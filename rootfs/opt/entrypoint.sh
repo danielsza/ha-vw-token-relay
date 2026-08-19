@@ -48,6 +48,19 @@ CMD="${CMD} --mqtt-port ${MQTT_PORT}"
 [ -n "${VW_PASSWORD}" ] && CMD="${CMD} --vw-password ${VW_PASSWORD}"
 [ -n "${VW_SPIN}" ] && CMD="${CMD} --vw-spin ${VW_SPIN}"
 
+wake_screen() {
+    # Wake screen and dismiss lock screen (no PIN assumed)
+    SCREEN_STATE=$(adb shell "dumpsys power | grep 'Display Power'" 2>/dev/null || echo "unknown")
+    if echo "${SCREEN_STATE}" | grep -q "state=OFF"; then
+        echo "Screen off — waking..."
+        adb shell "input keyevent KEYCODE_WAKEUP" 2>/dev/null || true
+        sleep 1
+        # Swipe up to dismiss lock screen
+        adb shell "input swipe 540 1800 540 800 300" 2>/dev/null || true
+        sleep 1
+    fi
+}
+
 ensure_phone_ready() {
     # Wait for ADB device
     echo "Waiting for USB device..."
@@ -64,12 +77,18 @@ ensure_phone_ready() {
         sleep 3
     fi
 
+    # Wake screen so app can launch properly
+    wake_screen
+
     # Launch VW app if not running
     if ! adb shell "pidof ${VW_PACKAGE}" > /dev/null 2>&1; then
         echo "Launching VW app..."
         adb shell "am start -n ${VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity" 2>/dev/null || true
         sleep 5
     fi
+
+    # Keep screen on while plugged in (developer setting)
+    adb shell "settings put global stay_on_while_plugged_in 3" 2>/dev/null || true
 }
 
 # ── Watchdog loop: auto-restart on crash/disconnect ──
