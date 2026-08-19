@@ -3,8 +3,16 @@
 # Detects the PIF module on the phone, runs its built-in autopif script
 # to generate a fresh fingerprint, or downloads one from known sources.
 # Called by entrypoint.sh (hourly) and vw_token_relay.py (MQTT command).
+#
+# Usage: update_pif.sh [--reboot]
+#   --reboot  Reboot the phone after updating (needed for Zygisk reload)
 
-set -e
+REBOOT_FLAG=""
+for arg in "$@"; do
+    case "$arg" in
+        --reboot) REBOOT_FLAG=1 ;;
+    esac
+done
 
 echo "PIF: Checking Play Integrity fingerprint..."
 
@@ -25,13 +33,11 @@ if adb shell "su -c 'test -d /data/adb/modules/playintegrityfix'" 2>/dev/null; t
     MODULE_PROP=$(adb shell "su -c 'cat ${PIF_DIR}/module.prop'" 2>/dev/null || echo "")
     if echo "$MODULE_PROP" | grep -qi 'KOWX712'; then
         PIF_VARIANT="kowx712"
-        # KOWX712 uses autopif.sh
         if adb shell "su -c 'test -f ${PIF_DIR}/autopif.sh'" 2>/dev/null; then
             AUTOPIF_SCRIPT="${PIF_DIR}/autopif.sh"
         fi
     elif echo "$MODULE_PROP" | grep -qi 'osm0sis'; then
         PIF_VARIANT="osm0sis"
-        # osm0sis uses autopifN.sh (highest version)
         AUTOPIF_SCRIPT=$(adb shell "su -c 'ls ${PIF_DIR}/autopif[0-9]*.sh 2>/dev/null | sort -V -r | head -1'" 2>/dev/null | tr -d '\r\n')
     else
         PIF_VARIANT="chiteroman"
@@ -53,6 +59,9 @@ fi
 
 echo "PIF: Found module at ${PIF_DIR} (variant: ${PIF_VARIANT})"
 
+# Snapshot current fingerprint for change detection
+OLD_FP=$(adb shell "su -c 'cat ${PIF_DIR}/custom.pif.prop 2>/dev/null || cat ${PIF_DIR}/pif.json 2>/dev/null || cat /data/adb/pif.json 2>/dev/null'" 2>/dev/null | head -20 || echo "")
+
 # ── Method 1: Run the module's built-in autopif script ──
 if [ -n "$AUTOPIF_SCRIPT" ] && adb shell "su -c 'test -f ${AUTOPIF_SCRIPT}'" 2>/dev/null; then
     echo "PIF: Running built-in script: ${AUTOPIF_SCRIPT}"
@@ -66,7 +75,6 @@ else
     # ── Method 2: Download pif.json from known sources ──
     echo "PIF: No autopif script available, downloading fingerprint..."
 
-    DOWNLOAD_OK=0
     /opt/venv/bin/python3 - <<'PYEOF'
 import urllib.request, json, sys
 
@@ -93,35 +101,34 @@ sys.exit(1)
 PYEOF
 
     if [ $? -eq 0 ] && [ -f /tmp/pif_new.json ]; then
-        # Determine target path based on variant
         if [ "$PIF_VARIANT" = "osm0sis" ]; then
             TARGET_JSON="${PIF_DIR}/custom.pif.json"
         else
             TARGET_JSON="/data/adb/pif.json"
         fi
 
-        # Check if fingerprint actually changed
-        CURRENT_FP=$(adb shell "su -c 'cat ${TARGET_JSON} 2>/dev/null'" | /opt/venv/bin/python3 -c "import json,sys; print(json.load(sys.stdin).get('FINGERPRINT',''))" 2>/dev/null || echo "")
-        NEW_FP=$(/opt/venv/bin/python3 -c "import json; print(json.load(open('/tmp/pif_new.json')).get('FINGERPRINT',''))" 2>/dev/null || echo "")
-
-        if [ "$CURRENT_FP" = "$NEW_FP" ] && [ -n "$CURRENT_FP" ]; then
-            echo "PIF: Fingerprint unchanged, skipping push"
-        else
-            echo "PIF: Pushing new fingerprint to ${TARGET_JSON}"
-            [ -n "$CURRENT_FP" ] && echo "PIF:   Was: ${CURRENT_FP}"
-            echo "PIF:   Now: ${NEW_FP}"
-            adb push /tmp/pif_new.json /data/local/tmp/pif.json 2>/dev/null
-            adb shell "su -c 'cp /data/local/tmp/pif.json ${TARGET_JSON} && chmod 644 ${TARGET_JSON}'" 2>/dev/null
-        fi
+        echo "PIF: Pushing new fingerprint to ${TARGET_JSON}"
+        adb push /tmp/pif_new.json /data/local/tmp/pif.json 2>/dev/null
+        adb shell "su -c 'cp /data/local/tmp/pif.json ${TARGET_JSON} && chmod 644 ${TARGET_JSON}'" 2>/dev/null
     else
         echo "PIF: Download failed, cannot update"
         exit 1
     fi
 fi
 
-# ── Restart DroidGuard to apply new fingerprint ──
-echo "PIF: Killing DroidGuard to force re-evaluation..."
-adb shell "su -c 'killall com.google.android.gms.unstable'" 2>/dev/null || true
+# Check if fingerprint actually changed
+NEW_FP=$(adb shell "su -c 'cat ${PIF_DIR}/custom.pif.prop 2>/dev/null || cat ${PIF_DIR}/pif.json 2>/dev/null || cat /data/adb/pif.json 2>/dev/null'" 2>/dev/null | head -20 || echo "")
+
+if [ "$OLD_FP" != "$NEW_FP" ] || [ -n "$REBOOT_FLAG" ]; then
+    echo "PIF: Fingerprint changed — rebooting phone for Zygisk reload..."
+    adb reboot 2>/dev/null || true
+    echo "PIF: Phone rebooting. Watchdog will reconnect in ~60s."
+    exit 0
+else
+    echo "PIF: Fingerprint unchanged, no reboot needed"
+    # Still kill DroidGuard as a lighter refresh
+    adb shell "su -c 'killall com.google.android.gms.unstable'" 2>/dev/null || true
+fi
 
 echo "PIF: Update complete"
 exit 0

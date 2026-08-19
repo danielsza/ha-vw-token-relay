@@ -67,11 +67,13 @@ PIF_UPDATE_INTERVAL=3600  # 1 hour in seconds
     sleep 30  # let boot settle
 
     echo "PIF: Starting auto-updater (interval: ${PIF_UPDATE_INTERVAL}s)"
-    sh /opt/update_pif.sh || echo "PIF: Initial update failed (will retry)"
+    # First run: use --reboot so Zygisk reloads with new props if changed
+    sh /opt/update_pif.sh --reboot || echo "PIF: Initial update failed (will retry)"
 
     while true; do
         sleep ${PIF_UPDATE_INTERVAL}
-        sh /opt/update_pif.sh || echo "PIF: Scheduled update failed (will retry next cycle)"
+        # Hourly: reboot only if fingerprint actually changed
+        sh /opt/update_pif.sh --reboot || echo "PIF: Scheduled update failed (will retry next cycle)"
     done
 ) &
 

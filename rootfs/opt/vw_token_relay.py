@@ -874,7 +874,7 @@ class VWTokenRelay:
         log.info("Running PIF fingerprint updater...")
         try:
             result = subprocess.run(
-                ["sh", "/opt/update_pif.sh"],
+                ["sh", "/opt/update_pif.sh", "--reboot"],
                 capture_output=True, text=True, timeout=120,
             )
             for line in result.stdout.splitlines():
