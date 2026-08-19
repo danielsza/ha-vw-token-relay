@@ -1,0 +1,35 @@
+name: "VW Token Relay"
+version: "1.0.0"
+slug: "vw-token-relay"
+description: "Captures VW app OAuth tokens via Frida over USB and relays them via MQTT for CarConnectivity Play Integrity bypass."
+panel_icon: "mdi:cellphone-link"
+arch:
+  - amd64
+  - aarch64
+init: false
+usb: true
+full_access: true
+options:
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_pass: ""
+  mqtt_topic: "vw/token_relay"
+  vw_package: "com.vw.carnet.releaseca"
+  base_url: "https://b-h-s.spr.ca00.p.con-veh.net"
+  vw_username: ""
+  vw_password: ""
+  vw_spin: ""
+  log_level: "info"
+schema:
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str?
+  mqtt_pass: password?
+  mqtt_topic: str
+  vw_package: str
+  base_url: str
+  vw_username: str?
+  vw_password: password?
+  vw_spin: str?
+  log_level: list(info|debug|warning|error)
