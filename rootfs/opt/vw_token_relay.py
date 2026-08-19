@@ -1189,10 +1189,14 @@ class VWTokenRelay:
             pass
 
         if not pid:
-            for proc in self.device.enumerate_processes():
-                if VW_PACKAGE in (proc.name, getattr(proc, 'identifier', '')):
-                    pid = proc.pid
-                    break
+            try:
+                for proc in self.device.enumerate_processes():
+                    if VW_PACKAGE in (proc.name, getattr(proc, 'identifier', '')):
+                        pid = proc.pid
+                        break
+            except Exception as e:
+                log.warning("enumerate_processes failed (phone still booting?): %s", e)
+                pass
 
         if not pid:
             log.warning("VW app not running. Attempting to launch...")

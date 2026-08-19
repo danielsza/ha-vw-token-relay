@@ -164,8 +164,8 @@ while true; do
     if [ "${RUNTIME}" -lt 30 ]; then
         CONSECUTIVE_FAST_EXITS=$((CONSECUTIVE_FAST_EXITS + 1))
         echo "Fast exit #${CONSECUTIVE_FAST_EXITS}"
-        # Exponential backoff: 10, 20, 40, 80, 120 (cap)
-        RESTART_DELAY=$((10 * (2 ** (CONSECUTIVE_FAST_EXITS - 1))))
+        # Exponential backoff: 10, 20, 40, 80, 120 (cap) — POSIX sh compatible
+        RESTART_DELAY=$((RESTART_DELAY * 2))
         [ "${RESTART_DELAY}" -gt "${MAX_DELAY}" ] && RESTART_DELAY=${MAX_DELAY}
     else
         CONSECUTIVE_FAST_EXITS=0
