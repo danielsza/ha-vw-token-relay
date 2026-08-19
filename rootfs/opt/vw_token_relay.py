@@ -84,8 +84,9 @@ Java.perform(function () {
     var Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
     var JLong  = Java.use('java.lang.Long');
     var PEEK   = JLong.parseLong('131072');
+    var BufferClass = Java.use('okio.Buffer');
 
-    // All API path prefixes CarConnectivity needs
+    // Known API path prefixes
     var API_PATHS = [
         '/oidc/',            // OAuth token exchange
         '/account/v1/',      // garage / vehicle list
@@ -99,6 +100,16 @@ Java.perform(function () {
         '/charging/',        // charging commands
     ];
 
+    // Domains we care about (VW backend)
+    var VW_DOMAINS = ['con-veh.net', 'vwgroup.io', 'volkswagen'];
+
+    function isVwDomain(u) {
+        for (var i = 0; i < VW_DOMAINS.length; i++) {
+            if (u.indexOf(VW_DOMAINS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
     function isApiUrl(u) {
         for (var i = 0; i < API_PATHS.length; i++) {
             if (u.indexOf(API_PATHS[i]) !== -1) return true;
@@ -106,9 +117,30 @@ Java.perform(function () {
         return false;
     }
 
+    function getRequestBody(req) {
+        try {
+            var body = req.body();
+            if (body === null) return null;
+            var buffer = BufferClass.$new();
+            body.writeTo(buffer);
+            return buffer.readUtf8();
+        } catch (e) {
+            return '(error reading body: ' + e + ')';
+        }
+    }
+
+    function getHeaders(hdrs) {
+        var result = {};
+        for (var i = 0; i < hdrs.size(); i++) {
+            result[hdrs.name(i)] = hdrs.value(i);
+        }
+        return result;
+    }
+
     Bridge.intercept.implementation = function (chain) {
         var req  = chain.request();
         var url  = req.url().toString();
+        var method = req.method();
         var resp = this.intercept(chain);
 
         // ── Capture Authorization headers → fresh access tokens ──
@@ -126,15 +158,36 @@ Java.perform(function () {
         // ── Capture OIDC token responses (access + refresh tokens) ──
         if (url.indexOf('/oidc/') !== -1) {
             try {
-                send({ type: 'token_response', url: url, body: resp.peekBody(PEEK).string() });
+                var reqBody = getRequestBody(req);
+                send({ type: 'token_response', url: url, method: method, requestBody: reqBody, body: resp.peekBody(PEEK).string() });
             } catch (e) {}
             return resp;
         }
 
-        // ── Capture all vehicle/API responses ──
+        // ── FULL TRAFFIC CAPTURE for VW domains (remote start discovery) ──
+        if (isVwDomain(url)) {
+            try {
+                var reqBody = getRequestBody(req);
+                var respBody = resp.peekBody(PEEK).string();
+                var reqHeaders = getHeaders(hdrs);
+                var respCode = resp.code();
+                send({
+                    type: 'full_traffic',
+                    url: url,
+                    method: method,
+                    status: respCode,
+                    requestHeaders: reqHeaders,
+                    requestBody: reqBody,
+                    responseBody: respBody
+                });
+            } catch (e) {
+                send({ type: 'full_traffic', url: url, method: method, error: '' + e });
+            }
+        }
+
+        // ── Also still publish known API responses for normal relay operation ──
         if (isApiUrl(url)) {
             try {
-                var method = req.method();
                 send({ type: 'api_response', url: url, method: method, body: resp.peekBody(PEEK).string() });
             } catch (e) {}
         }
@@ -142,7 +195,7 @@ Java.perform(function () {
         return resp;
     };
 
-    send({ type: 'status', msg: 'Hooks installed — capturing all VW API traffic' });
+    send({ type: 'status', msg: 'Hooks installed — FULL TRAFFIC capture active (remote start discovery)' });
 });
 """
 
@@ -675,6 +728,35 @@ class VWTokenRelay:
                 )
                 self._publish_tokens()
                 log.info("Published token_relay (new token)")
+
+        elif msg_type == "full_traffic":
+            # Log ALL VW domain traffic for remote start discovery
+            url = payload.get("url", "")
+            method = payload.get("method", "?")
+            status = payload.get("status", "?")
+            req_body = payload.get("requestBody", "")
+            resp_body = payload.get("responseBody", "")
+            log.info("═══ TRAFFIC ═══ %s %s → %s", method, url, status)
+            if req_body:
+                log.info("  REQ BODY: %s", req_body[:2000])
+            if resp_body:
+                log.info("  RESP BODY: %s", resp_body[:2000])
+            req_hdrs = payload.get("requestHeaders", {})
+            if req_hdrs:
+                # Log interesting headers (skip boring ones)
+                skip = {'host', 'accept-encoding', 'connection', 'user-agent'}
+                interesting = {k: v for k, v in req_hdrs.items() if k.lower() not in skip}
+                if interesting:
+                    log.info("  REQ HDRS: %s", json.dumps(interesting, indent=None)[:1000])
+            # Also publish to MQTT for easy viewing
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/traffic",
+                json.dumps({
+                    "method": method, "url": url, "status": status,
+                    "requestBody": (req_body or "")[:2000],
+                    "responseBody": (resp_body or "")[:2000],
+                }),
+            )
 
         elif msg_type == "api_response":
             self._parse_and_publish_vehicle_data(
