@@ -283,6 +283,10 @@ class VWTokenRelay:
         self.vw_password = vw_password
         self.vw_spin = vw_spin
 
+        # PIF health tracking
+        self._last_token_time = None  # set on every fresh token capture
+        self._pif_reboot_cooldown = None  # prevent reboot loops
+
         # Token state — keyed by vehicle ID
         self.tokens = {}       # {vehicle_id: {"token": str, "expiry": datetime}}
         self.global_token = None  # most recent non-vehicle-scoped token
@@ -917,11 +921,13 @@ class VWTokenRelay:
                         self.tokens[vehicle_id] = {"token": token, "expiry": expiry}
                         if vehicle_id not in self.vehicle_ids:
                             self.vehicle_ids.append(vehicle_id)
+                        self._last_token_time = datetime.now()
                         log.info("Vehicle token updated: %s (exp %s)", vehicle_id[:8], expiry.strftime("%H:%M"))
                 else:
                     if self.global_token != token:
                         self.global_token = token
                         self.global_expiry = expiry
+                        self._last_token_time = datetime.now()
                         log.info("Global token updated (exp %s)", expiry.strftime("%H:%M"))
         except Exception as e:
             log.debug("Token parse error: %s", e)
@@ -1339,6 +1345,36 @@ class VWTokenRelay:
                 else:
                     no_token_count = 0
 
+            # ── PIF health check ──
+            # If no fresh token in 45+ minutes and we haven't rebooted recently,
+            # assume Play Integrity is broken → update fingerprint + reboot phone
+            pif_status = "healthy"
+            if self._last_token_time:
+                token_age_min = (datetime.now() - self._last_token_time).total_seconds() / 60
+                cooldown_ok = (
+                    self._pif_reboot_cooldown is None
+                    or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 7200  # 2hr cooldown
+                )
+                if token_age_min > 45 and cooldown_ok:
+                    pif_status = "degraded"
+                    log.warning("PIF HEALTH: No fresh token in %.0f min — triggering PIF update + reboot", token_age_min)
+                    self._pif_reboot_cooldown = datetime.now()
+                    threading.Thread(target=self._update_pif, daemon=True).start()
+                elif token_age_min > 45:
+                    pif_status = "cooldown"
+                    log.info("PIF HEALTH: Token stale (%.0f min) but in reboot cooldown", token_age_min)
+
+            # Publish health status
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/pif_health",
+                json.dumps({
+                    "status": pif_status,
+                    "last_token_age_min": round((datetime.now() - self._last_token_time).total_seconds() / 60, 1) if self._last_token_time else None,
+                    "last_token_at": self._last_token_time.isoformat() if self._last_token_time else None,
+                }),
+                retain=True,
+            )
+
             # Always publish current state
             self._publish_tokens()
 
@@ -1373,6 +1409,7 @@ class VWTokenRelay:
         log.info("    %s/cmd/climate_stop   — send vehicle_id to stop climate", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/remote_start   — send vehicle_id for remote engine start (ICE)", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/remote_start_stop — send vehicle_id to stop remote start", MQTT_TOPIC_PREFIX)
+        log.info("    %s/pif_health         — PI status: healthy/degraded/cooldown (retained)", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/update_pif     — refresh Play Integrity fingerprint", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/wake_app       — force app refresh", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
