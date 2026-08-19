@@ -84,7 +84,13 @@ Java.perform(function () {
     var Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
     var JLong  = Java.use('java.lang.Long');
     var PEEK   = JLong.parseLong('131072');
-    var BufferClass = Java.use('okio.Buffer');
+
+    // Lazily resolve okio.Buffer — may be obfuscated in some builds
+    var BufferClass = null;
+    try { BufferClass = Java.use('okio.Buffer'); } catch(e) {}
+    // Try shaded/relocated okio paths
+    if (!BufferClass) try { BufferClass = Java.use('okhttp3.internal.okio.Buffer'); } catch(e) {}
+    if (!BufferClass) try { BufferClass = Java.use('o.Buffer'); } catch(e) {}
 
     // Known API path prefixes
     var API_PATHS = [
@@ -98,6 +104,11 @@ Java.perform(function () {
         '/fas/v1/',          // features
         '/climatisation/',   // climatisation commands
         '/charging/',        // charging commands
+        '/mps/v1/',          // legacy commands (remote start?)
+        '/ss/v1/',           // SPIN / session
+        '/pairing/',         // device pairing (remote start)
+        '/res/v1/',          // remote engine start
+        '/vhs/',             // vehicle health
     ];
 
     // Domains we care about (VW backend)
@@ -121,9 +132,15 @@ Java.perform(function () {
         try {
             var body = req.body();
             if (body === null) return null;
-            var buffer = BufferClass.$new();
-            body.writeTo(buffer);
-            return buffer.readUtf8();
+            if (BufferClass) {
+                var buffer = BufferClass.$new();
+                body.writeTo(buffer);
+                return buffer.readUtf8();
+            }
+            // Fallback: just report content type and length
+            var ct = body.contentType();
+            var cl = body.contentLength();
+            return '(body: type=' + ct + ', len=' + cl + ', okio.Buffer not available)';
         } catch (e) {
             return '(error reading body: ' + e + ')';
         }
