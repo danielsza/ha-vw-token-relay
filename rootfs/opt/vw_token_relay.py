@@ -399,113 +399,100 @@ class VWTokenRelay:
                 return self.global_token
         return None
 
+    def _api_request(self, method, url, body=None, vid=None, timeout=15):
+        """Make an API request with auto-retry on auth or server failure.
+
+        On 401/403: wakes the VW app for fresh tokens, waits, retries once.
+        On 5xx: retries once after a short delay.
+        Returns (response_body_str, None) on success, (None, error_dict) on failure.
+        """
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            token = self._get_valid_token(vid)
+            if not token:
+                if attempt < max_retries:
+                    log.info("No valid token — waking app for refresh...")
+                    self._wake_app()
+                    time.sleep(30)
+                    continue
+                return None, {"error": "no_valid_token", "msg": "Token expired — no fresh token after retry"}
+
+            headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
+            if self.user_id:
+                headers["x-user-id"] = self.user_id
+
+            req = Request(url, data=body, method=method, headers=headers)
+            try:
+                with urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode(), None
+            except HTTPError as e:
+                err = e.read().decode("utf-8", errors="replace")
+                if e.code in (401, 403) and attempt < max_retries:
+                    log.warning("API %d on %s — refreshing token and retrying...", e.code, url[:60])
+                    self._wake_app()
+                    time.sleep(30)
+                    continue
+                if e.code >= 500 and attempt < max_retries:
+                    log.warning("API %d on %s — server error, retrying in 10s...", e.code, url[:60])
+                    time.sleep(10)
+                    continue
+                return None, {"error": f"http_{e.code}", "url": url, "body": err[:500], "code": e.code}
+            except Exception as e:
+                if attempt < max_retries:
+                    log.warning("API exception on %s: %s — retrying...", url[:60], e)
+                    time.sleep(5)
+                    continue
+                return None, {"error": "exception", "msg": str(e)}
+
+        return None, {"error": "max_retries", "msg": "All retry attempts exhausted"}
+
     def _api_call(self, method, url_or_vid):
         """Make a direct API call using captured token."""
         vid = url_or_vid.strip()
         if not vid.startswith("http"):
-            # Assume it's a vehicle ID — fetch status
             url = f"{BASE_URL}/rvs/v1/vehicle/{vid}"
         else:
             url = vid
 
-        # Extract vehicle ID from URL
         m = re.search(r"/vehicle/([0-9a-f-]{36})", url)
         vid = m.group(1) if m else None
 
-        token = self._get_valid_token(vid)
-        if not token:
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_valid_token", "msg": "Token expired — wake the app"}),
-            )
-            log.warning("No valid token for API call")
-            return
-
-        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
-        if self.user_id:
-            headers["x-user-id"] = self.user_id
-
-        req = Request(url, method=method, headers=headers)
-        try:
-            with urlopen(req, timeout=15) as resp:
-                body = resp.read().decode()
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/response/vehicle_status",
-                body,
-            )
-            log.info("API call success: %s (%d bytes)", url[:80], len(body))
-        except HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            log.error("API call failed (%d): %s", e.code, err[:200])
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": f"http_{e.code}", "url": url, "body": err[:500]}),
-            )
+        result, err = self._api_request(method, url, vid=vid)
+        if result is not None:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/response/vehicle_status", result)
+            log.info("API call success: %s (%d bytes)", url[:80], len(result))
+        else:
+            log.error("API call failed: %s", err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error", json.dumps(err))
 
     def _api_lock(self, vehicle_id, lock=True):
-        """Send lock/unlock command."""
+        """Send lock/unlock command with auto-retry."""
         vid = vehicle_id.strip()
-        token = self._get_valid_token(vid)
-        if not token:
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_valid_token", "msg": "Token expired — wake the app"}),
-            )
-            return
-
+        action = "lock" if lock else "unlock"
         url = f"{BASE_URL}/lockunlock/v1/vehicle/{vid}"
         body = json.dumps({"lock": lock}).encode()
-        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
-        if self.user_id:
-            headers["x-user-id"] = self.user_id
 
-        req = Request(url, data=body, method="PUT", headers=headers)
-        try:
-            with urlopen(req, timeout=15) as resp:
-                result = resp.read().decode()
-            action = "lock" if lock else "unlock"
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/response/{action}",
-                result,
-            )
+        result, err = self._api_request("PUT", url, body=body, vid=vid)
+        if result is not None:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/response/{action}", result)
             log.info("%s success: %s", action.upper(), result[:200])
-        except HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            log.error("Lock/unlock failed (%d): %s", e.code, err[:200])
+        else:
+            log.error("%s failed: %s", action, err)
 
     def _api_climate(self, vehicle_id, start=True):
-        """Send climate start/stop command."""
+        """Send climate start/stop command with auto-retry."""
         vid = vehicle_id.strip()
-        token = self._get_valid_token(vid)
-        if not token:
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_valid_token", "msg": "Token expired — wake the app"}),
-            )
-            return
-
         action = "start" if start else "stop"
         url = f"{BASE_URL}/ev/v1/vehicle/{vid}/pretripclimate/{action}"
-        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
-        if self.user_id:
-            headers["x-user-id"] = self.user_id
 
-        req = Request(url, data=b"", method="POST", headers=headers)
-        try:
-            with urlopen(req, timeout=15) as resp:
-                result = resp.read().decode()
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/response/climate",
-                result,
-            )
+        result, err = self._api_request("POST", url, body=b"", vid=vid)
+        if result is not None:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/response/climate", result)
             log.info("CLIMATE %s success: %s", action.upper(), result[:200])
-        except HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            log.error("Climate %s failed (%d): %s", action, e.code, err[:200])
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": f"climate_{e.code}", "action": action, "body": err[:500]}),
-            )
+        else:
+            log.error("Climate %s failed: %s", action, err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": f"climate_{err.get('code','?')}", "action": action}))
 
     # ── Remote Start (ICE vehicles) ──────────────────────────────────
     def _build_encrypted_payload(self, pairing_key_seed_hex, mobile_app_id):
@@ -651,15 +638,18 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
+        # Pre-check: ensure we have a token before starting the multi-step flow
         token = self._get_valid_token(vid)
         if not token:
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_valid_token", "msg": "Token expired — wake the app first"}))
-            return
-
-        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
-        if self.user_id:
-            headers["x-user-id"] = self.user_id
+            log.info("RST: No valid token — waking app for refresh...")
+            self._wake_app()
+            time.sleep(30)
+            token = self._get_valid_token(vid)
+            if not token:
+                log.error("RST: Still no valid token after app wake")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                    json.dumps({"error": "no_valid_token", "msg": "Token expired — no fresh token after retry"}))
+                return
 
         # Step 1: Get pairing data
         log.info("RST Step 1: Getting pairing data...")
@@ -676,16 +666,14 @@ class VWTokenRelay:
         # Step 2: Get SPIN challenge
         log.info("RST Step 2: Getting SPIN challenge...")
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
-        req = Request(challenge_url, method="GET", headers=headers)
-        try:
-            with urlopen(req, timeout=15) as resp:
-                challenge_data = json.loads(resp.read().decode())
-        except HTTPError as e:
-            log.error("SPIN challenge failed (%d): %s", e.code, e.read().decode()[:200])
+        result, err = self._api_request("GET", challenge_url, vid=vid)
+        if result is None:
+            log.error("SPIN challenge failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "spin_challenge_failed", "code": e.code}))
+                json.dumps({"error": "spin_challenge_failed", **err}))
             return
 
+        challenge_data = json.loads(result)
         challenge = challenge_data["data"]["challenge"]
         remaining = challenge_data["data"]["remainingTries"]
         log.info("RST: challenge=%s, remainingTries=%d", challenge, remaining)
@@ -704,17 +692,14 @@ class VWTokenRelay:
         log.info("RST Step 4: SPIN check for roToken...")
         check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl/check"
         check_body = json.dumps({"spinHash": rst_pin_hash}).encode()
-        req = Request(check_url, data=check_body, method="POST", headers=headers)
-        try:
-            with urlopen(req, timeout=15) as resp:
-                check_data = json.loads(resp.read().decode())
-        except HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            log.error("SPIN check failed (%d): %s", e.code, err[:200])
+        result, err = self._api_request("POST", check_url, body=check_body, vid=vid)
+        if result is None:
+            log.error("SPIN check failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "spin_check_failed", "code": e.code, "body": err[:500]}))
+                json.dumps({"error": "spin_check_failed", **err}))
             return
 
+        check_data = json.loads(result)
         ro_token = check_data["data"]["roToken"]
         captcha_idx = check_data["data"].get("captchaIndex", "")
         captcha_val = check_data["data"].get("captchaValue", "")
@@ -744,29 +729,25 @@ class VWTokenRelay:
         }).encode()
         log.info("RST: POST body size=%d bytes", len(rst_body))
 
-        req = Request(rst_url, data=rst_body, method="POST", headers=headers)
-        try:
-            with urlopen(req, timeout=30) as resp:
-                rst_data = json.loads(resp.read().decode())
-        except HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            log.error("Remote start POST failed (%d): %s", e.code, err[:500])
+        result, err = self._api_request("POST", rst_url, body=rst_body, vid=vid, timeout=30)
+        if result is None:
+            log.error("Remote start POST failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "rst_post_failed", "code": e.code, "body": err[:500]}))
+                json.dumps({"error": "rst_post_failed", **err}))
             return
 
+        rst_data = json.loads(result)
         log.info("RST: POST response: %s", json.dumps(rst_data)[:500])
 
         # Extract correlationId for polling
         correlation_id = rst_data.get("data", {}).get("correlationId")
         if not correlation_id:
-            # Response might be the full data directly
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
                 json.dumps(rst_data), retain=False)
             log.info("RST: No correlationId in response — published raw result")
             return
 
-        # Step 8: Poll for result
+        # Step 8: Poll for result (uses _api_request for auto-retry)
         log.info("RST Step 8: Polling for result (correlationId=%s)...", correlation_id)
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
             json.dumps({"status": "pending", "correlationId": correlation_id}), retain=False)
@@ -774,10 +755,9 @@ class VWTokenRelay:
         poll_url = f"{BASE_URL}/history/v1/vehicle/{vid}/correlationId/{correlation_id}/ro/"
         for attempt in range(12):  # Poll up to 2 minutes
             time.sleep(10)
-            req = Request(poll_url, method="GET", headers=headers)
-            try:
-                with urlopen(req, timeout=15) as resp:
-                    poll_data = json.loads(resp.read().decode())
+            poll_result, poll_err = self._api_request("GET", poll_url, vid=vid)
+            if poll_result is not None:
+                poll_data = json.loads(poll_result)
                 status_str = poll_data.get("data", {}).get("responseStatusString", "")
                 outcome_str = poll_data.get("data", {}).get("responseOutcomeString", "")
                 telem_code = poll_data.get("data", {}).get("telematicsResponseCode", "")
@@ -803,42 +783,29 @@ class VWTokenRelay:
                         else:
                             log.warning("═══ REMOTE START REJECTED: %s (%s) ═══", telem_value, telem_code)
                         return
-            except HTTPError as e:
-                if e.code == 404:
+            else:
+                code = poll_err.get("code", 0) if isinstance(poll_err, dict) else 0
+                if code == 404:
                     log.debug("RST poll %d: not ready yet (404)", attempt + 1)
                 else:
-                    log.error("RST poll failed (%d): %s", e.code, e.read().decode()[:200])
-            except Exception as e:
-                log.error("RST poll error: %s", e)
+                    log.error("RST poll %d failed: %s", attempt + 1, poll_err)
 
         log.warning("RST: Polling timed out after %d attempts", 12)
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
             json.dumps({"status": "timeout", "correlationId": correlation_id}), retain=False)
 
     def _api_remote_start_stop(self, vehicle_id):
-        """Stop a running remote start."""
+        """Stop a running remote start with auto-retry."""
         vid = vehicle_id.strip()
-        token = self._get_valid_token(vid)
-        if not token:
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_valid_token", "msg": "Token expired"}))
-            return
-
         url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
-        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
-        if self.user_id:
-            headers["x-user-id"] = self.user_id
 
-        req = Request(url, method="DELETE", headers=headers)
-        try:
-            with urlopen(req, timeout=15) as resp:
-                result = resp.read().decode()
+        result, err = self._api_request("DELETE", url, vid=vid)
+        if result is not None:
             log.info("RST STOP success: %s", result[:200])
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
                 json.dumps({"status": "stopped"}), retain=False)
-        except HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            log.error("RST stop failed (%d): %s", e.code, err[:200])
+        else:
+            log.error("RST stop failed: %s", err)
 
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _wake_app(self):
@@ -1344,6 +1311,33 @@ class VWTokenRelay:
                         self._wake_app()  # Re-trigger after login
                 else:
                     no_token_count = 0
+
+            # ── Proactive token validation ──
+            # Make a lightweight test API call to verify the token actually works
+            # against VW's servers (catches revoked tokens, PI failures, etc.)
+            with self._lock:
+                test_vids = list(self.tokens.keys())
+            if test_vids:
+                test_vid = test_vids[0]
+                test_token = self._get_valid_token(test_vid)
+                if test_token:
+                    test_url = f"{BASE_URL}/rvs/v1/vehicle/{test_vid}"
+                    test_headers = {**VW_API_HEADERS, "Authorization": f"Bearer {test_token}"}
+                    if self.user_id:
+                        test_headers["x-user-id"] = self.user_id
+                    try:
+                        req = Request(test_url, method="GET", headers=test_headers)
+                        with urlopen(req, timeout=15) as resp:
+                            resp.read()
+                        log.debug("Token validation: OK")
+                    except HTTPError as e:
+                        if e.code in (401, 403):
+                            log.warning("Token validation failed (%d) — waking app for refresh", e.code)
+                            self._wake_app()
+                        else:
+                            log.debug("Token validation: HTTP %d (non-auth, ignoring)", e.code)
+                    except Exception:
+                        pass  # network glitch, ignore
 
             # ── PIF health check ──
             # If no fresh token in 45+ minutes and we haven't rebooted recently,
