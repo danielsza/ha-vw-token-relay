@@ -1,15 +1,12 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Install system dependencies
-RUN apk add --no-cache \
+# Install system dependencies (Debian-based)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
-    py3-pip \
-    android-tools \
-    build-base \
-    python3-dev \
-    libffi-dev \
-    linux-headers \
+    python3-pip \
+    python3-venv \
+    adb \
     jq \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
@@ -17,7 +14,8 @@ RUN apk add --no-cache \
         frida-tools==13.6.1 \
         paho-mqtt \
         PyJWT \
-    && apk del build-base python3-dev libffi-dev linux-headers
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy relay script and entrypoint
 COPY rootfs /
