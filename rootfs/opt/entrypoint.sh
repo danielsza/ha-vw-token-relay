@@ -14,15 +14,21 @@ VW_PASSWORD=$(jq -r '.vw_password // empty' "$OPTIONS")
 VW_SPIN=$(jq -r '.vw_spin // empty' "$OPTIONS")
 LOG_LEVEL=$(jq -r '.log_level' "$OPTIONS")
 
-# ── Persist ADB keys across container restarts ──
-ADB_KEY_DIR="/data/.android"
-mkdir -p "${ADB_KEY_DIR}"
-export HOME="/data"
-if [ ! -f "${ADB_KEY_DIR}/adbkey" ]; then
-    echo "Generating new ADB keypair (will persist in /data/)..."
-    adb keygen "${ADB_KEY_DIR}/adbkey" 2>/dev/null || true
+# ── Persist ADB keys across container restarts/rebuilds ──
+# ADB stores keys at ~/.android/adbkey. Default HOME is /root.
+# Symlink /root/.android → /data/.android so the key survives
+# container recreation (restarts, rebuilds, reboots).
+mkdir -p /data/.android
+rm -rf /root/.android 2>/dev/null || true
+ln -sf /data/.android /root/.android
+
+# If no key exists yet, let ADB generate one naturally on first use.
+# The phone must authorize once; after that the key persists.
+if [ -f /data/.android/adbkey ]; then
+    echo "Reusing persisted ADB key from /data/.android/"
+else
+    echo "No ADB key found — will be generated on first ADB use"
 fi
-export ADB_VENDOR_KEYS="${ADB_KEY_DIR}/adbkey"
 
 echo "============================================="
 echo "  VW Token Relay — Starting"
