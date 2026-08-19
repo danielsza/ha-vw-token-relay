@@ -14,6 +14,16 @@ VW_PASSWORD=$(jq -r '.vw_password // empty' "$OPTIONS")
 VW_SPIN=$(jq -r '.vw_spin // empty' "$OPTIONS")
 LOG_LEVEL=$(jq -r '.log_level' "$OPTIONS")
 
+# ── Persist ADB keys across container restarts ──
+ADB_KEY_DIR="/data/.android"
+mkdir -p "${ADB_KEY_DIR}"
+export HOME="/data"
+if [ ! -f "${ADB_KEY_DIR}/adbkey" ]; then
+    echo "Generating new ADB keypair (will persist in /data/)..."
+    adb keygen "${ADB_KEY_DIR}/adbkey" 2>/dev/null || true
+fi
+export ADB_VENDOR_KEYS="${ADB_KEY_DIR}/adbkey"
+
 echo "============================================="
 echo "  VW Token Relay — Starting"
 echo "============================================="
