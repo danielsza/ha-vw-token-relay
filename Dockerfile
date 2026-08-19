@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         frida-tools==13.6.1 \
         paho-mqtt \
         PyJWT \
+        cryptography \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

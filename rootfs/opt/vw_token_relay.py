@@ -21,16 +21,19 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
 import time
 import base64
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -107,8 +110,11 @@ Java.perform(function () {
         '/mps/v1/',          // legacy commands (remote start?)
         '/ss/v1/',           // SPIN / session
         '/pairing/',         // device pairing (remote start)
-        '/res/v1/',          // remote engine start
+        '/rst/v1/',          // remote engine start
+        '/res/v1/',          // remote engine start (legacy)
         '/vhs/',             // vehicle health
+        '/history/v1/',      // remote operation history
+        '/pair/v1/',         // device pairing
     ];
 
     // Domains we care about (VW backend)
@@ -212,8 +218,55 @@ Java.perform(function () {
         return resp;
     };
 
-    send({ type: 'status', msg: 'Hooks installed — FULL TRAFFIC capture active (remote start discovery)' });
+    send({ type: 'status', msg: 'Hooks installed — FULL TRAFFIC capture + RST signing active' });
 });
+
+// ── RPC exports for remote start signing ──────────────────────────
+rpc.exports = {
+    // List all Android KeyStore aliases (for discovery)
+    listKeystoreAliases: function () {
+        return Java.perform(function () {
+            var KeyStore = Java.use('java.security.KeyStore');
+            var ks = KeyStore.getInstance('AndroidKeyStore');
+            ks.load(null);
+            var aliases = ks.aliases();
+            var result = [];
+            while (aliases.hasMoreElements()) {
+                result.push(aliases.nextElement().toString());
+            }
+            return JSON.stringify(result);
+        });
+    },
+
+    // Sign data with the VW pairing key from Android KeyStore
+    // dataBase64: base64-encoded bytes to sign
+    // alias: KeyStore alias (discovered via listKeystoreAliases)
+    signWithKeystore: function (dataBase64, alias) {
+        return Java.perform(function () {
+            var KeyStore = Java.use('java.security.KeyStore');
+            var Signature = Java.use('java.security.Signature');
+            var Base64 = Java.use('android.util.Base64');
+
+            var ks = KeyStore.getInstance('AndroidKeyStore');
+            ks.load(null);
+
+            if (!ks.containsAlias(alias)) {
+                return JSON.stringify({ error: 'alias_not_found', alias: alias });
+            }
+
+            var entry = ks.getEntry(alias, null);
+            var privateKey = Java.cast(entry, Java.use('java.security.KeyStore$PrivateKeyEntry')).getPrivateKey();
+
+            var sig = Signature.getInstance('SHA256withECDSA');
+            sig.initSign(privateKey);
+            var dataBytes = Base64.decode(dataBase64, 0);
+            sig.update(dataBytes);
+            var sigBytes = sig.sign();
+            var sigB64 = Base64.encodeToString(sigBytes, 2); // NO_WRAP
+            return JSON.stringify({ signature: sigB64 });
+        });
+    },
+};
 """
 
 
@@ -299,6 +352,10 @@ class VWTokenRelay:
             self._api_climate(payload, start=True)
         elif cmd == "climate_stop":
             self._api_climate(payload, start=False)
+        elif cmd == "remote_start":
+            threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
+        elif cmd == "remote_start_stop":
+            threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
         else:
             log.warning("Unknown command: %s", cmd)
 
@@ -443,6 +500,339 @@ class VWTokenRelay:
                 f"{MQTT_TOPIC_PREFIX}/error",
                 json.dumps({"error": f"climate_{e.code}", "action": action, "body": err[:500]}),
             )
+
+    # ── Remote Start (ICE vehicles) ──────────────────────────────────
+    def _build_encrypted_payload(self, pairing_key_seed_hex, mobile_app_id):
+        """Build the encryptedPayload for RemoteStartRequest.
+
+        Crypto chain (from APK reverse engineering):
+          1. Get current time as milliseconds, create 3 timestamp ints
+          2. Convert each to 4-byte big-endian arrays
+          3. Hex-decode pairingKeySeed to bytes
+          4. XOR each timestamp array with key seed bytes (cycling)
+          5. AES/ECB encrypt using key seed as 16-byte key
+          6. XOR result with mobileAppId UTF-8 bytes (cycling)
+          7. Base64-encode → encryptedPayload
+        """
+        key_seed_bytes = bytes.fromhex(pairing_key_seed_hex)
+
+        now_ms = int(time.time() * 1000)
+        timestamps = [now_ms & 0xFFFFFFFF, (now_ms >> 16) & 0xFFFFFFFF, (now_ms >> 32) & 0xFFFFFFFF]
+        ts_bytes = b""
+        for ts in timestamps:
+            ts_bytes += struct.pack(">I", ts)
+
+        # XOR with key seed (cycling)
+        xored = bytes(d ^ key_seed_bytes[i % len(key_seed_bytes)] for i, d in enumerate(ts_bytes))
+
+        # AES/ECB encrypt (pad key seed to 16 bytes)
+        aes_key = key_seed_bytes
+        if len(aes_key) < 16:
+            aes_key = aes_key + b"\x00" * (16 - len(aes_key))
+        elif len(aes_key) > 16:
+            aes_key = aes_key[:16]
+
+        plaintext = xored
+        pad_len = 16 - (len(plaintext) % 16)
+        if pad_len < 16:
+            plaintext = plaintext + b"\x00" * pad_len
+
+        cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
+        encryptor = cipher.encryptor()
+        encrypted = encryptor.update(plaintext) + encryptor.finalize()
+
+        # XOR with mobileAppId bytes (cycling)
+        app_id_bytes = mobile_app_id.encode("utf-8")
+        result = bytes(d ^ app_id_bytes[i % len(app_id_bytes)] for i, d in enumerate(encrypted))
+
+        return base64.b64encode(result).decode("ascii")
+
+    def _sign_with_keystore(self, data_b64):
+        """Use Frida RPC to sign data with the phone's Android KeyStore key."""
+        if not self.script:
+            log.error("No Frida script loaded — cannot sign")
+            return None
+
+        try:
+            # First discover the KeyStore alias if we haven't yet
+            if not hasattr(self, '_keystore_alias') or self._keystore_alias is None:
+                aliases_json = self.script.exports_sync.list_keystore_aliases()
+                aliases = json.loads(aliases_json)
+                log.info("Android KeyStore aliases: %s", aliases)
+                # Look for VW-related aliases
+                vw_aliases = [a for a in aliases if any(k in a.lower() for k in ['vw', 'pairing', 'rst', 'remote', 'carnet'])]
+                if vw_aliases:
+                    self._keystore_alias = vw_aliases[0]
+                    log.info("Using VW KeyStore alias: %s", self._keystore_alias)
+                elif aliases:
+                    # Try each alias — the VW key might have a generic name
+                    for alias in aliases:
+                        log.info("Trying KeyStore alias: %s", alias)
+                        result = json.loads(self.script.exports_sync.sign_with_keystore(data_b64, alias))
+                        if "signature" in result:
+                            self._keystore_alias = alias
+                            log.info("Found working KeyStore alias: %s", alias)
+                            return result["signature"]
+                    log.error("No working KeyStore alias found")
+                    return None
+                else:
+                    log.error("No KeyStore aliases found")
+                    return None
+
+            result = json.loads(self.script.exports_sync.sign_with_keystore(data_b64, self._keystore_alias))
+            if "error" in result:
+                log.error("KeyStore signing failed: %s", result)
+                self._keystore_alias = None  # Reset for rediscovery
+                return None
+            return result["signature"]
+        except Exception as e:
+            log.error("Frida RPC signing failed: %s", e)
+            return None
+
+    def _get_pairing_data(self, vehicle_id):
+        """Get pairing data for a vehicle from the API."""
+        token = self._get_valid_token(vehicle_id)
+        if not token:
+            return None
+
+        url = f"{BASE_URL}/pair/v1/vehicle/{vehicle_id}"
+        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
+        if self.user_id:
+            headers["x-user-id"] = self.user_id
+
+        req = Request(url, method="GET", headers=headers)
+        try:
+            with urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode())
+            pairings = body.get("data", {}).get("pairings", [])
+            # Find our phone's pairing (match by mobileAppId from headers)
+            our_app_id = VW_API_HEADERS.get("x-app-uuid", "")
+            for p in pairings:
+                if p.get("mobileAppId", "").lower() == our_app_id.lower() and p.get("pairingStatus") == 4:
+                    log.info("Found active pairing: pairingId=%s", p["pairingId"])
+                    return p
+            # Fallback: return any active pairing
+            for p in pairings:
+                if p.get("pairingStatus") == 4:
+                    log.warning("Using fallback pairing (not our app): pairingId=%s", p["pairingId"])
+                    return p
+            log.error("No active pairing found for vehicle %s", vehicle_id)
+            return None
+        except HTTPError as e:
+            log.error("Get pairing failed (%d): %s", e.code, e.read().decode()[:200])
+            return None
+
+    def _api_remote_start(self, vehicle_id):
+        """Execute remote start for an ICE vehicle.
+
+        Flow (reverse-engineered from myVW APK):
+          1. GET /pair/v1/vehicle/{vid} → get pairingId + pairingKeySeed
+          2. GET /ss/v1/user/{uid}/challenge → get SPIN challenge
+          3. Compute rstPinHash = SHA512(challenge + "." + spin).hex().upper()
+          4. POST /ss/v1/user/{uid}/vehicle/{vid}/operation/climateControl/check
+             body: {"spinHash": rstPinHash} → get roToken
+          5. Build encryptedPayload (timestamps + XOR + AES/ECB + XOR + base64)
+          6. Sign encryptedPayload via Frida RPC (Android KeyStore ECDSA)
+          7. POST /rst/v1/vehicle/{vid}
+             body: {pairingId, rstPinHash, encryptedPayload, roToken, dataToSign}
+          8. Poll /history/v1/vehicle/{vid}/correlationId/{cid}/ro/ for result
+        """
+        vid = vehicle_id.strip()
+        log.info("═══ REMOTE START ═══ vehicle=%s", vid)
+
+        if not self.vw_spin:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
+            return
+
+        token = self._get_valid_token(vid)
+        if not token:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_valid_token", "msg": "Token expired — wake the app first"}))
+            return
+
+        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
+        if self.user_id:
+            headers["x-user-id"] = self.user_id
+
+        # Step 1: Get pairing data
+        log.info("RST Step 1: Getting pairing data...")
+        pairing = self._get_pairing_data(vid)
+        if not pairing:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_pairing", "msg": "No active device pairing for this vehicle"}))
+            return
+
+        pairing_id = pairing["pairingId"]
+        pairing_key_seed = pairing["pairingKeySeed"]
+        mobile_app_id = pairing["mobileAppId"]
+
+        # Step 2: Get SPIN challenge
+        log.info("RST Step 2: Getting SPIN challenge...")
+        challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
+        req = Request(challenge_url, method="GET", headers=headers)
+        try:
+            with urlopen(req, timeout=15) as resp:
+                challenge_data = json.loads(resp.read().decode())
+        except HTTPError as e:
+            log.error("SPIN challenge failed (%d): %s", e.code, e.read().decode()[:200])
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "spin_challenge_failed", "code": e.code}))
+            return
+
+        challenge = challenge_data["data"]["challenge"]
+        remaining = challenge_data["data"]["remainingTries"]
+        log.info("RST: challenge=%s, remainingTries=%d", challenge, remaining)
+
+        if remaining < 3:
+            log.warning("RST: Only %d SPIN tries remaining — aborting", remaining)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "spin_low_tries", "remaining": remaining}))
+            return
+
+        # Step 3: Compute rstPinHash
+        rst_pin_hash = hashlib.sha512(f"{challenge}.{self.vw_spin}".encode()).hexdigest().upper()
+        log.info("RST Step 3: Computed rstPinHash (%d chars)", len(rst_pin_hash))
+
+        # Step 4: SPIN check → get roToken
+        log.info("RST Step 4: SPIN check for roToken...")
+        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl/check"
+        check_body = json.dumps({"spinHash": rst_pin_hash}).encode()
+        req = Request(check_url, data=check_body, method="POST", headers=headers)
+        try:
+            with urlopen(req, timeout=15) as resp:
+                check_data = json.loads(resp.read().decode())
+        except HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            log.error("SPIN check failed (%d): %s", e.code, err[:200])
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "spin_check_failed", "code": e.code, "body": err[:500]}))
+            return
+
+        ro_token = check_data["data"]["roToken"]
+        captcha_idx = check_data["data"].get("captchaIndex", "")
+        captcha_val = check_data["data"].get("captchaValue", "")
+        log.info("RST: Got roToken (%d chars), captcha=%s/%s", len(ro_token), captcha_idx, captcha_val)
+
+        # Step 5: Build encrypted payload
+        log.info("RST Step 5: Building encrypted payload...")
+        encrypted_payload = self._build_encrypted_payload(pairing_key_seed, mobile_app_id)
+        log.info("RST: encryptedPayload=%s", encrypted_payload)
+
+        # Step 6: Sign with KeyStore via Frida
+        log.info("RST Step 6: Signing with Android KeyStore...")
+        data_to_sign = self._sign_with_keystore(encrypted_payload)
+        if not data_to_sign:
+            log.warning("RST: KeyStore signing failed — trying without signature")
+            data_to_sign = ""
+
+        # Step 7: POST to /rst/v1/
+        log.info("RST Step 7: Sending remote start command...")
+        rst_url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
+        rst_body = json.dumps({
+            "pairingId": pairing_id,
+            "rstPinHash": rst_pin_hash,
+            "encryptedPayload": encrypted_payload,
+            "roToken": ro_token,
+            "dataToSign": data_to_sign,
+        }).encode()
+        log.info("RST: POST body size=%d bytes", len(rst_body))
+
+        req = Request(rst_url, data=rst_body, method="POST", headers=headers)
+        try:
+            with urlopen(req, timeout=30) as resp:
+                rst_data = json.loads(resp.read().decode())
+        except HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            log.error("Remote start POST failed (%d): %s", e.code, err[:500])
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "rst_post_failed", "code": e.code, "body": err[:500]}))
+            return
+
+        log.info("RST: POST response: %s", json.dumps(rst_data)[:500])
+
+        # Extract correlationId for polling
+        correlation_id = rst_data.get("data", {}).get("correlationId")
+        if not correlation_id:
+            # Response might be the full data directly
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                json.dumps(rst_data), retain=False)
+            log.info("RST: No correlationId in response — published raw result")
+            return
+
+        # Step 8: Poll for result
+        log.info("RST Step 8: Polling for result (correlationId=%s)...", correlation_id)
+        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+            json.dumps({"status": "pending", "correlationId": correlation_id}), retain=False)
+
+        poll_url = f"{BASE_URL}/history/v1/vehicle/{vid}/correlationId/{correlation_id}/ro/"
+        for attempt in range(12):  # Poll up to 2 minutes
+            time.sleep(10)
+            req = Request(poll_url, method="GET", headers=headers)
+            try:
+                with urlopen(req, timeout=15) as resp:
+                    poll_data = json.loads(resp.read().decode())
+                status_str = poll_data.get("data", {}).get("responseStatusString", "")
+                outcome_str = poll_data.get("data", {}).get("responseOutcomeString", "")
+                telem_code = poll_data.get("data", {}).get("telematicsResponseCode", "")
+                telem_value = poll_data.get("data", {}).get("telematicsResponseValue", "")
+
+                log.info("RST poll %d: status=%s outcome=%s telem=%s/%s",
+                         attempt + 1, status_str, outcome_str, telem_code, telem_value)
+
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                    json.dumps({
+                        "status": status_str,
+                        "outcome": outcome_str,
+                        "telematicsCode": telem_code,
+                        "telematicsValue": telem_value,
+                        "correlationId": correlation_id,
+                        "attempt": attempt + 1,
+                    }), retain=False)
+
+                if status_str == "ACKNOWLEDGED":
+                    if outcome_str in ("ACCEPTED", "REJECTED"):
+                        if outcome_str == "ACCEPTED":
+                            log.info("═══ REMOTE START SUCCESS ═══")
+                        else:
+                            log.warning("═══ REMOTE START REJECTED: %s (%s) ═══", telem_value, telem_code)
+                        return
+            except HTTPError as e:
+                if e.code == 404:
+                    log.debug("RST poll %d: not ready yet (404)", attempt + 1)
+                else:
+                    log.error("RST poll failed (%d): %s", e.code, e.read().decode()[:200])
+            except Exception as e:
+                log.error("RST poll error: %s", e)
+
+        log.warning("RST: Polling timed out after %d attempts", 12)
+        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+            json.dumps({"status": "timeout", "correlationId": correlation_id}), retain=False)
+
+    def _api_remote_start_stop(self, vehicle_id):
+        """Stop a running remote start."""
+        vid = vehicle_id.strip()
+        token = self._get_valid_token(vid)
+        if not token:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_valid_token", "msg": "Token expired"}))
+            return
+
+        url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
+        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
+        if self.user_id:
+            headers["x-user-id"] = self.user_id
+
+        req = Request(url, method="DELETE", headers=headers)
+        try:
+            with urlopen(req, timeout=15) as resp:
+                result = resp.read().decode()
+            log.info("RST STOP success: %s", result[:200])
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                json.dumps({"status": "stopped"}), retain=False)
+        except HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            log.error("RST stop failed (%d): %s", e.code, err[:200])
 
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _wake_app(self):
@@ -950,9 +1340,11 @@ class VWTokenRelay:
         log.info("    %s/api_response — captured API responses", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/lock     — send vehicle_id to lock", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/unlock   — send vehicle_id to unlock", MQTT_TOPIC_PREFIX)
-        log.info("    %s/cmd/climate_start — send vehicle_id to start climate", MQTT_TOPIC_PREFIX)
-        log.info("    %s/cmd/climate_stop  — send vehicle_id to stop climate", MQTT_TOPIC_PREFIX)
-        log.info("    %s/cmd/wake_app — force app refresh", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/climate_start  — send vehicle_id to start climate", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/climate_stop   — send vehicle_id to stop climate", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/remote_start   — send vehicle_id for remote engine start (ICE)", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/remote_start_stop — send vehicle_id to stop remote start", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/wake_app       — force app refresh", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
         log.info("=" * 60)
 

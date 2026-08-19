@@ -1,5 +1,5 @@
 name: "VW Token Relay"
-version: "1.0.9"
+version: "1.1.0"
 slug: "vw-token-relay"
 description: "Captures VW app OAuth tokens via Frida over USB and relays them via MQTT for CarConnectivity Play Integrity bypass."
 panel_icon: "mdi:cellphone-link"
