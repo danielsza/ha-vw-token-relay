@@ -86,12 +86,12 @@ ensure_phone_ready() {
     # Wake screen so app can launch properly
     wake_screen
 
-    # Launch VW app if not running
-    if ! adb shell "pidof ${VW_PACKAGE}" > /dev/null 2>&1; then
-        echo "Launching VW app..."
-        adb shell "am start -n ${VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity" 2>/dev/null || true
-        sleep 5
-    fi
+    # Force-restart VW app to ensure fresh API calls on launch
+    echo "Force-restarting VW app..."
+    adb shell "am force-stop ${VW_PACKAGE}" 2>/dev/null || true
+    sleep 2
+    adb shell "am start -n ${VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity" 2>/dev/null || true
+    sleep 5
 
     # Keep screen on while plugged in (developer setting)
     adb shell "settings put global stay_on_while_plugged_in 3" 2>/dev/null || true

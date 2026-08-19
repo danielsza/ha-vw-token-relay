@@ -338,15 +338,34 @@ class VWTokenRelay:
 
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _wake_app(self):
-        """Use ADB to bring the VW app to the foreground, triggering API
-        calls and token refresh."""
+        """Force-restart the VW app to trigger fresh API calls and token capture.
+        Just 'am start' on an already-running app doesn't trigger new traffic."""
         try:
+            # Wake screen first
+            subprocess.run(
+                ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+                capture_output=True, timeout=5,
+            )
+            time.sleep(1)
+            # Force-stop the app so relaunch triggers fresh API calls
+            subprocess.run(
+                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(2)
+            # Relaunch
             subprocess.run(
                 ["adb", "shell", "am", "start", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
                 capture_output=True, timeout=10,
             )
-            log.info("Woke VW app via ADB — waiting for token capture")
+            log.info("Force-restarted VW app — waiting for token capture")
+            # Need to re-attach Frida since the app got a new PID
+            time.sleep(5)
+            try:
+                self._attach_frida()
+            except Exception as e:
+                log.error("Failed to reattach Frida after app restart: %s", e)
         except Exception as e:
             log.error("Failed to wake app: %s", e)
 
