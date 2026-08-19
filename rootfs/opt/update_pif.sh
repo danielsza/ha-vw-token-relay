@@ -119,11 +119,16 @@ fi
 # Check if fingerprint actually changed
 NEW_FP=$(adb shell "su -c 'cat ${PIF_DIR}/custom.pif.prop 2>/dev/null || cat ${PIF_DIR}/pif.json 2>/dev/null || cat /data/adb/pif.json 2>/dev/null'" 2>/dev/null | head -20 || echo "")
 
-if [ "$OLD_FP" != "$NEW_FP" ] || [ -n "$REBOOT_FLAG" ]; then
-    echo "PIF: Fingerprint changed — rebooting phone for Zygisk reload..."
-    adb reboot 2>/dev/null || true
-    echo "PIF: Phone rebooting. Watchdog will reconnect in ~60s."
-    exit 0
+if [ "$OLD_FP" != "$NEW_FP" ]; then
+    if [ -n "$REBOOT_FLAG" ]; then
+        echo "PIF: Fingerprint changed — rebooting phone for Zygisk reload..."
+        adb reboot 2>/dev/null || true
+        echo "PIF: Phone rebooting. Watchdog will reconnect in ~60s."
+        exit 0
+    else
+        echo "PIF: Fingerprint changed (reboot not requested, killing DroidGuard)..."
+        adb shell "su -c 'killall com.google.android.gms.unstable'" 2>/dev/null || true
+    fi
 else
     echo "PIF: Fingerprint unchanged, no reboot needed"
     # Still kill DroidGuard as a lighter refresh
