@@ -14,21 +14,47 @@ VW_PASSWORD=$(jq -r '.vw_password // empty' "$OPTIONS")
 VW_SPIN=$(jq -r '.vw_spin // empty' "$OPTIONS")
 LOG_LEVEL=$(jq -r '.log_level' "$OPTIONS")
 
-# ── Persist ADB keys across container restarts/rebuilds ──
-# ADB stores keys at ~/.android/adbkey. Default HOME is /root.
-# Symlink /root/.android → /data/.android so the key survives
-# container recreation (restarts, rebuilds, reboots).
-mkdir -p /data/.android
-rm -rf /root/.android 2>/dev/null || true
-ln -sf /data/.android /root/.android
+# ── Persist ADB keys across ALL addon lifecycle events ──
+# /data/.android/ survives restarts/rebuilds but is WIPED on uninstall.
+# /share/.vw-relay/.android/ survives everything including uninstall.
+SHARE_ANDROID="/share/.vw-relay/.android"
+DATA_ANDROID="/data/.android"
 
-# If no key exists yet, let ADB generate one naturally on first use.
-# The phone must authorize once; after that the key persists.
-if [ -f /data/.android/adbkey ]; then
-    echo "Reusing persisted ADB key from /data/.android/"
+mkdir -p "${SHARE_ANDROID}" "${DATA_ANDROID}"
+
+# Migrate: if key exists in /data but not /share, copy it over
+if [ -f "${DATA_ANDROID}/adbkey" ] && [ ! -f "${SHARE_ANDROID}/adbkey" ]; then
+    echo "Migrating ADB key from /data to /share for uninstall persistence..."
+    cp "${DATA_ANDROID}/adbkey" "${SHARE_ANDROID}/adbkey"
+    cp "${DATA_ANDROID}/adbkey.pub" "${SHARE_ANDROID}/adbkey.pub" 2>/dev/null || true
+fi
+
+# Restore: if key exists in /share but not /data (post-uninstall reinstall)
+if [ -f "${SHARE_ANDROID}/adbkey" ] && [ ! -f "${DATA_ANDROID}/adbkey" ]; then
+    echo "Restoring ADB key from /share (survived uninstall)..."
+    cp "${SHARE_ANDROID}/adbkey" "${DATA_ANDROID}/adbkey"
+    cp "${SHARE_ANDROID}/adbkey.pub" "${DATA_ANDROID}/adbkey.pub" 2>/dev/null || true
+fi
+
+# Symlink ~/.android → /data/.android (ADB's working copy)
+rm -rf /root/.android 2>/dev/null || true
+ln -sf "${DATA_ANDROID}" /root/.android
+
+if [ -f "${DATA_ANDROID}/adbkey" ]; then
+    echo "Reusing persisted ADB key (backed up to /share/.vw-relay/)"
 else
     echo "No ADB key found — will be generated on first ADB use"
 fi
+
+# After ADB generates a key, back it up to /share (runs in background)
+(
+    while [ ! -f "${DATA_ANDROID}/adbkey" ]; do sleep 10; done
+    if [ ! -f "${SHARE_ANDROID}/adbkey" ]; then
+        cp "${DATA_ANDROID}/adbkey" "${SHARE_ANDROID}/adbkey"
+        cp "${DATA_ANDROID}/adbkey.pub" "${SHARE_ANDROID}/adbkey.pub" 2>/dev/null || true
+        echo "ADB key backed up to /share/.vw-relay/ for uninstall persistence"
+    fi
+) &
 
 echo "============================================="
 echo "  VW Token Relay — Starting"
