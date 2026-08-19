@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -768,6 +769,12 @@ class VWTokenRelay:
 
     # ── Main ────────────────────────────────────────────────────────
     def run(self):
+        # Handle SIGTERM gracefully (Docker sends this on container stop)
+        def _handle_sigterm(signum, frame):
+            log.info("Received SIGTERM — shutting down gracefully")
+            self._running = False
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+
         self._setup_mqtt()
 
         if not self._attach_frida():
@@ -795,8 +802,14 @@ class VWTokenRelay:
             while self._running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            log.info("Shutting down...")
+            log.info("Shutting down (KeyboardInterrupt)...")
+        except SystemExit as e:
+            log.info("Shutting down (SystemExit code=%s)...", e.code)
+        except Exception as e:
+            log.error("Main loop crashed: %s", e, exc_info=True)
+        finally:
             self._running = False
+            log.info("Relay main loop exited — cleaning up")
 
         if self.mqttc:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/status", "offline", retain=True)
@@ -829,4 +842,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        log.info("Process exiting (code=%s)", e.code)
+        sys.exit(e.code)
+    except Exception as e:
+        log.error("FATAL unhandled exception: %s", e, exc_info=True)
+        sys.exit(1)

@@ -99,17 +99,38 @@ ensure_phone_ready() {
 
 # ── Watchdog loop: auto-restart on crash/disconnect ──
 RESTART_DELAY=10
+MAX_DELAY=120
+CONSECUTIVE_FAST_EXITS=0
 while true; do
     ensure_phone_ready
 
-    echo "Starting relay..."
+    echo "Starting relay at $(date '+%H:%M:%S')..."
+    START_TIME=$(date +%s)
     ${CMD}
     EXIT_CODE=$?
+    END_TIME=$(date +%s)
+    RUNTIME=$((END_TIME - START_TIME))
 
-    echo "Relay exited with code ${EXIT_CODE}. Restarting in ${RESTART_DELAY}s..."
+    echo "Relay exited with code ${EXIT_CODE} after ${RUNTIME}s. Restarting in ${RESTART_DELAY}s..."
+
+    # Track rapid crashes for exponential backoff
+    if [ "${RUNTIME}" -lt 30 ]; then
+        CONSECUTIVE_FAST_EXITS=$((CONSECUTIVE_FAST_EXITS + 1))
+        echo "Fast exit #${CONSECUTIVE_FAST_EXITS}"
+        # Exponential backoff: 10, 20, 40, 80, 120 (cap)
+        RESTART_DELAY=$((10 * (2 ** (CONSECUTIVE_FAST_EXITS - 1))))
+        [ "${RESTART_DELAY}" -gt "${MAX_DELAY}" ] && RESTART_DELAY=${MAX_DELAY}
+    else
+        CONSECUTIVE_FAST_EXITS=0
+        RESTART_DELAY=10
+    fi
+
     sleep ${RESTART_DELAY}
 
-    # Kill stale ADB server so it reconnects cleanly
-    adb kill-server 2>/dev/null || true
-    sleep 2
+    # Only kill ADB server after persistent failures (not every restart)
+    if [ "${CONSECUTIVE_FAST_EXITS}" -ge 3 ]; then
+        echo "Multiple fast crashes — resetting ADB server..."
+        adb kill-server 2>/dev/null || true
+        sleep 2
+    fi
 done
