@@ -225,6 +225,10 @@ class VWTokenRelay:
             self._api_lock(payload, lock=True)
         elif cmd == "unlock":
             self._api_lock(payload, lock=False)
+        elif cmd == "climate_start":
+            self._api_climate(payload, start=True)
+        elif cmd == "climate_stop":
+            self._api_climate(payload, start=False)
         else:
             log.warning("Unknown command: %s", cmd)
 
@@ -335,6 +339,40 @@ class VWTokenRelay:
         except HTTPError as e:
             err = e.read().decode("utf-8", errors="replace")
             log.error("Lock/unlock failed (%d): %s", e.code, err[:200])
+
+    def _api_climate(self, vehicle_id, start=True):
+        """Send climate start/stop command."""
+        vid = vehicle_id.strip()
+        token = self._get_valid_token(vid)
+        if not token:
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_valid_token", "msg": "Token expired — wake the app"}),
+            )
+            return
+
+        action = "start" if start else "stop"
+        url = f"{BASE_URL}/ev/v1/vehicle/{vid}/pretripclimate/{action}"
+        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
+        if self.user_id:
+            headers["x-user-id"] = self.user_id
+
+        req = Request(url, data=b"", method="POST", headers=headers)
+        try:
+            with urlopen(req, timeout=15) as resp:
+                result = resp.read().decode()
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/response/climate",
+                result,
+            )
+            log.info("CLIMATE %s success: %s", action.upper(), result[:200])
+        except HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            log.error("Climate %s failed (%d): %s", action, e.code, err[:200])
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": f"climate_{e.code}", "action": action, "body": err[:500]}),
+            )
 
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _wake_app(self):
@@ -813,6 +851,8 @@ class VWTokenRelay:
         log.info("    %s/api_response — captured API responses", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/lock     — send vehicle_id to lock", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/unlock   — send vehicle_id to unlock", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/climate_start — send vehicle_id to start climate", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/climate_stop  — send vehicle_id to stop climate", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/wake_app — force app refresh", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
         log.info("=" * 60)
