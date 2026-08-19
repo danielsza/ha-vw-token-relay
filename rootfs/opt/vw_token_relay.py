@@ -356,6 +356,8 @@ class VWTokenRelay:
             threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
         elif cmd == "remote_start_stop":
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
+        elif cmd == "update_pif":
+            threading.Thread(target=self._update_pif, daemon=True).start()
         else:
             log.warning("Unknown command: %s", cmd)
 
@@ -867,6 +869,33 @@ class VWTokenRelay:
         except Exception as e:
             log.error("Failed to wake app: %s", e)
 
+    def _update_pif(self):
+        """Run the Play Integrity fingerprint updater script."""
+        log.info("Running PIF fingerprint updater...")
+        try:
+            result = subprocess.run(
+                ["sh", "/opt/update_pif.sh"],
+                capture_output=True, text=True, timeout=120,
+            )
+            for line in result.stdout.splitlines():
+                log.info(line)
+            if result.stderr:
+                for line in result.stderr.splitlines():
+                    log.warning("PIF stderr: %s", line)
+            status = "success" if result.returncode == 0 else "failed"
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/pif_update",
+                json.dumps({"status": status, "output": result.stdout[-500:]}),
+            )
+        except subprocess.TimeoutExpired:
+            log.error("PIF update timed out")
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/pif_update",
+                json.dumps({"status": "timeout"}),
+            )
+        except Exception as e:
+            log.error("PIF update error: %s", e)
+
     # ── Token management ────────────────────────────────────────────
     def _store_token_from_header(self, token, url):
         """Store an access token captured from an Authorization header."""
@@ -1344,6 +1373,7 @@ class VWTokenRelay:
         log.info("    %s/cmd/climate_stop   — send vehicle_id to stop climate", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/remote_start   — send vehicle_id for remote engine start (ICE)", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/remote_start_stop — send vehicle_id to stop remote start", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/update_pif     — refresh Play Integrity fingerprint", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/wake_app       — force app refresh", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
         log.info("=" * 60)

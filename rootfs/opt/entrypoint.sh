@@ -56,6 +56,25 @@ fi
     fi
 ) &
 
+# ── Play Integrity fingerprint auto-updater ──
+# Runs update_pif.sh on startup and every 60 minutes to keep
+# the phone's PIF fingerprint fresh (Google bans them periodically).
+PIF_UPDATE_INTERVAL=3600  # 1 hour in seconds
+
+(
+    # Wait for ADB device to connect
+    while ! adb devices 2>/dev/null | grep -q "device$"; do sleep 10; done
+    sleep 30  # let boot settle
+
+    echo "PIF: Starting auto-updater (interval: ${PIF_UPDATE_INTERVAL}s)"
+    sh /opt/update_pif.sh || echo "PIF: Initial update failed (will retry)"
+
+    while true; do
+        sleep ${PIF_UPDATE_INTERVAL}
+        sh /opt/update_pif.sh || echo "PIF: Scheduled update failed (will retry next cycle)"
+    done
+) &
+
 echo "============================================="
 echo "  VW Token Relay — Starting"
 echo "============================================="

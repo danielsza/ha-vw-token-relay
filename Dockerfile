@@ -21,6 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy relay script and entrypoint
 COPY rootfs /
 
-RUN chmod +x /opt/entrypoint.sh
+RUN chmod +x /opt/entrypoint.sh /opt/update_pif.sh
 
 ENTRYPOINT ["/opt/entrypoint.sh"]
