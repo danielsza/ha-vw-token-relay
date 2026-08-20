@@ -1260,15 +1260,38 @@ class VWTokenRelay:
         spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
         log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
 
+        # ── Step 3b: Initialize captcha (GET /operation/climateControl) ──
+        # The server requires a captcha to be set up before /check returns
+        # the roToken.  The VW app creates this during its navigation flow.
+        # Calling GET on the operation endpoint creates/refreshes it.
+        init_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl"
+        log.info("RST Step 3b: Initializing captcha via GET %s ...", init_url.split('/user/')[1])
+        init_result, init_err = self._api_request_with_token("GET", init_url,
+                                                              bearer_token=atc_token)
+        if init_result is not None:
+            log.info("RST: climateControl init response: %s", init_result[:500])
+        else:
+            log.warning("RST: climateControl init failed (non-fatal): %s", init_err)
+            # Also try POST as fallback init method
+            log.info("RST: Trying POST init instead...")
+            init_body = json.dumps({"remoteOperation": "climateControl"}).encode()
+            init_result2, init_err2 = self._api_request_with_token("POST", init_url,
+                                                                    body=init_body,
+                                                                    bearer_token=atc_token)
+            if init_result2 is not None:
+                log.info("RST: climateControl POST init response: %s", init_result2[:500])
+            else:
+                log.warning("RST: climateControl POST init also failed: %s", init_err2)
+
         # ── Step 4: SPIN check → roToken ──
         # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
-        # Reference implementation uses climateControl ONLY — remoteStart/check
-        # consumes the challenge but returns empty data, poisoning the state.
+        # Use climateControl ONLY — remoteStart/check consumes the captcha
+        # but returns empty data, leaving nothing for the RST POST.
         check_body = json.dumps({"spinHash": spin_hash2}).encode()
         ro_token = None
         captcha_index = "0"
         captcha_value = "0"
-        for operation in ("remoteStart", "climateControl"):
+        for operation in ("climateControl", "remoteStart"):
             op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
             log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
             result, err = self._api_request_with_token("POST", op_url,
