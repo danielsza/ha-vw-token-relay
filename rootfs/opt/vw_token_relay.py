@@ -1014,58 +1014,138 @@ class VWTokenRelay:
 
     def _navigate_to_vehicle(self, target_vid=None):
         """Navigate the VW app to trigger vehicle-scoped API calls.
-        If target_vid is specified, swipe through vehicles to find it.
+        If target_vid is specified, tries multiple strategies to reach it.
         React Native views are invisible to uiautomator, so we use
-        fallback tap positions + swiping through the vehicle carousel."""
+        blind taps/swipes at known positions on Moto G Pure (720x1600)."""
         if not self._adb_check():
             log.error("NAV: Cannot navigate — ADB not connected")
             return False
 
-        try:
-            # Tap the vehicle card area to enter a vehicle dashboard
-            # Moto G Pure is 720x1600. Vehicle cards are in the center area.
-            log.info("NAV: Tapping vehicle card area...")
-            self._adb_tap(360, 600, label="card-area")
-            time.sleep(3)
+        def _check_target():
+            if not target_vid:
+                return False
+            return self._get_valid_token(target_vid, vehicle_only=True) is not None
 
-            # If we need a specific vehicle and don't have its token yet,
-            # try swiping through the vehicle carousel
-            if target_vid:
-                token = self._get_valid_token(target_vid, vehicle_only=True)
-                if token:
-                    log.info("NAV: Already have token for target vehicle")
+        try:
+            # ── Strategy 0: Tap the default vehicle card area ──
+            # Hits the first vehicle (Buzz) on the home screen.
+            log.info("NAV: S0 — tap default card area (360,600)")
+            self._adb_tap(360, 600, label="S0-card-default")
+            time.sleep(4)
+
+            if not target_vid:
+                return True
+            if _check_target():
+                log.info("NAV: Got target token from default tap")
+                return True
+
+            # ── Strategy 1: Swipe left on CURRENT screen ──
+            # If we entered Buzz's detail, some apps let you swipe
+            # left/right to switch between vehicle dashboards.
+            log.info("NAV: S1 — swipe left on current screen (detail-level switch)")
+            for i in range(2):
+                self._adb_swipe(600, 800, 100, 800, 400, f"S1-detail-left-{i+1}")
+                time.sleep(5)
+                if _check_target():
+                    log.info("NAV: S1 — got target token after detail swipe %d", i + 1)
                     return True
 
-                # The app defaults to the first vehicle (Buzz).
-                # Swipe left on the vehicle card area to cycle to the next vehicle.
-                # Try multiple swipes to cover 2-3 vehicles.
-                log.info("NAV: Swiping through vehicle carousel for target %s...", target_vid[:8])
-                for swipe_num in range(3):
-                    # First go back to home/garage if we tapped into a vehicle detail
-                    try:
-                        subprocess.run(
-                            ["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
-                            capture_output=True, timeout=5,
-                        )
-                        time.sleep(2)
-                    except Exception:
-                        pass
+            # ── Strategy 2: Back to home, scroll DOWN, tap lower card ──
+            # If vehicles are in a vertical list, the second card is below.
+            log.info("NAV: S2 — back to home, scroll down for second card")
+            try:
+                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
+                              capture_output=True, timeout=5)
+                time.sleep(2)
+            except Exception:
+                pass
+            # Scroll down (swipe up) to reveal cards below the fold
+            self._adb_swipe(360, 1200, 360, 400, 500, "S2-scroll-down")
+            time.sleep(2)
+            # Tap where a second card might now be visible
+            self._adb_tap(360, 600, label="S2-card-after-scroll")
+            time.sleep(5)
+            if _check_target():
+                log.info("NAV: S2 — got target token from scroll-down")
+                return True
 
-                    # Swipe left on the card area to show next vehicle
-                    self._adb_swipe(600, 600, 120, 600, 300, f"carousel-swipe-{swipe_num+1}")
-                    time.sleep(3)
+            # ── Strategy 3: Back, tap at various Y positions ──
+            # The second card might be at a different Y on the home screen.
+            log.info("NAV: S3 — back to home, tap at multiple Y positions")
+            try:
+                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
+                              capture_output=True, timeout=5)
+                time.sleep(2)
+            except Exception:
+                pass
+            for y_pos in [900, 1100, 1300]:
+                self._adb_tap(360, y_pos, label=f"S3-y{y_pos}")
+                time.sleep(4)
+                if _check_target():
+                    log.info("NAV: S3 — got target token from y=%d", y_pos)
+                    return True
+                # Go back in case we entered something
+                try:
+                    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
+                                  capture_output=True, timeout=5)
+                    time.sleep(1)
+                except Exception:
+                    pass
 
-                    # Tap the card that's now showing
-                    self._adb_tap(360, 600, label=f"card-after-swipe-{swipe_num+1}")
-                    time.sleep(5)
+            # ── Strategy 4: Swipe RIGHT (opposite direction) on home ──
+            # Maybe the second vehicle is to the left in the carousel.
+            log.info("NAV: S4 — swipe right on home screen")
+            for i in range(2):
+                self._adb_swipe(100, 600, 600, 600, 400, f"S4-home-right-{i+1}")
+                time.sleep(2)
+                self._adb_tap(360, 600, label=f"S4-card-right-{i+1}")
+                time.sleep(5)
+                if _check_target():
+                    log.info("NAV: S4 — got target from right swipe %d", i + 1)
+                    return True
+                try:
+                    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
+                                  capture_output=True, timeout=5)
+                    time.sleep(1)
+                except Exception:
+                    pass
 
-                    # Check if we got the target vehicle's token
-                    token = self._get_valid_token(target_vid, vehicle_only=True)
-                    if token:
-                        log.info("NAV: Got target vehicle token after swipe %d!", swipe_num + 1)
-                        return True
+            # ── Strategy 5: HOME + relaunch + scroll down ──
+            # Press HOME first to reset to a known state.
+            log.info("NAV: S5 — HOME key + fresh launch + scroll")
+            try:
+                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
+                              capture_output=True, timeout=5)
+                time.sleep(2)
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=10,
+                )
+                time.sleep(8)
+            except Exception:
+                pass
+            # Scroll down the home screen
+            self._adb_swipe(360, 1200, 360, 200, 600, "S5-big-scroll-down")
+            time.sleep(3)
+            # Tap where second card might be after scrolling
+            for y_pos in [400, 600, 800]:
+                self._adb_tap(360, y_pos, label=f"S5-y{y_pos}")
+                time.sleep(4)
+                if _check_target():
+                    log.info("NAV: S5 — got target token from y=%d after big scroll", y_pos)
+                    return True
+                try:
+                    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
+                                  capture_output=True, timeout=5)
+                    time.sleep(1)
+                except Exception:
+                    pass
 
-            return True
+            log.warning("NAV: All 6 strategies exhausted — no target vehicle token")
+            self._screencap()  # Screenshot for post-mortem debugging
+            return False
+
         except Exception as e:
             log.error("NAV: Navigation failed: %s", e)
             return False
