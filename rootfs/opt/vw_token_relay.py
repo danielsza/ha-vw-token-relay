@@ -427,6 +427,16 @@ class VWTokenRelay:
         # Vehicle data cache — keyed by vehicle ID
         self.vehicle_data = {}  # {vehicle_id: {endpoint: response_dict}}
 
+        # Cached pairing data (from Frida traffic capture)
+        self._cached_pairings = {
+            # Atlas pairing captured 2026-08-20 via app pairing flow
+            "90bf07c5-1fb8-36a6-8b12-9bbb013c51a0": {
+                "mobileAppId": "9b6b9f9d-35ae-41e3-be67-1b58bf5d49ca",
+                "pairingId": "856a16c4-3682-420f-98cf-8179fbc95d89",
+                "pairingKeySeed": "A7534E221EE63E7A"
+            }
+        }
+
         # Frida
         self.session = None
         self.script = None
@@ -879,32 +889,59 @@ class VWTokenRelay:
 
     def _get_pairing_data(self, vehicle_id):
         """Get pairing data for a vehicle from the API.
-        Uses _api_request for auto-retry on 401/403 (token refresh)."""
+        Uses _api_request for auto-retry on 401/403 (token refresh).
+        Falls back to cached pairing data from Frida traffic capture."""
         url = f"{BASE_URL}/pair/v1/vehicle/{vehicle_id}"
         result, err = self._api_request("GET", url, vid=vehicle_id)
         if result is None:
             log.error("Get pairing failed: %s", err)
-            return None
+            return self._get_cached_pairing(vehicle_id)
 
         try:
             body = json.loads(result)
             pairings = body.get("data", {}).get("pairings", [])
+            log.info("Pairings response for %s: %d pairings found", vehicle_id[:8], len(pairings))
+            for i, p in enumerate(pairings):
+                log.info("  Pairing[%d]: id=%s status=%s seed=%s appId=%s",
+                         i, p.get("pairingId", "?")[:8],
+                         p.get("pairingStatus", "?"),
+                         "yes" if p.get("pairingKeySeed") else "no",
+                         p.get("mobileAppId", "?")[:8])
+
             # Find our phone's pairing (match by mobileAppId from headers)
             our_app_id = VW_API_HEADERS.get("x-app-uuid", "")
+            # Priority 1: active pairing (status 4) for our app
             for p in pairings:
                 if p.get("mobileAppId", "").lower() == our_app_id.lower() and p.get("pairingStatus") == 4:
                     log.info("Found active pairing: pairingId=%s", p["pairingId"])
                     return p
-            # Fallback: return any active pairing
+            # Priority 2: any active pairing (status 4)
             for p in pairings:
                 if p.get("pairingStatus") == 4:
                     log.warning("Using fallback pairing (not our app): pairingId=%s", p["pairingId"])
                     return p
-            log.error("No active pairing found for vehicle %s", vehicle_id)
-            return None
+            # Priority 3: any pairing with a seed key (may be pending)
+            for p in pairings:
+                if p.get("pairingKeySeed"):
+                    log.warning("Using pairing with seed (status=%s): pairingId=%s",
+                                p.get("pairingStatus"), p["pairingId"])
+                    return p
+
+            log.warning("No active pairing in API for vehicle %s, trying cached", vehicle_id[:8])
+            return self._get_cached_pairing(vehicle_id)
         except (json.JSONDecodeError, KeyError) as e:
             log.error("Get pairing parse error: %s", e)
-            return None
+            return self._get_cached_pairing(vehicle_id)
+
+    def _get_cached_pairing(self, vehicle_id):
+        """Return cached pairing data captured from Frida traffic."""
+        with self._lock:
+            cached = getattr(self, '_cached_pairings', {}).get(vehicle_id)
+            if cached:
+                log.info("Using cached pairing for %s: id=%s", vehicle_id[:8], cached["pairingId"][:8])
+                return cached
+        log.error("No active pairing found for vehicle %s (API empty, no cache)", vehicle_id)
+        return None
 
     def _api_remote_start(self, vehicle_id):
         """Execute remote start for an ICE vehicle.
@@ -2817,6 +2854,25 @@ class VWTokenRelay:
                     "responseBody": (resp_body or "")[:2000],
                 }),
             )
+
+            # Cache pairing data from pairingRequests responses
+            if "/pair/v1/vehicle/" in url and "pairingRequest" in url and resp_body:
+                try:
+                    resp_data = json.loads(resp_body).get("data", {})
+                    if resp_data.get("pairingKeySeed") and resp_data.get("pairingId"):
+                        # Extract vehicle_id from URL
+                        import re
+                        vid_match = re.search(r'/vehicle/([a-f0-9-]+)/', url)
+                        if vid_match:
+                            vid = vid_match.group(1)
+                            if not hasattr(self, '_cached_pairings'):
+                                self._cached_pairings = {}
+                            self._cached_pairings[vid] = resp_data
+                            log.info("PAIR_CACHE: Cached pairing for %s: id=%s seed=%s",
+                                     vid[:8], resp_data["pairingId"][:8],
+                                     resp_data["pairingKeySeed"])
+                except Exception as e:
+                    log.debug("PAIR_CACHE: Parse error: %s", e)
 
         elif msg_type == "api_response":
             self._parse_and_publish_vehicle_data(
