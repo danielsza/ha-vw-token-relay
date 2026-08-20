@@ -971,8 +971,36 @@ class VWTokenRelay:
         finally:
             self._rst_lock.release()
 
+    def _api_request_with_token(self, method, url, body=None, bearer_token=None, timeout=15):
+        """Make an API request with an explicit Bearer token (no auto-lookup).
+
+        Used for RST flow where we need carnetVehicleToken instead of OAuth token.
+        Returns (response_body_str, None) on success, (None, error_dict) on failure.
+        """
+        headers = {**VW_API_HEADERS, "Authorization": f"Bearer {bearer_token}"}
+        if self.user_id:
+            headers["x-user-id"] = self.user_id
+
+        req = Request(url, data=body, method=method, headers=headers)
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode(), None
+        except HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            return None, {"error": f"http_{e.code}", "url": url, "body": err[:500], "code": e.code}
+        except Exception as e:
+            return None, {"error": "exception", "msg": str(e)}
+
     def _api_remote_start_inner(self, vid):
-        """Inner RST logic (runs under _rst_lock)."""
+        """Inner RST logic — 5-step two-challenge flow for ATC/ICE vehicles.
+
+        Flow (from DEV_NOTES_REMOTE_START.md):
+          1. GET challenge1 → compute spinHash1
+          2. POST /ss/.../session with {idToken, spinHash, tsp:"ATC"} → carnetVehicleToken
+          3. GET challenge2 (challenges are single-use!)
+          4. POST /ss/.../climateControl/check with {spinHash} using carnetVehicleToken → roToken
+          5. POST /rst/v1/vehicle/{vid} with {roToken} using carnetVehicleToken
+        """
         log.info("═══ REMOTE START ═══ vehicle=%s", vid)
 
         if not self.vw_spin:
@@ -980,53 +1008,51 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
-        # RST requires a vehicle-scoped token (with tid in JWT).
-        # The pairing endpoint and SPIN check return 403 with global tokens.
-        token = self._get_valid_token(vid, vehicle_only=True)
-        if token:
-            log.info("RST: Using vehicle-scoped token for %s", vid[:8])
-        else:
-            log.info("RST: No vehicle-scoped token for %s — switching vehicle in app...", vid[:8])
-            self._switch_vehicle(vid)
-            token = self._get_valid_token(vid, vehicle_only=True)
-            if not token:
-                # Last resort: try global token (some endpoints may work)
-                token = self._get_valid_token(vid, vehicle_only=False)
-                if token:
-                    log.warning("RST: Using global token as fallback — some steps may fail")
-                else:
-                    log.error("RST: Vehicle switch failed — no token for %s", vid[:8])
-                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                        json.dumps({"error": "no_valid_token",
-                                    "msg": f"Could not get vehicle-scoped token for {vid[:8]}"}))
-                    return
-
-        # Step 1: Get pairing data (uses _api_request with auto-retry on 403)
-        log.info("RST Step 1: Getting pairing data...")
-        pairing = self._get_pairing_data(vid)
-        if not pairing:
+        if not self.id_token:
+            log.error("RST: No id_token available — need app to have logged in")
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_pairing", "msg": "No active device pairing for this vehicle"}))
+                json.dumps({"error": "no_id_token", "msg": "No OIDC id_token — wake app first"}))
             return
 
-        pairing_id = pairing["pairingId"]
-        pairing_key_seed = pairing["pairingKeySeed"]
-        mobile_app_id = pairing["mobileAppId"]
+        if not self.user_id:
+            log.error("RST: No user_id available")
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_user_id", "msg": "User ID not set"}))
+            return
 
-        # Step 2: Get SPIN challenge
-        log.info("RST Step 2: Getting SPIN challenge...")
+        # Need OAuth token for challenge endpoints
+        oauth_token = self._get_valid_token(vid, vehicle_only=True)
+        if not oauth_token:
+            oauth_token = self._get_valid_token(vid, vehicle_only=False)
+        if not oauth_token:
+            log.info("RST: No token — waking app...")
+            self._wake_app(target_vid=vid)
+            time.sleep(30)
+            oauth_token = self._get_valid_token(vid)
+            if not oauth_token:
+                log.error("RST: Still no token after wake")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                    json.dumps({"error": "no_valid_token", "msg": "No OAuth token available"}))
+                return
+
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
+        session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/session"
+        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl/check"
+        rst_url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
+
+        # ── Step 1: Fetch challenge1 ──
+        log.info("RST Step 1: Fetching challenge1 for ATC session...")
         result, err = self._api_request("GET", challenge_url, vid=vid)
         if result is None:
-            log.error("SPIN challenge failed: %s", err)
+            log.error("RST: Challenge1 failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "spin_challenge_failed", **err}))
+                json.dumps({"error": "challenge1_failed", **err}))
             return
 
-        challenge_data = json.loads(result)
-        challenge = challenge_data["data"]["challenge"]
-        remaining = challenge_data["data"]["remainingTries"]
-        log.info("RST: challenge=%s, remainingTries=%d", challenge, remaining)
+        c1_data = json.loads(result)
+        challenge1 = c1_data["data"]["challenge"]
+        remaining = c1_data["data"].get("remainingTries", 999)
+        log.info("RST: challenge1=%s, remainingTries=%d", challenge1, remaining)
 
         if remaining < 3:
             log.warning("RST: Only %d SPIN tries remaining — aborting", remaining)
@@ -1034,64 +1060,86 @@ class VWTokenRelay:
                 json.dumps({"error": "spin_low_tries", "remaining": remaining}))
             return
 
-        # Step 3: Compute rstPinHash
-        rst_pin_hash = hashlib.sha512(f"{challenge}.{self.vw_spin}".encode()).hexdigest().upper()
-        log.info("RST Step 3: Computed rstPinHash (%d chars)", len(rst_pin_hash))
+        spin_hash1 = hashlib.sha512(f"{challenge1}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
+        log.info("RST: Computed spinHash1 (%d chars)", len(spin_hash1))
 
-        # Step 4: SPIN check → get roToken
-        # ATC/MQB (ICE) vehicles use "remoteStart", WCT/MEB (BEV) use "climateControl"
-        spin_operation = "remoteStart"
-        log.info("RST Step 4: SPIN check for roToken (operation=%s)...", spin_operation)
-        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{spin_operation}/check"
-        check_body = json.dumps({"spinHash": rst_pin_hash}).encode()
-        result, err = self._api_request("POST", check_url, body=check_body, vid=vid)
+        # ── Step 2: Create ATC session → carnetVehicleToken ──
+        log.info("RST Step 2: Creating ATC session (tsp=ATC)...")
+        session_body = json.dumps({
+            "idToken": self.id_token,
+            "spinHash": spin_hash1,
+            "tsp": "ATC"
+        }).encode()
+        result, err = self._api_request("POST", session_url, body=session_body, vid=vid)
         if result is None:
-            log.error("SPIN check failed: %s", err)
+            log.error("RST: ATC session failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "spin_check_failed", **err}))
+                json.dumps({"error": "atc_session_failed", **err}))
+            return
+
+        session_data = json.loads(result)
+        log.info("RST Step 2 response keys: %s", list(session_data.get("data", {}).keys()))
+        atc_token = session_data.get("data", {}).get("carnetVehicleToken")
+        if not atc_token:
+            log.error("RST: No carnetVehicleToken in session response: %s",
+                      json.dumps(session_data)[:500])
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_atc_token", "msg": "Session response missing carnetVehicleToken"}))
+            return
+        log.info("RST: Got carnetVehicleToken (%d chars)", len(atc_token))
+
+        # ── Step 3: Fetch challenge2 (challenges are single-use!) ──
+        log.info("RST Step 3: Fetching challenge2 for climateControl/check...")
+        result, err = self._api_request("GET", challenge_url, vid=vid)
+        if result is None:
+            log.error("RST: Challenge2 failed: %s", err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "challenge2_failed", **err}))
+            return
+
+        c2_data = json.loads(result)
+        challenge2 = c2_data["data"]["challenge"]
+        log.info("RST: challenge2=%s", challenge2)
+
+        spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
+        log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
+
+        # ── Step 4: climateControl/check → roToken ──
+        # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
+        log.info("RST Step 4: climateControl/check for roToken (using ATC token)...")
+        check_body = json.dumps({"spinHash": spin_hash2}).encode()
+        result, err = self._api_request_with_token("POST", check_url,
+                                                    body=check_body,
+                                                    bearer_token=atc_token)
+        if result is None:
+            log.error("RST: climateControl/check failed: %s", err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "climate_check_failed", **err}))
             return
 
         check_data = json.loads(result)
         log.info("RST Step 4 response: %s", json.dumps(check_data)[:500])
-        data_block = check_data.get("data", {})
-        ro_token = data_block.get("roToken", "")
-        captcha_idx = data_block.get("captchaIndex", "")
-        captcha_val = data_block.get("captchaValue", "")
-        if ro_token:
-            log.info("RST: Got roToken (%d chars), captcha=%s/%s", len(ro_token), captcha_idx, captcha_val)
-        else:
-            # MQB/ATC vehicles return empty data — roToken not needed for RST POST
-            log.info("RST: SPIN check returned empty data (MQB/ATC) — proceeding without roToken")
+        ro_token = check_data.get("data", {}).get("roToken", "")
+        if not ro_token:
+            log.error("RST: No roToken in climateControl/check response")
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_ro_token",
+                            "msg": "climateControl/check returned no roToken",
+                            "response": json.dumps(check_data)[:300]}))
+            return
+        log.info("RST: Got roToken (%d chars)", len(ro_token))
 
-        # Step 5: Build encrypted payload
-        log.info("RST Step 5: Building encrypted payload...")
-        encrypted_payload = self._build_encrypted_payload(pairing_key_seed, mobile_app_id)
-        log.info("RST: encryptedPayload=%s", encrypted_payload)
-
-        # Step 6: Sign with KeyStore via Frida
-        log.info("RST Step 6: Signing with Android KeyStore...")
-        data_to_sign = self._sign_with_keystore(encrypted_payload)
-        if not data_to_sign:
-            log.warning("RST: KeyStore signing failed — trying without signature")
-            data_to_sign = ""
-
-        # Step 7: POST to /rst/v1/
-        log.info("RST Step 7: Sending remote start command...")
-        rst_url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
-        rst_payload = {
-            "pairingId": pairing_id,
-            "rstPinHash": rst_pin_hash,
-            "encryptedPayload": encrypted_payload,
-            "dataToSign": data_to_sign,
-        }
-        if ro_token:
-            rst_payload["roToken"] = ro_token
-        else:
-            log.info("RST: Omitting roToken from POST body (MQB/ATC)")
-        rst_body = json.dumps(rst_payload).encode()
+        # ── Step 5: POST /rst/v1/vehicle/{vid} ──
+        # Body is just {"roToken": "..."} — no pairing, no encryption, no signature needed
+        # MUST use carnetVehicleToken as Bearer
+        log.info("RST Step 5: Sending remote start command...")
+        rst_body = json.dumps({"roToken": ro_token}).encode()
         log.info("RST: POST body size=%d bytes", len(rst_body))
 
-        result, err = self._api_request("POST", rst_url, body=rst_body, vid=vid, timeout=30)
+        result, err = self._api_request_with_token("POST", rst_url,
+                                                    body=rst_body,
+                                                    bearer_token=atc_token,
+                                                    timeout=30)
         if result is None:
             log.error("Remote start POST failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
@@ -1104,20 +1152,25 @@ class VWTokenRelay:
         # Extract correlationId for polling
         correlation_id = rst_data.get("data", {}).get("correlationId")
         if not correlation_id:
+            # Some responses have correlationId at top level
+            correlation_id = rst_data.get("correlationId")
+        if not correlation_id:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
                 json.dumps(rst_data), retain=False)
             log.info("RST: No correlationId in response — published raw result")
             return
 
-        # Step 8: Poll for result (uses _api_request for auto-retry)
-        log.info("RST Step 8: Polling for result (correlationId=%s)...", correlation_id)
+        # ── Step 6: Poll for result ──
+        log.info("RST Step 6: Polling for result (correlationId=%s)...", correlation_id)
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
             json.dumps({"status": "pending", "correlationId": correlation_id}), retain=False)
 
         poll_url = f"{BASE_URL}/history/v1/vehicle/{vid}/correlationId/{correlation_id}/ro/"
         for attempt in range(12):  # Poll up to 2 minutes
             time.sleep(10)
-            poll_result, poll_err = self._api_request("GET", poll_url, vid=vid)
+            # Use carnetVehicleToken for polling too
+            poll_result, poll_err = self._api_request_with_token("GET", poll_url,
+                                                                  bearer_token=atc_token)
             if poll_result is not None:
                 poll_data = json.loads(poll_result)
                 status_str = poll_data.get("data", {}).get("responseStatusString", "")
@@ -1157,17 +1210,65 @@ class VWTokenRelay:
             json.dumps({"status": "timeout", "correlationId": correlation_id}), retain=False)
 
     def _api_remote_start_stop(self, vehicle_id):
-        """Stop a running remote start with auto-retry."""
-        vid = vehicle_id.strip()
-        url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
+        """Stop a running remote start. Needs ATC carnetVehicleToken as Bearer.
 
-        result, err = self._api_request("DELETE", url, vid=vid)
+        Flow: challenge → ATC session → DELETE /rst/v1/vehicle/{vid}
+        No roToken needed for stop — just the carnetVehicleToken.
+        """
+        vid = vehicle_id.strip()
+        log.info("═══ REMOTE STOP ═══ vehicle=%s", vid)
+
+        if not self.vw_spin:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_spin", "msg": "S-PIN not configured"}))
+            return
+
+        if not self.id_token or not self.user_id:
+            log.error("RST STOP: Missing id_token or user_id")
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_id_token", "msg": "No id_token/user_id — wake app first"}))
+            return
+
+        # Get ATC carnetVehicleToken via challenge + session
+        challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
+        session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/session"
+
+        result, err = self._api_request("GET", challenge_url, vid=vid)
+        if result is None:
+            log.error("RST STOP: Challenge failed: %s", err)
+            return
+
+        c_data = json.loads(result)
+        challenge = c_data["data"]["challenge"]
+        spin_hash = hashlib.sha512(f"{challenge}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
+
+        session_body = json.dumps({
+            "idToken": self.id_token,
+            "spinHash": spin_hash,
+            "tsp": "ATC"
+        }).encode()
+        result, err = self._api_request("POST", session_url, body=session_body, vid=vid)
+        if result is None:
+            log.error("RST STOP: ATC session failed: %s", err)
+            return
+
+        atc_token = json.loads(result).get("data", {}).get("carnetVehicleToken")
+        if not atc_token:
+            log.error("RST STOP: No carnetVehicleToken in session response")
+            return
+
+        # DELETE with carnetVehicleToken as Bearer — no body needed
+        rst_url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
+        result, err = self._api_request_with_token("DELETE", rst_url,
+                                                    bearer_token=atc_token, timeout=30)
         if result is not None:
-            log.info("RST STOP success: %s", result[:200])
+            log.info("═══ REMOTE STOP SUCCESS ═══ %s", result[:200])
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
                 json.dumps({"status": "stopped"}), retain=False)
         else:
             log.error("RST stop failed: %s", err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "rst_stop_failed", **err}))
 
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _adb_check(self):
