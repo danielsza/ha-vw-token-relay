@@ -64,6 +64,18 @@ fi
 # PIF_UPDATE_INTERVAL=3600
 echo "PIF auto-updater: DISABLED (manual via vw/cmd/update_pif)"
 
+# ── One-time PIF module fix ──
+# Disable PIF module to recover from boot loop caused by bad fingerprint.
+# This runs once on startup; remove after phone is stable.
+(
+    while ! adb devices 2>/dev/null | grep -q "device$"; do sleep 5; done
+    echo "PIF-FIX: Attempting to disable PIF module via ADB..."
+    adb shell "su -c 'touch /data/adb/modules/playintegrityfix/disable'" 2>&1 || echo "PIF-FIX: su failed (safe mode?)"
+    # Also try to revert the bad fingerprint
+    adb shell "su -c 'rm -f /data/adb/modules/playintegrityfix/custom.pif.prop'" 2>&1 || true
+    echo "PIF-FIX: Done. Reboot phone to apply."
+) &
+
 echo "============================================="
 echo "  VW Token Relay — Starting"
 echo "============================================="
