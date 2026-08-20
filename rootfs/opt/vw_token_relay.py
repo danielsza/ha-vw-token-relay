@@ -524,6 +524,8 @@ class VWTokenRelay:
             threading.Thread(target=self._cmd_get_pairing, args=(payload,), daemon=True).start()
         elif cmd == "dump_ui":
             threading.Thread(target=self._dump_ui, daemon=True).start()
+        elif cmd == "ui_xml":
+            threading.Thread(target=self._cmd_ui_xml, daemon=True).start()
         elif cmd == "dump_storage":
             threading.Thread(target=self._dump_rn_storage, daemon=True).start()
         elif cmd == "switch_vehicle":
@@ -962,6 +964,62 @@ class VWTokenRelay:
                 return cached
         log.error("No active pairing found for vehicle %s (API empty, no cache)", vehicle_id)
         return None
+
+    def _cmd_ui_xml(self):
+        """Dump uiautomator XML and publish to MQTT for remote debugging."""
+        log.info("UI_XML: Dumping uiautomator hierarchy...")
+        xml = self._dump_ui_xml()
+        if xml:
+            # Publish to MQTT - split into chunks if needed (MQTT max ~256KB)
+            if len(xml) > 100000:
+                # Just publish element summaries
+                import xml.etree.ElementTree as ET
+                try:
+                    root = ET.fromstring(xml)
+                    elements = []
+                    for node in root.iter("node"):
+                        a = node.attrib
+                        text = a.get("text", "")
+                        desc = a.get("content-desc", "")
+                        rid = a.get("resource-id", "")
+                        cls = a.get("class", "")
+                        bounds = a.get("bounds", "")
+                        click = a.get("clickable", "false")
+                        if text or desc or click == "true":
+                            elements.append({
+                                "t": text[:50], "d": desc[:50],
+                                "r": rid.split("/")[-1] if "/" in rid else rid,
+                                "c": cls.split(".")[-1] if "." in cls else cls,
+                                "b": bounds, "k": click
+                            })
+                    result = json.dumps({"count": len(elements), "elements": elements})
+                except Exception as e:
+                    result = json.dumps({"error": f"parse failed: {e}", "raw_len": len(xml)})
+            else:
+                result = xml
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_xml", result, retain=False)
+            log.info("UI_XML: Published %d bytes to MQTT", len(result))
+            # Also log key clickable elements
+            import xml.etree.ElementTree as ET
+            try:
+                root = ET.fromstring(xml)
+                for node in root.iter("node"):
+                    a = node.attrib
+                    text = a.get("text", "")
+                    desc = a.get("content-desc", "")
+                    click = a.get("clickable", "false")
+                    bounds = a.get("bounds", "")
+                    if (text or desc) and click == "true":
+                        log.info("UI_XML clickable: text='%s' desc='%s' bounds=%s",
+                                 text[:40], desc[:40], bounds)
+                    elif text and len(text) > 1:
+                        log.info("UI_XML text: '%s' bounds=%s", text[:60], bounds)
+            except Exception:
+                pass
+        else:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_xml",
+                json.dumps({"error": "dump_failed"}), retain=False)
+            log.warning("UI_XML: uiautomator dump failed")
 
     def _cmd_get_pairing(self, vehicle_id):
         """Query and publish pairing status for a vehicle."""
