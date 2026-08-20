@@ -388,6 +388,8 @@ class VWTokenRelay:
             threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
         elif cmd == "remote_start_stop":
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
+        elif cmd == "dump_ui":
+            threading.Thread(target=self._dump_ui, daemon=True).start()
         elif cmd == "update_pif":
             threading.Thread(target=self._update_pif, daemon=True).start()
         else:
@@ -1316,6 +1318,75 @@ class VWTokenRelay:
             log.error("SCREENCAP: Failed: %s", e)
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/screencap",
+                json.dumps({"status": "error", "msg": str(e)}),
+            )
+
+    def _dump_ui(self):
+        """Dump the Android UI hierarchy via uiautomator for debugging.
+        Publishes the XML to MQTT and logs key elements."""
+        try:
+            log.info("DUMP_UI: Running uiautomator dump...")
+            # Dump UI hierarchy to XML file on phone
+            r = subprocess.run(
+                ["adb", "shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
+                capture_output=True, text=True, timeout=30,
+            )
+            log.info("DUMP_UI: dump result: %s", r.stdout.strip())
+
+            # Pull the XML file
+            subprocess.run(
+                ["adb", "pull", "/sdcard/ui_dump.xml", "/share/ui_dump.xml"],
+                capture_output=True, timeout=15,
+            )
+
+            # Read and parse
+            try:
+                with open("/share/ui_dump.xml", "r") as f:
+                    xml_content = f.read()
+            except FileNotFoundError:
+                log.error("DUMP_UI: XML file not found after pull")
+                return
+
+            # Log the full XML (it's usually small enough)
+            log.info("DUMP_UI: XML length=%d", len(xml_content))
+
+            # Parse and log clickable/important elements
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml_content)
+            interesting = []
+            for node in root.iter("node"):
+                text = node.get("text", "")
+                desc = node.get("content-desc", "")
+                clz = node.get("class", "")
+                bounds = node.get("bounds", "")
+                clickable = node.get("clickable", "false")
+                if text or desc or clickable == "true":
+                    interesting.append({
+                        "text": text,
+                        "desc": desc,
+                        "class": clz.split(".")[-1] if "." in clz else clz,
+                        "bounds": bounds,
+                        "clickable": clickable,
+                    })
+
+            for elem in interesting:
+                log.info("DUMP_UI: %s", json.dumps(elem))
+
+            # Publish summary to MQTT
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/ui_dump",
+                json.dumps({"status": "ok", "elements": len(interesting),
+                             "items": interesting[:50]}),  # limit to 50
+            )
+
+            # Also log foreground activity
+            fg = self._get_foreground_activity()
+            log.info("DUMP_UI: Foreground: %s", fg)
+
+        except Exception as e:
+            log.error("DUMP_UI: Failed: %s", e)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/ui_dump",
                 json.dumps({"status": "error", "msg": str(e)}),
             )
 

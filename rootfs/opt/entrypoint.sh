@@ -105,6 +105,18 @@ echo "PIF auto-updater: DISABLED (manual via vw/cmd/update_pif)"
     fi
 ) &
 
+# ── Tiny HTTP file server for screenshots ──
+# Serves /share/ on ingress port so screenshots can be viewed via HA UI
+mkdir -p /share/vw-relay
+python3 -c "
+import http.server, socketserver, os
+os.chdir('/share')
+handler = http.server.SimpleHTTPRequestHandler
+with socketserver.TCPServer(('0.0.0.0', 8099), handler) as s:
+    s.serve_forever()
+" &
+echo "File server: listening on :8099 (serves /share/)"
+
 echo "============================================="
 echo "  VW Token Relay — Starting"
 echo "============================================="
