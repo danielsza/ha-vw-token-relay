@@ -1914,7 +1914,15 @@ class VWTokenRelay:
 
     def _auto_login(self):
         """Automated login flow: clear data → launch → fill WebView credentials.
-        Uses uiautomator dump to find UI elements dynamically."""
+        Uses uiautomator dump to find UI elements dynamically.
+
+        App flow after pm clear:
+          1. Splash/Welcome screen ("We ride with Canada") → tap anywhere / swipe
+          2. "Log into myVW" native screen → tap "Log in" button (id=loginButton)
+          3. AzsCallbackActivity WebView → OIDC email page (id=input_email, btn=next-btn)
+          4. OIDC password page (id=input_password)
+          5. Redirect back to app → Frida captures token
+        """
         if not self.vw_email or not self.vw_password:
             log.error("AUTO_LOGIN: No credentials configured (vw_email/vw_password)")
             return
@@ -1948,25 +1956,28 @@ class VWTokenRelay:
                     return line.strip()
             return "unknown"
 
-        def _wait_for_activity(target, timeout=30):
-            """Wait until a specific activity substring appears."""
+        def _wait_for_ui_element(desc, timeout=20, interval=3, **kwargs):
+            """Retry uiautomator dump until element appears. Returns (xml, True) or (last_xml, False)."""
             start = time.time()
+            last_xml = None
             while time.time() - start < timeout:
-                act = _get_activity()
-                if target.lower() in act.lower():
-                    return act
-                time.sleep(2)
-            return None
+                xml = self._dump_ui_xml()
+                last_xml = xml
+                elems = self._find_ui_elements(xml, **kwargs)
+                if elems:
+                    log.info("AUTO_LOGIN: wait_for_element found '%s' after %.1fs",
+                             desc, time.time() - start)
+                    return xml, True
+                time.sleep(interval)
+            log.warning("AUTO_LOGIN: wait_for_element timed out for '%s'", desc)
+            return last_xml, False
 
         def _log_ui_elements(xml_str, label=""):
             """Log all clickable/focusable elements for debugging."""
             if not xml_str:
                 log.info("UI_DUMP[%s]: No XML available", label)
                 return
-            elems = self._find_ui_elements(xml_str, text="")
-            # Log all elements with text or content-desc
             import xml.etree.ElementTree as ET
-            import re
             try:
                 root = ET.fromstring(xml_str)
                 count = 0
@@ -1983,14 +1994,14 @@ class VWTokenRelay:
                                  label, cls.split(".")[-1] if cls else "",
                                  bounds, clickable, txt[:40], desc[:40], rid[:60])
                         count += 1
-                        if count > 30:
+                        if count > 40:
                             log.info("UI[%s] ... (%d+ elements, truncated)", label, count)
                             break
             except Exception as e:
                 log.warning("UI[%s] parse error: %s", label, e)
 
         try:
-            log.info("AUTO_LOGIN: Starting automated login flow...")
+            log.info("AUTO_LOGIN: ====== Starting automated login flow ======")
 
             # Step 1: Clear app data
             log.info("AUTO_LOGIN: Step 1 — Clearing app data...")
@@ -2014,149 +2025,184 @@ class VWTokenRelay:
                 ["adb", "shell", "am", "start", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
                 capture_output=True, timeout=10)
-            time.sleep(8)  # Wait for splash/welcome screen
+            time.sleep(10)  # Longer wait for splash/welcome
 
             activity = _get_activity()
             log.info("AUTO_LOGIN: After launch, activity: %s", activity)
 
-            # Step 4: Navigate welcome/onboarding using UI element detection
-            log.info("AUTO_LOGIN: Step 4 — Navigating welcome screen...")
-            xml = self._dump_ui_xml()
-            _log_ui_elements(xml, "welcome")
-
-            # Try common button texts for welcome/onboarding
-            tapped = False
-            for btn_text in ["Let's Go", "Get Started", "Continue", "Next", "Accept",
-                             "I Agree", "OK", "AGREE", "ACCEPT"]:
-                if self._tap_element(xml, f"welcome:{btn_text}", text=btn_text):
-                    tapped = True
-                    time.sleep(3)
-                    break
-            if not tapped:
-                # Fallback: tap bottom center where CTA usually is
-                _tap(360, 1350, "bottom CTA fallback")
-                time.sleep(3)
-
-            # Handle permission dialogs (Android system)
+            # Step 4: Dismiss welcome/splash screen(s)
+            # The app shows "We ride with Canada" splash. Tap through it.
+            log.info("AUTO_LOGIN: Step 4 — Dismissing welcome screen(s)...")
             for attempt in range(3):
                 xml = self._dump_ui_xml()
-                _log_ui_elements(xml, f"permission_{attempt}")
-                # Android permission dialog buttons
-                perm_tapped = False
+                _log_ui_elements(xml, f"screen_{attempt}")
+
+                # Check if we've reached the native login screen (has loginButton)
+                login_elems = self._find_ui_elements(xml, resource_id="loginButton")
+                if login_elems:
+                    log.info("AUTO_LOGIN: Found loginButton — on native login screen")
+                    break
+
+                # Check if we've already reached the WebView
+                act = _get_activity()
+                if "AzsCallback" in act:
+                    log.info("AUTO_LOGIN: Already on WebView, skipping to email entry")
+                    break
+
+                # Try to dismiss whatever screen we're on
+                tapped = False
+                # Try common button texts
+                for btn_text in ["Let's Go", "Get Started", "Continue", "Next",
+                                 "Accept", "OK", "Log in"]:
+                    if self._tap_element(xml, f"dismiss:{btn_text}", text=btn_text):
+                        tapped = True
+                        time.sleep(3)
+                        break
+
+                if not tapped:
+                    # Try any clickable Button element
+                    btn_elems = self._find_ui_elements(xml, class_name="android.widget.Button")
+                    if btn_elems:
+                        cx, cy, bounds, attrs = btn_elems[0]
+                        log.info("AUTO_LOGIN: tapping first Button(%d,%d) text='%s'",
+                                 cx, cy, attrs.get("text", "")[:30])
+                        subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                                       capture_output=True, timeout=10)
+                        tapped = True
+                        time.sleep(3)
+
+                if not tapped:
+                    # Fallback: swipe up to dismiss
+                    log.info("AUTO_LOGIN: No button found, swiping up...")
+                    _swipe(360, 1200, 360, 400, 300)
+                    time.sleep(3)
+
+                # Handle permission dialogs
+                xml = self._dump_ui_xml()
                 for perm_text in ["While using the app", "Allow", "ALLOW",
                                   "While using", "Only this time"]:
-                    if self._tap_element(xml, f"permission:{perm_text}", text=perm_text):
-                        perm_tapped = True
+                    if self._tap_element(xml, f"perm:{perm_text}", text=perm_text):
                         time.sleep(2)
+                        xml = self._dump_ui_xml()  # Re-dump after permission
                         break
-                # Also try resource-id for system permission buttons
-                if not perm_tapped:
-                    for rid in ["com.android.permissioncontroller:id/permission_allow_foreground_only_button",
-                                "com.android.permissioncontroller:id/permission_allow_button",
-                                "android:id/button1"]:
-                        if self._tap_element(xml, f"perm_rid:{rid}", resource_id=rid):
-                            perm_tapped = True
-                            time.sleep(2)
-                            break
-                if not perm_tapped:
-                    break  # No more permission dialogs
 
-            # Step 5: Find and tap Log In button
-            log.info("AUTO_LOGIN: Step 5 — Looking for login button...")
+            # Step 5: Tap "Log in" on native login screen
+            log.info("AUTO_LOGIN: Step 5 — Tapping native 'Log in' button...")
             xml = self._dump_ui_xml()
-            _log_ui_elements(xml, "login_screen")
+            _log_ui_elements(xml, "native_login")
 
-            login_tapped = False
-            for btn_text in ["Log In", "Login", "Sign In", "LOG IN", "SIGN IN", "Sign in"]:
-                if self._tap_element(xml, f"login:{btn_text}", text=btn_text):
-                    login_tapped = True
-                    break
+            # Primary: find by resource_id (most reliable)
+            login_tapped = self._tap_element(xml, "loginButton", resource_id="loginButton")
             if not login_tapped:
-                # Fallback
-                _tap(360, 1350, "Log In fallback")
+                # Secondary: find by text
+                for btn_text in ["Log in", "Log In", "Login", "Sign In"]:
+                    if self._tap_element(xml, f"login:{btn_text}", text=btn_text):
+                        login_tapped = True
+                        break
+            if not login_tapped:
+                # Fallback: tap center of screen where button typically is (360, 935)
+                _tap(360, 935, "Log in button fallback")
 
-            # Wait for WebView (AzsCallbackActivity) to load
-            log.info("AUTO_LOGIN: Waiting for OIDC WebView...")
-            act = _wait_for_activity("AzsCallback", timeout=15)
-            if act:
-                log.info("AUTO_LOGIN: WebView loaded: %s", act)
-            else:
-                log.warning("AUTO_LOGIN: WebView didn't load, checking current activity...")
-                activity = _get_activity()
-                log.info("AUTO_LOGIN: Current: %s", activity)
+            time.sleep(5)  # Wait for WebView to start loading
 
-            time.sleep(3)  # Let WebView content render
+            # Step 6: Wait for WebView to render email input
+            log.info("AUTO_LOGIN: Step 6 — Waiting for OIDC email page...")
 
-            # Step 6: Enter email in OIDC WebView
-            log.info("AUTO_LOGIN: Step 6 — Entering email...")
-            xml = self._dump_ui_xml()
-            _log_ui_elements(xml, "webview_email")
+            # Wait for WebView content to appear (retry dumps)
+            xml, found = _wait_for_ui_element(
+                "email input", timeout=25, interval=3,
+                resource_id="input_email")
 
-            # Find email input field — try EditText class or input fields
+            if not found:
+                # Try EditText as fallback
+                xml, found = _wait_for_ui_element(
+                    "any EditText", timeout=10, interval=2,
+                    class_name="android.widget.EditText")
+
+            _log_ui_elements(xml, "oidc_email_page")
+
+            # Tap email input field
             email_tapped = False
             for search in [
+                {"resource_id": "input_email"},
                 {"class_name": "android.widget.EditText"},
                 {"resource_id": "email"},
-                {"resource_id": "username"},
-                {"content_desc": "email"},
             ]:
                 if self._tap_element(xml, "email field", **search):
                     email_tapped = True
                     break
             if not email_tapped:
-                _tap(360, 550, "email field fallback")
+                # Known fallback coords from UI dump: email at [56,799][665,869] → center(360,834)
+                _tap(360, 834, "email field fallback (known coords)")
 
             time.sleep(1)
             _input_text(self.vw_email, "email")
             time.sleep(1)
 
-            # Try tapping Next/Continue button
+            # Tap Next button
             xml = self._dump_ui_xml()
-            _log_ui_elements(xml, "after_email_input")
             next_tapped = False
-            for btn_text in ["Next", "Continue", "NEXT", "CONTINUE", "Weiter"]:
-                if self._tap_element(xml, f"next:{btn_text}", text=btn_text):
+            for search in [
+                {"resource_id": "next-btn"},
+                {"text": "Next"},
+            ]:
+                if self._tap_element(xml, "Next button", **search):
                     next_tapped = True
                     break
             if not next_tapped:
-                # Try Enter key then fallback tap
-                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
-                               capture_output=True, timeout=10)
-            time.sleep(4)
+                # Known fallback coords: Next at [229,1058][490,1140] → center(360,1099)
+                _tap(360, 1099, "Next button fallback (known coords)")
+
+            time.sleep(5)  # Wait for password page
 
             # Step 7: Enter password
             log.info("AUTO_LOGIN: Step 7 — Entering password...")
-            xml = self._dump_ui_xml()
-            _log_ui_elements(xml, "webview_password")
+
+            # Wait for password field to appear
+            xml, found = _wait_for_ui_element(
+                "password input", timeout=15, interval=3,
+                resource_id="input_password")
+
+            if not found:
+                xml, found = _wait_for_ui_element(
+                    "any EditText", timeout=10, interval=2,
+                    class_name="android.widget.EditText")
+
+            _log_ui_elements(xml, "oidc_password_page")
 
             pwd_tapped = False
             for search in [
+                {"resource_id": "input_password"},
                 {"class_name": "android.widget.EditText"},
                 {"resource_id": "password"},
-                {"content_desc": "password"},
             ]:
                 if self._tap_element(xml, "password field", **search):
                     pwd_tapped = True
                     break
             if not pwd_tapped:
-                _tap(360, 550, "password field fallback")
+                # Same approx coords as email field
+                _tap(360, 834, "password field fallback")
 
             time.sleep(1)
             _input_text(self.vw_password, "password")
             time.sleep(1)
 
-            # Submit login
+            # Submit login — try Next/Login button
             xml = self._dump_ui_xml()
-            _log_ui_elements(xml, "after_password_input")
+            _log_ui_elements(xml, "after_password")
             submit_tapped = False
-            for btn_text in ["Sign In", "Log In", "Login", "Submit",
-                             "SIGN IN", "LOG IN", "Anmelden"]:
-                if self._tap_element(xml, f"submit:{btn_text}", text=btn_text):
+            for search in [
+                {"resource_id": "next-btn"},
+                {"text": "Next"},
+                {"text": "Sign In"},
+                {"text": "Log In"},
+                {"text": "Login"},
+            ]:
+                if self._tap_element(xml, "submit button", **search):
                     submit_tapped = True
                     break
             if not submit_tapped:
-                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
-                               capture_output=True, timeout=10)
+                _tap(360, 1099, "submit fallback (known coords)")
 
             log.info("AUTO_LOGIN: Waiting for OIDC redirect...")
             time.sleep(15)  # Wait for OIDC redirect + app load
