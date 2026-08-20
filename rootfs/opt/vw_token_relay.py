@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 import base64
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+# cryptography no longer needed — XTEA cipher is implemented inline
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -799,53 +799,94 @@ class VWTokenRelay:
                 json.dumps({"error": f"climate_{err.get('code','?')}", "action": action}))
 
     # ── Remote Start (ICE vehicles) ──────────────────────────────────
-    def _build_encrypted_payload(self, pairing_key_seed_hex, mobile_app_id):
+    @staticmethod
+    def _xtea_encrypt_block(v0, v1, key):
+        """XTEA encrypt a single 64-bit block (two 32-bit halves).
+        key = list of 4 uint32 values. 32 rounds, delta=0x9E3779B9."""
+        delta = 0x9E3779B9
+        s = 0
+        for _ in range(32):
+            v0 = (v0 + ((((v1 << 4) ^ (v1 >> 5)) + v1) ^ (s + key[s & 3]))) & 0xFFFFFFFF
+            s = (s + delta) & 0xFFFFFFFF
+            v1 = (v1 + ((((v0 << 4) ^ (v0 >> 5)) + v0) ^ (s + key[(s >> 11) & 3]))) & 0xFFFFFFFF
+        return v0, v1
+
+    @staticmethod
+    def _crc8_0x2f(data):
+        """CRC-8 with polynomial 0x2F (SAE J1850). Returns inverted CRC byte."""
+        table = [0] * 256
+        for i in range(256):
+            val = i
+            for _ in range(8):
+                val = ((val << 1) ^ 0x2F) if (val & 0x80) else (val << 1)
+                val &= 0xFF
+            table[i] = val
+        crc = 0xFF
+        for b in data:
+            crc = table[crc ^ b]
+        return (~crc) & 0xFF
+
+    def _build_encrypted_payload(self, pairing_key_seed_hex, spin_hash,
+                                  captcha_index, captcha_value):
         """Build the encryptedPayload for RemoteStartRequest.
 
-        Crypto chain (from APK reverse engineering):
-          1. Get current time as milliseconds, create 3 timestamp ints
-          2. Convert each to 4-byte big-endian arrays
-          3. Hex-decode pairingKeySeed to bytes
-          4. XOR each timestamp array with key seed bytes (cycling)
-          5. AES/ECB encrypt using key seed as 16-byte key
-          6. XOR result with mobileAppId UTF-8 bytes (cycling)
-          7. Base64-encode → encryptedPayload
+        Correct crypto chain (from APK bytecode analysis — XTEA cipher):
+          1. Timestamps: [now-4000, now-2000, now] / 1000 → 3x uint32 BE
+          2. hashedPin = first 16 hex chars of SPIN hash → 8 bytes
+          3. data = ts[0] || ts[1] || hashedPinBytes || ts[2]  (20 bytes)
+          4. Append captchaIndex + captchaValue as single bytes (parsed from hex)
+          5. CRC-8 (poly 0x2F, inverted) + 0x00 padding → 24 bytes total
+          6. XTEA key derivation from pairingKeySeed (16 hex chars)
+          7. XTEA-ECB encrypt 3 blocks of 8 bytes
+          8. Returns raw encrypted bytes (caller hex-encodes for wire)
         """
-        key_seed_bytes = bytes.fromhex(pairing_key_seed_hex)
-
+        # ── 1. Timestamps ──
         now_ms = int(time.time() * 1000)
-        timestamps = [now_ms & 0xFFFFFFFF, (now_ms >> 16) & 0xFFFFFFFF, (now_ms >> 32) & 0xFFFFFFFF]
-        ts_bytes = b""
-        for ts in timestamps:
-            ts_bytes += struct.pack(">I", ts)
+        timestamps = [now_ms - 4000, now_ms - 2000, now_ms]
+        ts_bytes = [struct.pack(">I", int(ts / 1000) & 0xFFFFFFFF) for ts in timestamps]
 
-        # XOR with key seed (cycling)
-        xored = bytes(d ^ key_seed_bytes[i % len(key_seed_bytes)] for i, d in enumerate(ts_bytes))
+        # ── 2. Hashed PIN bytes (first 16 hex chars → 8 bytes) ──
+        hashed_pin_bytes = bytes.fromhex(spin_hash[:16])
 
-        # AES/ECB encrypt (pad key seed to 16 bytes)
-        aes_key = key_seed_bytes
-        if len(aes_key) < 16:
-            aes_key = aes_key + b"\x00" * (16 - len(aes_key))
-        elif len(aes_key) > 16:
-            aes_key = aes_key[:16]
+        # ── 3. Data construction: concat (NOT XOR) ──
+        data = ts_bytes[0] + ts_bytes[1] + hashed_pin_bytes + ts_bytes[2]  # 20 bytes
 
-        plaintext = xored
-        pad_len = 16 - (len(plaintext) % 16)
-        if pad_len < 16:
-            plaintext = plaintext + b"\x00" * pad_len
+        # ── 4. Captcha values (hex string → single byte each) ──
+        data += bytes([int(captcha_index, 16)])   # 21 bytes
+        data += bytes([int(captcha_value, 16)])    # 22 bytes
 
-        cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
-        encryptor = cipher.encryptor()
-        encrypted = encryptor.update(plaintext) + encryptor.finalize()
+        # ── 5. CRC-8 + padding ──
+        crc = self._crc8_0x2f(data)
+        data += bytes([crc, 0x00])  # 24 bytes (3 XTEA blocks)
 
-        # XOR with mobileAppId bytes (cycling)
-        app_id_bytes = mobile_app_id.encode("utf-8")
-        result = bytes(d ^ app_id_bytes[i % len(app_id_bytes)] for i, d in enumerate(encrypted))
+        log.debug("RST plaintext (%d bytes): %s", len(data), data.hex().upper())
 
-        return base64.b64encode(result).decode("ascii")
+        # ── 6. XTEA key derivation from pairingKeySeed ──
+        seed_int = int(pairing_key_seed_hex[:16], 16)
+        hi = (seed_int >> 32) & 0xFFFFFFFF
+        lo = seed_int & 0xFFFFFFFF
+        temp_key = [hi, lo, (~hi) & 0xFFFFFFFF, (~lo) & 0xFFFFFFFF]
+        new_hi, new_lo = self._xtea_encrypt_block(hi, lo, temp_key)
+        final_key = [new_hi, new_lo, 0, 0]
 
-    def _sign_with_keystore(self, data_b64):
-        """Use Frida RPC to sign data with the phone's Android KeyStore key."""
+        log.debug("RST XTEA key: [%08X, %08X, %08X, %08X]",
+                  final_key[0], final_key[1], final_key[2], final_key[3])
+
+        # ── 7. XTEA-ECB encrypt (3 blocks × 8 bytes) ──
+        encrypted = b""
+        for i in range(0, len(data), 8):
+            v0 = struct.unpack(">I", data[i:i+4])[0]
+            v1 = struct.unpack(">I", data[i+4:i+8])[0]
+            ev0, ev1 = self._xtea_encrypt_block(v0, v1, final_key)
+            encrypted += struct.pack(">I", ev0) + struct.pack(">I", ev1)
+
+        log.info("RST: XTEA encrypted %d bytes → %d bytes", len(data), len(encrypted))
+        return encrypted  # raw bytes — caller hex-encodes
+
+    def _sign_with_keystore(self, data_b64, user_id=None):
+        """Use Frida RPC to sign data with the phone's Android KeyStore key.
+        data_b64: base64-encoded bytes to sign (pairingId UTF-8 + encrypted bytes).
+        user_id: if set, use 'Entry {user_id}' as the KeyStore alias."""
         if not self.script:
             log.error("No Frida script loaded — cannot sign")
             return None
@@ -853,6 +894,19 @@ class VWTokenRelay:
         try:
             # First discover the KeyStore alias if we haven't yet
             if not hasattr(self, '_keystore_alias') or self._keystore_alias is None:
+                # Try known VW alias pattern: "Entry {userId}"
+                if user_id:
+                    candidate = f"Entry {user_id}"
+                    log.info("Trying VW KeyStore alias: %s", candidate)
+                    sign_raw = self.script.exports_sync.sign_with_keystore(data_b64, candidate)
+                    if sign_raw:
+                        result = json.loads(sign_raw)
+                        if "signature" in result:
+                            self._keystore_alias = candidate
+                            log.info("Using VW KeyStore alias: %s (algo=%s)",
+                                     candidate, result.get("algorithm", "?"))
+                            return result["signature"]
+
                 aliases_raw = self.script.exports_sync.list_keystore_aliases()
                 if aliases_raw is None:
                     log.error("KeyStore: RPC returned None — Frida script may not be attached")
@@ -1206,6 +1260,8 @@ class VWTokenRelay:
         # consumes the challenge but returns empty data, poisoning the state.
         check_body = json.dumps({"spinHash": spin_hash2}).encode()
         ro_token = None
+        captcha_index = "0"
+        captcha_value = "0"
         for operation in ("remoteStart", "climateControl"):
             op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
             log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
@@ -1216,8 +1272,11 @@ class VWTokenRelay:
                 check_data = json.loads(result)
                 log.info("RST Step 4 (%s) response: %s", operation, json.dumps(check_data)[:500])
                 ro_token = check_data.get("data", {}).get("roToken", "")
+                captcha_index = check_data.get("data", {}).get("captchaIndex", "0")
+                captcha_value = check_data.get("data", {}).get("captchaValue", "0")
                 if ro_token:
-                    log.info("RST: Got roToken (%d chars) via %s", len(ro_token), operation)
+                    log.info("RST: Got roToken (%d chars) via %s, captchaIndex=%s, captchaValue=%s",
+                             len(ro_token), operation, captcha_index, captcha_value)
                     break
                 else:
                     log.warning("RST: %s/check returned 200 but no roToken: %s",
@@ -1272,29 +1331,32 @@ class VWTokenRelay:
         if pairing and pairing.get("pairingKeySeed") and pairing.get("pairingId"):
             pairing_id = pairing["pairingId"]
             pairing_seed = pairing["pairingKeySeed"]
-            mobile_app_id = pairing.get("mobileAppId", VW_API_HEADERS.get("x-app-uuid", ""))
 
-            log.info("RST: Building encrypted payload (seed=%s, appId=%s)",
-                     pairing_seed[:4] + "...", mobile_app_id[:8] + "...")
+            log.info("RST: Building XTEA encrypted payload (seed=%s...)",
+                     pairing_seed[:4])
 
-            encrypted_payload = self._build_encrypted_payload(pairing_seed, mobile_app_id)
-            log.info("RST: encryptedPayload built (%d chars)", len(encrypted_payload))
+            # Build encrypted payload with XTEA cipher
+            encrypted_bytes = self._build_encrypted_payload(
+                pairing_seed, spin_hash2, captcha_index, captcha_value)
+            log.info("RST: XTEA encryptedPayload built (%d bytes)", len(encrypted_bytes))
 
-            # Sign the encrypted payload via Frida RPC (Android KeyStore ECDSA)
-            signature = self._sign_with_keystore(encrypted_payload)
+            # Sign: pairingId UTF-8 bytes + encrypted bytes (concatenated raw)
+            data_to_sign = pairing_id.encode("utf-8") + encrypted_bytes
+            sign_b64 = base64.b64encode(data_to_sign).decode("ascii")
+            signature = self._sign_with_keystore(sign_b64, user_id=self.user_id)
             if signature:
-                log.info("RST: encryptedPayloadSignature obtained (%d chars)", len(signature))
+                log.info("RST: ECDSA signature obtained (%d chars)", len(signature))
                 rst_payload["pairingId"] = pairing_id
-                rst_payload["rstSpinHash"] = spin_hash2
-                rst_payload["encryptedPayload"] = encrypted_payload
+                rst_payload["rstSpinHash"] = spin_hash2[:16]  # first 16 chars ONLY
+                rst_payload["encryptedPayload"] = encrypted_bytes.hex().upper()  # HEX not base64
                 rst_payload["encryptedPayloadSignature"] = signature
-                log.info("RST: Full pairing body built (5 fields)")
+                log.info("RST: Full pairing body built (5 fields, rstSpinHash=%s...)",
+                         rst_payload["rstSpinHash"][:8])
             else:
                 log.warning("RST: KeyStore signing failed — trying without signature")
-                # Still include pairing fields without signature as fallback
                 rst_payload["pairingId"] = pairing_id
-                rst_payload["rstSpinHash"] = spin_hash2
-                rst_payload["encryptedPayload"] = encrypted_payload
+                rst_payload["rstSpinHash"] = spin_hash2[:16]
+                rst_payload["encryptedPayload"] = encrypted_bytes.hex().upper()
                 log.info("RST: Partial pairing body (no signature, 4 fields)")
         else:
             log.warning("RST: No pairing data — sending minimal body (roToken only)")
