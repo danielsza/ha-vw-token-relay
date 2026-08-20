@@ -1440,14 +1440,26 @@ class VWTokenRelay:
 
             if os.path.exists("/share/vw_screen.png"):
                 sz = os.path.getsize("/share/vw_screen.png")
-                # Base64 encode for viewing through ingress proxy
+                # Base64 encode + HTML viewer for ingress proxy
                 import base64
                 try:
                     with open("/share/vw_screen.png", "rb") as f:
                         b64 = base64.b64encode(f.read()).decode()
                     with open("/share/vw_screen_b64.txt", "w") as f:
                         f.write(b64)
-                    log.info("SCREENCAP: Base64 written (%d chars)", len(b64))
+                    # Write HTML viewer with embedded image
+                    html = (
+                        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                        '<title>Phone Screen</title>'
+                        '<style>body{margin:0;background:#111;display:flex;'
+                        'justify-content:center;align-items:flex-start;min-height:100vh}'
+                        'img{max-height:100vh;width:auto}</style></head>'
+                        f'<body><img src="data:image/png;base64,{b64}"/>'
+                        '</body></html>'
+                    )
+                    with open("/share/vw_screen.html", "w") as f:
+                        f.write(html)
+                    log.info("SCREENCAP: Base64+HTML written (%d chars)", len(b64))
                 except Exception as be:
                     log.error("SCREENCAP: Base64 encode failed: %s", be)
                 self.mqttc.publish(
