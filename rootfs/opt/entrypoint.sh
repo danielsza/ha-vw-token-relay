@@ -67,13 +67,12 @@ PIF_UPDATE_INTERVAL=3600  # 1 hour in seconds
     sleep 30  # let boot settle
 
     echo "PIF: Starting auto-updater (interval: ${PIF_UPDATE_INTERVAL}s)"
-    # First run: use --reboot so Zygisk reloads with new props if changed
-    sh /opt/update_pif.sh --reboot || echo "PIF: Initial update failed (will retry)"
+    # No --reboot: auto-reboot disabled (risk of boot loop). Just kills DroidGuard.
+    sh /opt/update_pif.sh || echo "PIF: Initial update failed (will retry)"
 
     while true; do
         sleep ${PIF_UPDATE_INTERVAL}
-        # Hourly: reboot only if fingerprint actually changed
-        sh /opt/update_pif.sh --reboot || echo "PIF: Scheduled update failed (will retry next cycle)"
+        sh /opt/update_pif.sh || echo "PIF: Scheduled update failed (will retry next cycle)"
     done
 ) &
 
@@ -123,12 +122,12 @@ ensure_phone_ready() {
     DEVICE=$(adb devices | grep "device$" | head -1 | awk '{print $1}')
     echo "Found ADB device: ${DEVICE}"
 
-    # Ensure frida-server is running on the phone
-    if ! adb shell "pidof frida-server" > /dev/null 2>&1; then
-        echo "Starting frida-server on phone..."
-        adb shell "su -c '/data/local/tmp/frida-server -D &'" 2>/dev/null || true
-        sleep 3
-    fi
+    # Force-restart frida-server (don't trust stale PIDs after phone reboot)
+    echo "Starting frida-server on phone..."
+    adb shell "su -c 'killall frida-server'" 2>/dev/null || true
+    sleep 1
+    adb shell "su -c '/data/local/tmp/frida-server -D &'" 2>/dev/null || true
+    sleep 3
 
     # Wake screen so app can launch properly
     wake_screen
