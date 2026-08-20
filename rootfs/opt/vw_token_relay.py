@@ -980,24 +980,21 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
-        # Try vehicle-scoped token first, fall back to any valid token.
-        # Vehicle-scoped tokens have tid in the JWT; the global token
-        # also works for many vehicle endpoints (status, SPIN, RST).
+        # RST requires a vehicle-scoped token (with tid in JWT).
+        # The pairing endpoint and SPIN check return 403 with global tokens.
         token = self._get_valid_token(vid, vehicle_only=True)
         if token:
             log.info("RST: Using vehicle-scoped token for %s", vid[:8])
         else:
-            # Try global token before expensive vehicle switch
-            token = self._get_valid_token(vid, vehicle_only=False)
-            if token:
-                log.info("RST: No vehicle-scoped token — using global token for %s", vid[:8])
-            else:
-                log.info("RST: No valid token at all for %s — switching vehicle in app...", vid[:8])
-                self._switch_vehicle(vid)
-                token = self._get_valid_token(vid, vehicle_only=True)
-                if not token:
-                    token = self._get_valid_token(vid, vehicle_only=False)
-                if not token:
+            log.info("RST: No vehicle-scoped token for %s — switching vehicle in app...", vid[:8])
+            self._switch_vehicle(vid)
+            token = self._get_valid_token(vid, vehicle_only=True)
+            if not token:
+                # Last resort: try global token (some endpoints may work)
+                token = self._get_valid_token(vid, vehicle_only=False)
+                if token:
+                    log.warning("RST: Using global token as fallback — some steps may fail")
+                else:
                     log.error("RST: Vehicle switch failed — no token for %s", vid[:8])
                     self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
                         json.dumps({"error": "no_valid_token",
@@ -2091,6 +2088,15 @@ class VWTokenRelay:
                                        capture_output=True, timeout=10)
                         time.sleep(5)
 
+            # Step 2.5: Handle SPIN dialog if it appeared after vehicle tap
+            time.sleep(2)
+            xml_spin = self._dump_ui_xml()
+            if xml_spin:
+                spin_entered = self._enter_spin_if_present(xml_spin)
+                if spin_entered:
+                    log.info("SWITCH: SPIN entered — waiting for session to establish...")
+                    time.sleep(8)  # Give the app time to process the SPIN
+
             # Step 3: Wait for vehicle-scoped token
             log.info("SWITCH: Waiting for %s-scoped token...", target_name)
             for i in range(12):  # 60s max
@@ -2115,6 +2121,84 @@ class VWTokenRelay:
                 f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
                 json.dumps({"status": "error", "msg": str(e)}),
             )
+
+    def _enter_spin_if_present(self, xml_str):
+        """Detect and enter S-PIN in a dialog. Returns True if SPIN was entered."""
+        if not xml_str or not self.vw_spin:
+            return False
+
+        # Look for PIN entry indicators
+        has_pin_entry = bool(self._find_ui_elements(xml_str, resource_id="pin_entry"))
+        has_pin_field = bool(self._find_ui_elements(xml_str, resource_id="pin"))
+        has_edittext = bool(self._find_ui_elements(xml_str, class_name="EditText"))
+        has_confirm = (
+            bool(self._find_ui_elements(xml_str, resource_id="button_ok")) or
+            bool(self._find_ui_elements(xml_str, text="Confirm")) or
+            bool(self._find_ui_elements(xml_str, text="Verify")) or
+            bool(self._find_ui_elements(xml_str, text="OK"))
+        )
+
+        if not (has_pin_entry or has_pin_field or (has_edittext and has_confirm)):
+            return False
+
+        log.info("SPIN_ENTRY: SPIN dialog detected (pin_entry=%s pin=%s edittext=%s confirm=%s)",
+                 has_pin_entry, has_pin_field, has_edittext, has_confirm)
+
+        # Strategy 1: Tap pin_entry or EditText field, then type SPIN digits
+        target_field = None
+        if has_pin_entry:
+            elems = self._find_ui_elements(xml_str, resource_id="pin_entry")
+            if elems:
+                target_field = elems[0]
+        elif has_pin_field:
+            elems = self._find_ui_elements(xml_str, resource_id="pin")
+            if elems:
+                target_field = elems[0]
+        elif has_edittext:
+            elems = self._find_ui_elements(xml_str, class_name="EditText")
+            if elems:
+                target_field = elems[0]
+
+        if target_field:
+            cx, cy = target_field[0], target_field[1]
+            log.info("SPIN_ENTRY: Tapping PIN field at (%d, %d)", cx, cy)
+            subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                          capture_output=True, timeout=10)
+            time.sleep(1)
+
+        # Type the SPIN digits
+        log.info("SPIN_ENTRY: Typing S-PIN (%d digits)...", len(self.vw_spin))
+        subprocess.run(["adb", "shell", "input", "text", self.vw_spin],
+                      capture_output=True, timeout=10)
+        time.sleep(1)
+
+        # Re-dump UI and tap Confirm/Verify/OK
+        xml2 = self._dump_ui_xml()
+        if xml2:
+            for btn_search in [
+                {"resource_id": "button_ok"},
+                {"text": "Confirm"},
+                {"text": "Verify"},
+                {"text": "OK"},
+                {"text": "Submit"},
+                {"text": "CONFIRM"},
+                {"text": "VERIFY"},
+            ]:
+                elems = self._find_ui_elements(xml2, **btn_search)
+                if elems:
+                    cx, cy = elems[0][0], elems[0][1]
+                    log.info("SPIN_ENTRY: Tapping confirm button at (%d, %d) [%s]",
+                             cx, cy, btn_search)
+                    subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                                  capture_output=True, timeout=10)
+                    log.info("SPIN_ENTRY: S-PIN submitted successfully")
+                    return True
+
+        # Fallback: press Enter key
+        log.info("SPIN_ENTRY: No confirm button found — pressing Enter")
+        subprocess.run(["adb", "shell", "input", "keyevent", "ENTER"],
+                      capture_output=True, timeout=10)
+        return True
 
     def _clear_app_data(self):
         """Clear VW app data to force fresh login."""
