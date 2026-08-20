@@ -1260,28 +1260,51 @@ class VWTokenRelay:
         spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
         log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
 
-        # ── Step 3b: Initialize captcha (GET /operation/climateControl) ──
-        # The server requires a captcha to be set up before /check returns
-        # the roToken.  The VW app creates this during its navigation flow.
-        # Calling GET on the operation endpoint creates/refreshes it.
+        # ── Step 3b: Initialize captcha ──
+        # The server requires a captcha to be registered before /check works.
+        # Try multiple approaches to create it:
+        #   a) GET /operation/climateControl with OAuth token (app's normal flow)
+        #   b) POST /operation/climateControl with OAuth token
+        #   c) Same with ATC token
         init_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl"
-        log.info("RST Step 3b: Initializing captcha via GET %s ...", init_url.split('/user/')[1])
-        init_result, init_err = self._api_request_with_token("GET", init_url,
-                                                              bearer_token=atc_token)
-        if init_result is not None:
-            log.info("RST: climateControl init response: %s", init_result[:500])
-        else:
-            log.warning("RST: climateControl init failed (non-fatal): %s", init_err)
-            # Also try POST as fallback init method
-            log.info("RST: Trying POST init instead...")
-            init_body = json.dumps({"remoteOperation": "climateControl"}).encode()
-            init_result2, init_err2 = self._api_request_with_token("POST", init_url,
-                                                                    body=init_body,
-                                                                    bearer_token=atc_token)
-            if init_result2 is not None:
-                log.info("RST: climateControl POST init response: %s", init_result2[:500])
+        log.info("RST Step 3b: Initializing captcha (%s) ...", init_url.split('/user/')[1])
+        init_ok = False
+        # Try with OAuth token first (VW app uses this for normal operations)
+        for method in ("GET", "POST"):
+            log.info("RST Step 3b: %s with OAuth token...", method)
+            if method == "GET":
+                init_result, init_err = self._api_request("GET", init_url, vid=vid)
             else:
-                log.warning("RST: climateControl POST init also failed: %s", init_err2)
+                init_body = json.dumps({"remoteOperation": "climateControl"}).encode()
+                init_result, init_err = self._api_request("POST", init_url,
+                                                          body=init_body, vid=vid)
+            if init_result is not None:
+                log.info("RST: captcha init OK (%s/OAuth): %s", method, init_result[:500])
+                init_ok = True
+                break
+            else:
+                log.warning("RST: captcha init %s/OAuth failed: %s", method, init_err)
+
+        if not init_ok:
+            # Try with ATC bearer token
+            for method in ("GET", "POST"):
+                log.info("RST Step 3b: %s with ATC token...", method)
+                if method == "GET":
+                    init_result, init_err = self._api_request_with_token(
+                        "GET", init_url, bearer_token=atc_token)
+                else:
+                    init_body = json.dumps({"remoteOperation": "climateControl"}).encode()
+                    init_result, init_err = self._api_request_with_token(
+                        "POST", init_url, body=init_body, bearer_token=atc_token)
+                if init_result is not None:
+                    log.info("RST: captcha init OK (%s/ATC): %s", method, init_result[:500])
+                    init_ok = True
+                    break
+                else:
+                    log.warning("RST: captcha init %s/ATC failed: %s", method, init_err)
+
+        if not init_ok:
+            log.warning("RST: All captcha init attempts failed — proceeding anyway")
 
         # ── Step 4: SPIN check → roToken ──
         # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
