@@ -1714,11 +1714,73 @@ class VWTokenRelay:
                     capture_output=True, timeout=10)
                 time.sleep(5)
 
-            # Step 1: Dump UI and look for vehicle picker
+            # Step 1: Dump UI, dismiss blocking dialogs, then look for vehicle picker
             xml = self._dump_ui_xml()
             if not xml:
                 log.error("SWITCH: uiautomator dump failed")
                 return
+
+            # Dismiss blocking dialogs (PIN entry, alerts, etc.)
+            dialogs_dismissed = 0
+            for dismiss_attempt in range(5):
+                # Check for PIN dialog (SPIN challenge)
+                if self._find_ui_elements(xml, resource_id="pin_entry") or \
+                   self._find_ui_elements(xml, resource_id="button_cancel"):
+                    log.info("SWITCH: Dismissing PIN/SPIN dialog (attempt %d)...",
+                             dismiss_attempt + 1)
+                    # Try Cancel button first
+                    if not self._tap_element(xml, "cancel PIN", resource_id="button_cancel"):
+                        # Try pressing Back key
+                        subprocess.run(["adb", "shell", "input", "keyevent", "BACK"],
+                                       capture_output=True, timeout=10)
+                    time.sleep(2)
+                    dialogs_dismissed += 1
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        break
+                    continue
+                # Check for any alert dialog dismiss button
+                if self._find_ui_elements(xml, resource_id="android:id/button2"):
+                    self._tap_element(xml, "dismiss alert", resource_id="android:id/button2")
+                    time.sleep(2)
+                    dialogs_dismissed += 1
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        break
+                    continue
+                # Check for OK/Close buttons
+                found_dismiss = False
+                for dismiss_text in ["OK", "Close", "Dismiss", "Not Now"]:
+                    if self._find_ui_elements(xml, text=dismiss_text):
+                        self._tap_element(xml, f"dismiss:{dismiss_text}", text=dismiss_text)
+                        time.sleep(2)
+                        dialogs_dismissed += 1
+                        xml = self._dump_ui_xml()
+                        found_dismiss = True
+                        break
+                if found_dismiss:
+                    continue
+                break  # No more dialogs to dismiss
+
+            # If dialog is STILL blocking after dismiss attempts, force-stop + relaunch
+            if xml and (self._find_ui_elements(xml, resource_id="pin_entry") or
+                        self._find_ui_elements(xml, resource_id="button_cancel")):
+                log.warning("SWITCH: PIN dialog persists — force-stopping app...")
+                subprocess.run(["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                               capture_output=True, timeout=10)
+                time.sleep(3)
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=10)
+                time.sleep(8)
+                xml = self._dump_ui_xml()
+                if not xml:
+                    log.error("SWITCH: UI dump failed after relaunch")
+                    return
+
+            if dialogs_dismissed:
+                log.info("SWITCH: Dismissed %d dialog(s)", dialogs_dismissed)
 
             # Log all elements for debugging
             import xml.etree.ElementTree as ET
