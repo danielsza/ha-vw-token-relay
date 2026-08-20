@@ -494,6 +494,10 @@ class VWTokenRelay:
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
         elif cmd == "dump_ui":
             threading.Thread(target=self._dump_ui, daemon=True).start()
+        elif cmd == "dump_storage":
+            threading.Thread(target=self._dump_rn_storage, daemon=True).start()
+        elif cmd == "switch_vehicle":
+            threading.Thread(target=self._switch_vehicle_rn, args=(payload,), daemon=True).start()
         elif cmd == "update_pif":
             threading.Thread(target=self._update_pif, daemon=True).start()
         else:
@@ -1537,6 +1541,149 @@ class VWTokenRelay:
             log.error("DUMP_UI: Failed: %s", e)
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/ui_dump",
+                json.dumps({"status": "error", "msg": str(e)}),
+            )
+
+    def _dump_rn_storage(self):
+        """Dump React Native AsyncStorage (SQLite DB) for vehicle data discovery."""
+        try:
+            log.info("RN_STORAGE: Reading AsyncStorage database...")
+            # RN AsyncStorage is at /data/data/<pkg>/databases/RKStorage
+            db_path = f"/data/data/{VW_PACKAGE}/databases/RKStorage"
+
+            # Use su to query the SQLite database
+            r = subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"sqlite3 {db_path} \"SELECT key, substr(value, 1, 300) FROM catalystLocalStorage ORDER BY key;\""],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                for line in r.stdout.strip().split('\n'):
+                    log.info("RN_STORAGE: %s", line[:300])
+            else:
+                log.warning("RN_STORAGE: RKStorage query failed (rc=%d): %s",
+                            r.returncode, r.stderr.strip()[:200])
+                # Try alternate DB name
+                alt_db = f"/data/data/{VW_PACKAGE}/databases/AsyncStorage"
+                r2 = subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"sqlite3 {alt_db} \".tables\""],
+                    capture_output=True, text=True, timeout=15,
+                )
+                log.info("RN_STORAGE: Alt DB tables: %s", r2.stdout.strip()[:200])
+
+            # Also list all databases
+            r3 = subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"ls -la /data/data/{VW_PACKAGE}/databases/"],
+                capture_output=True, text=True, timeout=10,
+            )
+            log.info("RN_STORAGE: databases dir: %s", r3.stdout.strip()[:500])
+
+            # Check for vehicle data in files
+            r4 = subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"grep -rl '90bf07c5\\|vehicle\\|garage\\|selected' /data/data/{VW_PACKAGE}/shared_prefs/ 2>/dev/null"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r4.stdout.strip():
+                log.info("RN_STORAGE: Vehicle-related prefs files: %s", r4.stdout.strip()[:500])
+                # Read matching files
+                for fp in r4.stdout.strip().split('\n')[:5]:
+                    r5 = subprocess.run(
+                        ["adb", "shell", "su", "-c", f"cat {fp}"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    log.info("RN_STORAGE: [%s] %s", fp.split('/')[-1], r5.stdout.strip()[:500])
+
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/rn_storage",
+                json.dumps({"status": "ok", "msg": "See addon logs for results"}),
+            )
+        except Exception as e:
+            log.error("RN_STORAGE: Failed: %s", e)
+
+    def _switch_vehicle_rn(self, target_vid=None):
+        """Switch the VW app to a different vehicle by modifying RN AsyncStorage
+        and relaunching the app. This is more reliable than blind UI tapping."""
+        if not target_vid:
+            log.error("SWITCH: No target vehicle ID provided")
+            return
+
+        log.info("SWITCH: Attempting to switch to vehicle %s", target_vid[:16])
+
+        try:
+            db_path = f"/data/data/{VW_PACKAGE}/databases/RKStorage"
+
+            # First, dump current vehicle selection
+            r = subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"sqlite3 {db_path} \"SELECT key, substr(value, 1, 200) FROM catalystLocalStorage WHERE key LIKE '%vehicle%' OR key LIKE '%selected%' OR key LIKE '%garage%' OR key LIKE '%current%';\""],
+                capture_output=True, text=True, timeout=15,
+            )
+            log.info("SWITCH: Current vehicle keys: %s", r.stdout.strip()[:500])
+
+            # Try to update the selected vehicle in AsyncStorage
+            # Common RN key patterns: 'selectedVehicle', 'currentVehicle', '@selectedVehicleId'
+            update_keys = [
+                "selectedVehicleId", "selected_vehicle_id", "currentVehicleId",
+                "@selectedVehicleId", "selectedVehicle", "activeVehicleId",
+            ]
+            for key in update_keys:
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f'sqlite3 {db_path} "UPDATE catalystLocalStorage SET value=\'{target_vid}\' WHERE key=\'{key}\';"'],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+            # Force-stop and relaunch the app
+            log.info("SWITCH: Force-restarting VW app...")
+            subprocess.run(
+                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(3)
+            subprocess.run(
+                ["adb", "shell", "am", "start", "-n",
+                 f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(10)
+
+            # Reattach Frida
+            log.info("SWITCH: Reattaching Frida after app restart...")
+            try:
+                self._attach_frida()
+            except Exception as e:
+                log.warning("SWITCH: Frida reattach failed: %s — will retry", e)
+                time.sleep(5)
+                try:
+                    self._attach_frida()
+                except Exception as e2:
+                    log.error("SWITCH: Frida reattach failed again: %s", e2)
+
+            # Wait for app to load and make API calls
+            time.sleep(20)
+
+            # Check if we got a token for the target vehicle
+            target_token = self._get_valid_token(target_vid, vehicle_only=True)
+            if target_token:
+                log.info("SWITCH: SUCCESS — got token for %s", target_vid[:16])
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
+                    json.dumps({"status": "success", "vehicle": target_vid}),
+                )
+            else:
+                log.warning("SWITCH: No token for %s after restart", target_vid[:16])
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
+                    json.dumps({"status": "no_token", "vehicle": target_vid}),
+                )
+
+        except Exception as e:
+            log.error("SWITCH: Failed: %s", e)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
                 json.dumps({"status": "error", "msg": str(e)}),
             )
 
