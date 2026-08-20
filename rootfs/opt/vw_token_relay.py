@@ -504,6 +504,46 @@ class VWTokenRelay:
             threading.Thread(target=self._clear_app_data, daemon=True).start()
         elif cmd == "auto_login":
             threading.Thread(target=self._auto_login, daemon=True).start()
+        elif cmd == "adb_tap":
+            # Tap arbitrary coordinates: payload = "x,y" e.g. "360,1439"
+            try:
+                x, y = payload.strip().split(",")
+                log.info("ADB_TAP: Tapping (%s, %s)", x.strip(), y.strip())
+                subprocess.run(
+                    ["adb", "shell", "input", "tap", x.strip(), y.strip()],
+                    capture_output=True, timeout=10)
+            except Exception as e:
+                log.error("ADB_TAP: Failed: %s", e)
+        elif cmd == "adb_key":
+            # Press key: payload = keyevent name e.g. "BACK", "HOME", "ENTER"
+            try:
+                log.info("ADB_KEY: Pressing %s", payload.strip())
+                subprocess.run(
+                    ["adb", "shell", "input", "keyevent", payload.strip()],
+                    capture_output=True, timeout=10)
+            except Exception as e:
+                log.error("ADB_KEY: Failed: %s", e)
+        elif cmd == "adb_text":
+            # Type text: payload = text to type
+            try:
+                log.info("ADB_TEXT: Typing '%s'", payload.strip()[:20])
+                subprocess.run(
+                    ["adb", "shell", "input", "text", payload.strip()],
+                    capture_output=True, timeout=10)
+            except Exception as e:
+                log.error("ADB_TEXT: Failed: %s", e)
+        elif cmd == "grant_permissions":
+            # Pre-grant all permissions to VW app
+            try:
+                for perm in ["ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+                             "POST_NOTIFICATIONS", "CAMERA"]:
+                    subprocess.run(
+                        ["adb", "shell", "pm", "grant", VW_PACKAGE,
+                         f"android.permission.{perm}"],
+                        capture_output=True, timeout=10)
+                    log.info("PERM: Granted %s", perm)
+            except Exception as e:
+                log.error("PERM: Failed: %s", e)
         else:
             log.warning("Unknown command: %s", cmd)
 
@@ -1720,49 +1760,75 @@ class VWTokenRelay:
                 log.error("SWITCH: uiautomator dump failed")
                 return
 
-            # Dismiss blocking dialogs (PIN entry, alerts, etc.)
+            # Dismiss blocking dialogs (PIN, location, permissions, etc.)
             dialogs_dismissed = 0
-            for dismiss_attempt in range(5):
-                # Check for PIN dialog (SPIN challenge)
+            for dismiss_attempt in range(8):
+                if not xml:
+                    break
+                dismissed_this_round = False
+
+                # 1. PIN/SPIN dialog
                 if self._find_ui_elements(xml, resource_id="pin_entry") or \
                    self._find_ui_elements(xml, resource_id="button_cancel"):
                     log.info("SWITCH: Dismissing PIN/SPIN dialog (attempt %d)...",
                              dismiss_attempt + 1)
-                    # Try Cancel button first
                     if not self._tap_element(xml, "cancel PIN", resource_id="button_cancel"):
-                        # Try pressing Back key
                         subprocess.run(["adb", "shell", "input", "keyevent", "BACK"],
                                        capture_output=True, timeout=10)
                     time.sleep(2)
-                    dialogs_dismissed += 1
-                    xml = self._dump_ui_xml()
-                    if not xml:
-                        break
-                    continue
-                # Check for any alert dialog dismiss button
-                if self._find_ui_elements(xml, resource_id="android:id/button2"):
+                    dismissed_this_round = True
+
+                # 2. App "Continue" buttons (location permission, onboarding, etc.)
+                elif self._find_ui_elements(xml, resource_id="continueButton"):
+                    log.info("SWITCH: Tapping app Continue button...")
+                    self._tap_element(xml, "continueButton", resource_id="continueButton")
+                    time.sleep(3)
+                    dismissed_this_round = True
+
+                # 3. Android system permission dialogs
+                elif self._find_ui_elements(xml, resource_id="com.android.permissioncontroller"):
+                    # Try "While using the app" first, then "Allow", then "Only this time"
+                    for perm_text in ["While using the app", "While using", "Allow", "Only this time"]:
+                        if self._find_ui_elements(xml, text=perm_text):
+                            log.info("SWITCH: Granting permission: %s", perm_text)
+                            self._tap_element(xml, f"perm:{perm_text}", text=perm_text)
+                            time.sleep(2)
+                            dismissed_this_round = True
+                            break
+                    if not dismissed_this_round:
+                        # Fallback: tap any button in the permission dialog
+                        for btn_id in ["permission_allow_button",
+                                       "permission_allow_foreground_only_button",
+                                       "permission_allow_one_time_button"]:
+                            if self._find_ui_elements(xml, resource_id=btn_id):
+                                self._tap_element(xml, f"perm:{btn_id}", resource_id=btn_id)
+                                time.sleep(2)
+                                dismissed_this_round = True
+                                break
+
+                # 4. Alert dialog dismiss buttons
+                elif self._find_ui_elements(xml, resource_id="android:id/button2"):
                     self._tap_element(xml, "dismiss alert", resource_id="android:id/button2")
                     time.sleep(2)
+                    dismissed_this_round = True
+
+                # 5. Generic dismiss buttons (OK, Close, Continue, Skip, etc.)
+                else:
+                    for dismiss_text in ["OK", "Close", "Dismiss", "Not Now", "Continue",
+                                         "Skip", "Got it", "CONTINUE", "SKIP"]:
+                        if self._find_ui_elements(xml, text=dismiss_text):
+                            self._tap_element(xml, f"dismiss:{dismiss_text}", text=dismiss_text)
+                            time.sleep(2)
+                            dismissed_this_round = True
+                            break
+
+                if dismissed_this_round:
                     dialogs_dismissed += 1
                     xml = self._dump_ui_xml()
-                    if not xml:
-                        break
-                    continue
-                # Check for OK/Close buttons
-                found_dismiss = False
-                for dismiss_text in ["OK", "Close", "Dismiss", "Not Now"]:
-                    if self._find_ui_elements(xml, text=dismiss_text):
-                        self._tap_element(xml, f"dismiss:{dismiss_text}", text=dismiss_text)
-                        time.sleep(2)
-                        dialogs_dismissed += 1
-                        xml = self._dump_ui_xml()
-                        found_dismiss = True
-                        break
-                if found_dismiss:
                     continue
                 break  # No more dialogs to dismiss
 
-            # If dialog is STILL blocking after dismiss attempts, force-stop + relaunch
+            # If PIN dialog is STILL blocking, force-stop + relaunch
             if xml and (self._find_ui_elements(xml, resource_id="pin_entry") or
                         self._find_ui_elements(xml, resource_id="button_cancel")):
                 log.warning("SWITCH: PIN dialog persists — force-stopping app...")
@@ -2099,6 +2165,15 @@ class VWTokenRelay:
                 capture_output=True, timeout=15,
             )
             time.sleep(2)
+
+            # Step 1b: Pre-grant permissions to avoid dialogs after login
+            log.info("AUTO_LOGIN: Step 1b — Pre-granting permissions...")
+            for perm in ["ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+                         "POST_NOTIFICATIONS"]:
+                subprocess.run(
+                    ["adb", "shell", "pm", "grant", VW_PACKAGE,
+                     f"android.permission.{perm}"],
+                    capture_output=True, timeout=10)
 
             # Step 2: Wake screen
             log.info("AUTO_LOGIN: Step 2 — Waking screen...")
