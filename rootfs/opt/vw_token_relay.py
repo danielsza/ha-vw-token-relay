@@ -549,19 +549,19 @@ class VWTokenRelay:
             try:
                 log.info("UIXML: Running uiautomator dump...")
                 dr = subprocess.run(
-                    ["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
+                    ["adb", "shell", "uiautomator", "dump", "/data/local/tmp/ui.xml"],
                     capture_output=True, text=True, timeout=15)
                 log.info("UIXML: dump stdout=%s stderr=%s rc=%d",
                          dr.stdout.strip()[:200], dr.stderr.strip()[:200], dr.returncode)
                 time.sleep(2)
                 # Check file exists and has size
                 ls_r = subprocess.run(
-                    ["adb", "shell", "ls", "-la", "/sdcard/ui.xml"],
+                    ["adb", "shell", "ls", "-la", "/data/local/tmp/ui.xml"],
                     capture_output=True, text=True, timeout=10)
                 log.info("UIXML: ls=%s", ls_r.stdout.strip()[:200])
                 # Pull file instead of cat (more reliable)
                 subprocess.run(
-                    ["adb", "pull", "/sdcard/ui.xml", "/tmp/ui.xml"],
+                    ["adb", "pull", "/data/local/tmp/ui.xml", "/tmp/ui.xml"],
                     capture_output=True, timeout=15)
                 r_local = None
                 try:
@@ -571,7 +571,7 @@ class VWTokenRelay:
                 except Exception:
                     xml_str_local = ""
                 r = subprocess.run(
-                    ["adb", "shell", "cat", "/sdcard/ui.xml"],
+                    ["adb", "shell", "cat", "/data/local/tmp/ui.xml"],
                     capture_output=True, text=True, timeout=15)
                 xml_str = r.stdout.strip()
                 log.info("UIXML: cat length=%d, pull length=%d", len(xml_str), len(xml_str_local))
