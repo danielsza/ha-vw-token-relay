@@ -980,22 +980,29 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
-        # Vehicle-scoped endpoints need tokens with tid in the JWT.
-        # VW issues tid-stamped tokens when the app navigates to a vehicle
-        # dashboard. If we don't have one, switch vehicle via UI.
+        # Try vehicle-scoped token first, fall back to any valid token.
+        # Vehicle-scoped tokens have tid in the JWT; the global token
+        # also works for many vehicle endpoints (status, SPIN, RST).
         token = self._get_valid_token(vid, vehicle_only=True)
         if token:
             log.info("RST: Using vehicle-scoped token for %s", vid[:8])
         else:
-            log.info("RST: No vehicle-scoped token for %s — switching vehicle in app...", vid[:8])
-            self._switch_vehicle(vid)
-            token = self._get_valid_token(vid, vehicle_only=True)
-            if not token:
-                log.error("RST: Vehicle switch failed — no token for %s", vid[:8])
-                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                    json.dumps({"error": "no_valid_token",
-                                "msg": f"Could not get vehicle-scoped token for {vid[:8]}"}))
-                return
+            # Try global token before expensive vehicle switch
+            token = self._get_valid_token(vid, vehicle_only=False)
+            if token:
+                log.info("RST: No vehicle-scoped token — using global token for %s", vid[:8])
+            else:
+                log.info("RST: No valid token at all for %s — switching vehicle in app...", vid[:8])
+                self._switch_vehicle(vid)
+                token = self._get_valid_token(vid, vehicle_only=True)
+                if not token:
+                    token = self._get_valid_token(vid, vehicle_only=False)
+                if not token:
+                    log.error("RST: Vehicle switch failed — no token for %s", vid[:8])
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                        json.dumps({"error": "no_valid_token",
+                                    "msg": f"Could not get vehicle-scoped token for {vid[:8]}"}))
+                    return
 
         # Step 1: Get pairing data (uses _api_request with auto-retry on 403)
         log.info("RST Step 1: Getting pairing data...")
