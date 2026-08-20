@@ -1285,35 +1285,58 @@ class VWTokenRelay:
         """Take a screenshot of the phone and save to /share/ for debugging."""
         try:
             log.info("SCREENCAP: Taking screenshot...")
-            subprocess.run(
-                ["adb", "shell", "screencap", "-p", "/sdcard/vw_screen.png"],
-                capture_output=True, timeout=30,
-            )
-            subprocess.run(
-                ["adb", "pull", "/sdcard/vw_screen.png", "/share/vw_screen.png"],
-                capture_output=True, timeout=15,
-            )
-            # Also save to /media/ and /config/www/ for browser access
-            subprocess.run(
-                ["cp", "/share/vw_screen.png", "/media/vw_screen.png"],
-                capture_output=True, timeout=5,
-            )
-            # /config/www/ → accessible at /local/vw_screen.png
-            subprocess.run(["mkdir", "-p", "/config/www"], capture_output=True, timeout=5)
-            subprocess.run(
-                ["cp", "/share/vw_screen.png", "/config/www/vw_screen.png"],
-                capture_output=True, timeout=5,
-            )
-            log.info("SCREENCAP: Saved to /share/, /media/, /config/www/")
 
-            # Also log the current activity for context
+            # Method 1: Use su for screencap (more reliable on rooted phones)
+            r1 = subprocess.run(
+                ["adb", "shell", "su", "-c", "screencap -p /data/local/tmp/vw_screen.png"],
+                capture_output=True, text=True, timeout=30,
+            )
+            log.info("SCREENCAP: capture rc=%d stdout=%s stderr=%s",
+                     r1.returncode, r1.stdout.strip()[:100], r1.stderr.strip()[:100])
+
+            # Pull with verbose output
+            r2 = subprocess.run(
+                ["adb", "pull", "/data/local/tmp/vw_screen.png", "/share/vw_screen.png"],
+                capture_output=True, text=True, timeout=15,
+            )
+            log.info("SCREENCAP: pull rc=%d stdout=%s stderr=%s",
+                     r2.returncode, r2.stdout.strip()[:100], r2.stderr.strip()[:100])
+
+            # Check if file exists and its size
+            import os
+            if os.path.exists("/share/vw_screen.png"):
+                sz = os.path.getsize("/share/vw_screen.png")
+                log.info("SCREENCAP: File exists, size=%d bytes", sz)
+            else:
+                log.error("SCREENCAP: File NOT created at /share/vw_screen.png")
+                # Fallback: try piping screencap directly
+                log.info("SCREENCAP: Trying pipe method...")
+                r3 = subprocess.run(
+                    ["adb", "exec-out", "su", "-c", "screencap -p"],
+                    capture_output=True, timeout=30,
+                )
+                if r3.stdout and len(r3.stdout) > 1000:
+                    with open("/share/vw_screen.png", "wb") as f:
+                        f.write(r3.stdout)
+                    log.info("SCREENCAP: Pipe method saved %d bytes", len(r3.stdout))
+                else:
+                    log.error("SCREENCAP: Pipe method failed (got %d bytes)", len(r3.stdout) if r3.stdout else 0)
+
+            # Log the current activity for context
             fg = self._get_foreground_activity()
             log.info("SCREENCAP: Current foreground: %s", fg)
 
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/screencap",
-                json.dumps({"status": "saved", "path": "/share/vw_screen.png"}),
-            )
+            if os.path.exists("/share/vw_screen.png"):
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/screencap",
+                    json.dumps({"status": "saved", "path": "/share/vw_screen.png",
+                                "size": os.path.getsize("/share/vw_screen.png")}),
+                )
+            else:
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/screencap",
+                    json.dumps({"status": "error", "msg": "File not created"}),
+                )
         except Exception as e:
             log.error("SCREENCAP: Failed: %s", e)
             self.mqttc.publish(
@@ -1326,18 +1349,21 @@ class VWTokenRelay:
         Publishes the XML to MQTT and logs key elements."""
         try:
             log.info("DUMP_UI: Running uiautomator dump...")
-            # Dump UI hierarchy to XML file on phone
+            # Dump UI hierarchy to XML file on phone (use /data/local/tmp for reliability)
             r = subprocess.run(
-                ["adb", "shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
+                ["adb", "shell", "uiautomator", "dump", "/data/local/tmp/ui_dump.xml"],
                 capture_output=True, text=True, timeout=30,
             )
-            log.info("DUMP_UI: dump result: %s", r.stdout.strip())
+            log.info("DUMP_UI: dump rc=%d stdout=%s stderr=%s",
+                     r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200])
 
             # Pull the XML file
-            subprocess.run(
-                ["adb", "pull", "/sdcard/ui_dump.xml", "/share/ui_dump.xml"],
-                capture_output=True, timeout=15,
+            r2 = subprocess.run(
+                ["adb", "pull", "/data/local/tmp/ui_dump.xml", "/share/ui_dump.xml"],
+                capture_output=True, text=True, timeout=15,
             )
+            log.info("DUMP_UI: pull rc=%d stdout=%s stderr=%s",
+                     r2.returncode, r2.stdout.strip()[:200], r2.stderr.strip()[:200])
 
             # Read and parse
             try:
