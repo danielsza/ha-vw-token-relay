@@ -1016,7 +1016,12 @@ class VWTokenRelay:
         """Navigate the VW app to trigger vehicle-scoped API calls.
         If target_vid is specified, tries multiple strategies to reach it.
         React Native views are invisible to uiautomator, so we use
-        blind taps/swipes at known positions on Moto G Pure (720x1600)."""
+        blind taps/swipes at known positions on Moto G Pure (720x1600).
+
+        Key insight: The VW myVW app uses a bottom navigation bar. The
+        home tab shows ONE vehicle at a time. Vehicle switching is via
+        a picker/dropdown or a separate "garage" tab — NOT a swipeable
+        carousel on the home screen."""
         if not self._adb_check():
             log.error("NAV: Cannot navigate — ADB not connected")
             return False
@@ -1026,11 +1031,27 @@ class VWTokenRelay:
                 return False
             return self._get_valid_token(target_vid, vehicle_only=True) is not None
 
+        def _ensure_app_fg():
+            """Make sure VW app is in foreground."""
+            fg = self._get_foreground_activity()
+            if VW_PACKAGE not in (fg or ''):
+                log.info("NAV: App not in FG (%s) — relaunching", fg[:40] if fg else 'none')
+                try:
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                        capture_output=True, timeout=10,
+                    )
+                    time.sleep(6)
+                except Exception:
+                    pass
+
         try:
+            _ensure_app_fg()
+
             # ── Strategy 0: Tap the default vehicle card area ──
-            # Hits the first vehicle (Buzz) on the home screen.
             log.info("NAV: S0 — tap default card area (360,600)")
-            self._adb_tap(360, 600, label="S0-card-default")
+            self._adb_tap(360, 600, label="S0-default")
             time.sleep(4)
 
             if not target_vid:
@@ -1039,111 +1060,95 @@ class VWTokenRelay:
                 log.info("NAV: Got target token from default tap")
                 return True
 
-            # ── Strategy 1: Swipe left on CURRENT screen ──
-            # If we entered Buzz's detail, some apps let you swipe
-            # left/right to switch between vehicle dashboards.
-            log.info("NAV: S1 — swipe left on current screen (detail-level switch)")
-            for i in range(2):
-                self._adb_swipe(600, 800, 100, 800, 400, f"S1-detail-left-{i+1}")
-                time.sleep(5)
-                if _check_target():
-                    log.info("NAV: S1 — got target token after detail swipe %d", i + 1)
-                    return True
-
-            # ── Strategy 2: Back to home, scroll DOWN, tap lower card ──
-            # If vehicles are in a vertical list, the second card is below.
-            log.info("NAV: S2 — back to home, scroll down for second card")
-            try:
-                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
-                              capture_output=True, timeout=5)
-                time.sleep(2)
-            except Exception:
-                pass
-            # Scroll down (swipe up) to reveal cards below the fold
-            self._adb_swipe(360, 1200, 360, 400, 500, "S2-scroll-down")
-            time.sleep(2)
-            # Tap where a second card might now be visible
-            self._adb_tap(360, 600, label="S2-card-after-scroll")
+            # ── Strategy 1: Vehicle picker/dropdown at top of screen ──
+            # Many car apps have the vehicle name at the top that opens a picker.
+            log.info("NAV: S1 — tap vehicle picker areas at top of screen")
+            _ensure_app_fg()
+            # Tap top center (vehicle name area)
+            self._adb_tap(360, 150, label="S1-top-center")
+            time.sleep(3)
+            # If a dropdown appeared, tap the second item
+            self._adb_tap(360, 300, label="S1-dropdown-item2")
             time.sleep(5)
             if _check_target():
-                log.info("NAV: S2 — got target token from scroll-down")
+                log.info("NAV: S1 — got target from top picker")
+                return True
+            # Try tapping a third position in case the dropdown has headers
+            self._adb_tap(360, 400, label="S1-dropdown-item3")
+            time.sleep(5)
+            if _check_target():
+                log.info("NAV: S1 — got target from picker item 3")
                 return True
 
-            # ── Strategy 3: Back, tap at various Y positions ──
-            # The second card might be at a different Y on the home screen.
-            log.info("NAV: S3 — back to home, tap at multiple Y positions")
-            try:
-                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
-                              capture_output=True, timeout=5)
-                time.sleep(2)
-            except Exception:
-                pass
-            for y_pos in [900, 1100, 1300]:
-                self._adb_tap(360, y_pos, label=f"S3-y{y_pos}")
-                time.sleep(4)
-                if _check_target():
-                    log.info("NAV: S3 — got target token from y=%d", y_pos)
-                    return True
-                # Go back in case we entered something
-                try:
-                    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
-                                  capture_output=True, timeout=5)
-                    time.sleep(1)
-                except Exception:
-                    pass
+            # ── Strategy 2: Bottom navigation tabs ──
+            # VW app has a bottom nav bar. Try each tab to find "Garage".
+            # On 720x1600, bottom nav is around Y=1540-1560.
+            # Common 4-tab positions: x=90, 270, 450, 630
+            # Common 5-tab positions: x=72, 216, 360, 504, 648
+            log.info("NAV: S2 — tap bottom navigation tabs")
+            _ensure_app_fg()
+            # Try each bottom tab position
+            for tab_x in [90, 270, 450, 630]:
+                self._adb_tap(tab_x, 1550, label=f"S2-btab-{tab_x}")
+                time.sleep(3)
+                # After switching tab, look for vehicle list items
+                # Tap various Y positions to find Atlas card
+                for card_y in [400, 600, 800, 1000]:
+                    self._adb_tap(360, card_y, label=f"S2-card-y{card_y}")
+                    time.sleep(4)
+                    if _check_target():
+                        log.info("NAV: S2 — got target from tab x=%d, card y=%d", tab_x, card_y)
+                        return True
 
-            # ── Strategy 4: Swipe RIGHT (opposite direction) on home ──
-            # Maybe the second vehicle is to the left in the carousel.
-            log.info("NAV: S4 — swipe right on home screen")
-            for i in range(2):
-                self._adb_swipe(100, 600, 600, 600, 400, f"S4-home-right-{i+1}")
-                time.sleep(2)
-                self._adb_tap(360, 600, label=f"S4-card-right-{i+1}")
+            # ── Strategy 3: Hamburger menu (top-left) ──
+            log.info("NAV: S3 — try hamburger menu (top-left)")
+            _ensure_app_fg()
+            self._adb_tap(50, 80, label="S3-hamburger")
+            time.sleep(3)
+            # Look for vehicle entries in side menu
+            for menu_y in [300, 400, 500, 600, 700]:
+                self._adb_tap(300, menu_y, label=f"S3-menu-y{menu_y}")
+                time.sleep(3)
+                if _check_target():
+                    log.info("NAV: S3 — got target from menu y=%d", menu_y)
+                    return True
+                # If we entered a sub-screen, check for vehicle items
+                for sub_y in [400, 600, 800]:
+                    self._adb_tap(360, sub_y, label=f"S3-sub-y{sub_y}")
+                    time.sleep(3)
+                    if _check_target():
+                        log.info("NAV: S3 — got target from sub-menu y=%d", sub_y)
+                        return True
+
+            # ── Strategy 4: Top-right menu/kebab ──
+            log.info("NAV: S4 — try top-right menu")
+            _ensure_app_fg()
+            self._adb_tap(670, 80, label="S4-kebab")
+            time.sleep(3)
+            for menu_y in [200, 300, 400, 500]:
+                self._adb_tap(500, menu_y, label=f"S4-menu-y{menu_y}")
+                time.sleep(3)
+                if _check_target():
+                    log.info("NAV: S4 — got target from top-right menu y=%d", menu_y)
+                    return True
+
+            # ── Strategy 5: Swipe left on detail screen ──
+            log.info("NAV: S5 — swipe left on main screen")
+            _ensure_app_fg()
+            self._adb_tap(360, 600, label="S5-enter-detail")
+            time.sleep(3)
+            for i in range(3):
+                self._adb_swipe(600, 800, 100, 800, 400, f"S5-swipe-left-{i+1}")
                 time.sleep(5)
                 if _check_target():
-                    log.info("NAV: S4 — got target from right swipe %d", i + 1)
+                    log.info("NAV: S5 — got target after swipe %d", i + 1)
                     return True
-                try:
-                    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
-                                  capture_output=True, timeout=5)
-                    time.sleep(1)
-                except Exception:
-                    pass
 
-            # ── Strategy 5: HOME + relaunch + scroll down ──
-            # Press HOME first to reset to a known state.
-            log.info("NAV: S5 — HOME key + fresh launch + scroll")
-            try:
-                subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
-                              capture_output=True, timeout=5)
-                time.sleep(2)
-                subprocess.run(
-                    ["adb", "shell", "am", "start", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                    capture_output=True, timeout=10,
-                )
-                time.sleep(8)
-            except Exception:
-                pass
-            # Scroll down the home screen
-            self._adb_swipe(360, 1200, 360, 200, 600, "S5-big-scroll-down")
-            time.sleep(3)
-            # Tap where second card might be after scrolling
-            for y_pos in [400, 600, 800]:
-                self._adb_tap(360, y_pos, label=f"S5-y{y_pos}")
-                time.sleep(4)
-                if _check_target():
-                    log.info("NAV: S5 — got target token from y=%d after big scroll", y_pos)
-                    return True
-                try:
-                    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
-                                  capture_output=True, timeout=5)
-                    time.sleep(1)
-                except Exception:
-                    pass
-
-            log.warning("NAV: All 6 strategies exhausted — no target vehicle token")
-            self._screencap()  # Screenshot for post-mortem debugging
+            log.warning("NAV: All strategies exhausted — no target vehicle token")
+            # Take screenshot for debugging (goes to /config/www/vw_screen.png)
+            _ensure_app_fg()
+            time.sleep(2)
+            self._screencap()
             return False
 
         except Exception as e:
@@ -1277,12 +1282,18 @@ class VWTokenRelay:
                 ["adb", "pull", "/sdcard/vw_screen.png", "/share/vw_screen.png"],
                 capture_output=True, timeout=15,
             )
-            # Also save to /media/ for HA media browser access
+            # Also save to /media/ and /config/www/ for browser access
             subprocess.run(
                 ["cp", "/share/vw_screen.png", "/media/vw_screen.png"],
                 capture_output=True, timeout=5,
             )
-            log.info("SCREENCAP: Saved to /share/vw_screen.png and /media/vw_screen.png")
+            # /config/www/ → accessible at /local/vw_screen.png
+            subprocess.run(["mkdir", "-p", "/config/www"], capture_output=True, timeout=5)
+            subprocess.run(
+                ["cp", "/share/vw_screen.png", "/config/www/vw_screen.png"],
+                capture_output=True, timeout=5,
+            )
+            log.info("SCREENCAP: Saved to /share/, /media/, /config/www/")
 
             # Also log the current activity for context
             fg = self._get_foreground_activity()
