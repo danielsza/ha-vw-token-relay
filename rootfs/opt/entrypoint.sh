@@ -130,9 +130,10 @@ echo "============================================="
 export VW_PACKAGE="${VW_PACKAGE}"
 export BASE_URL="${BASE_URL}"
 export LOG_LEVEL="${LOG_LEVEL}"
+export PYTHONUNBUFFERED=1
 
 # Build relay command args
-CMD="/opt/venv/bin/python3 /opt/vw_token_relay.py"
+CMD="/opt/venv/bin/python3 -u /opt/vw_token_relay.py"
 CMD="${CMD} --mqtt-host ${MQTT_HOST}"
 CMD="${CMD} --mqtt-port ${MQTT_PORT}"
 [ -n "${MQTT_USER}" ] && CMD="${CMD} --mqtt-user ${MQTT_USER}"
