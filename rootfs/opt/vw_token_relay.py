@@ -1190,11 +1190,47 @@ class VWTokenRelay:
             return
 
         # ── Step 5: POST /rst/v1/vehicle/{vid} ──
-        # Body is just {"roToken": "..."} — no pairing, no encryption, no signature needed
         # MUST use carnetVehicleToken as Bearer
+        # Include pairing crypto data — required by Atlas (and likely other ICE vehicles)
+        log.info("RST Step 5: Building RST body with pairing data...")
+
+        rst_payload = {"roToken": ro_token}
+
+        # Get pairing data and build encrypted payload + signature
+        pairing = self._get_pairing_data(vid)
+        if pairing and pairing.get("pairingKeySeed") and pairing.get("pairingId"):
+            pairing_id = pairing["pairingId"]
+            pairing_seed = pairing["pairingKeySeed"]
+            mobile_app_id = pairing.get("mobileAppId", VW_API_HEADERS.get("x-app-uuid", ""))
+
+            log.info("RST: Building encrypted payload (seed=%s, appId=%s)",
+                     pairing_seed[:4] + "...", mobile_app_id[:8] + "...")
+
+            encrypted_payload = self._build_encrypted_payload(pairing_seed, mobile_app_id)
+            log.info("RST: encryptedPayload built (%d chars)", len(encrypted_payload))
+
+            # Sign the encrypted payload via Frida RPC (Android KeyStore ECDSA)
+            signature = self._sign_with_keystore(encrypted_payload)
+            if signature:
+                log.info("RST: encryptedPayloadSignature obtained (%d chars)", len(signature))
+                rst_payload["pairingId"] = pairing_id
+                rst_payload["rstSpinHash"] = spin_hash2
+                rst_payload["encryptedPayload"] = encrypted_payload
+                rst_payload["encryptedPayloadSignature"] = signature
+                log.info("RST: Full pairing body built (5 fields)")
+            else:
+                log.warning("RST: KeyStore signing failed — trying without signature")
+                # Still include pairing fields without signature as fallback
+                rst_payload["pairingId"] = pairing_id
+                rst_payload["rstSpinHash"] = spin_hash2
+                rst_payload["encryptedPayload"] = encrypted_payload
+                log.info("RST: Partial pairing body (no signature, 4 fields)")
+        else:
+            log.warning("RST: No pairing data — sending minimal body (roToken only)")
+
         log.info("RST Step 5: Sending remote start command...")
-        rst_body = json.dumps({"roToken": ro_token}).encode()
-        log.info("RST: POST body size=%d bytes", len(rst_body))
+        rst_body = json.dumps(rst_payload).encode()
+        log.info("RST: POST body keys=%s size=%d bytes", list(rst_payload.keys()), len(rst_body))
 
         result, err = self._api_request_with_token("POST", rst_url,
                                                     body=rst_body,
@@ -1251,12 +1287,14 @@ class VWTokenRelay:
                         "attempt": attempt + 1,
                     }), retain=False)
 
-                if status_str == "ACKNOWLEDGED":
-                    if outcome_str in ("ACCEPTED", "REJECTED"):
-                        if outcome_str == "ACCEPTED":
-                            log.info("═══ REMOTE START SUCCESS ═══")
-                        else:
-                            log.warning("═══ REMOTE START REJECTED: %s (%s) ═══", telem_value, telem_code)
+                # Terminal states: ACKNOWLEDGED or COMPLETED
+                if status_str in ("ACKNOWLEDGED", "COMPLETED"):
+                    if outcome_str == "ACCEPTED" or (status_str == "ACKNOWLEDGED" and outcome_str == "ACCEPTED"):
+                        log.info("═══ REMOTE START SUCCESS ═══")
+                        return
+                    elif outcome_str in ("REJECTED", "FAILURE"):
+                        log.warning("═══ REMOTE START FAILED: %s (%s) — %s ═══",
+                                    outcome_str, telem_code, telem_value)
                         return
             else:
                 code = poll_err.get("code", 0) if isinstance(poll_err, dict) else 0
