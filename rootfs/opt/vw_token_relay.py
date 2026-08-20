@@ -225,46 +225,70 @@ Java.perform(function () {
 rpc.exports = {
     // List all Android KeyStore aliases (for discovery)
     listKeystoreAliases: function () {
-        return Java.perform(function () {
-            var KeyStore = Java.use('java.security.KeyStore');
-            var ks = KeyStore.getInstance('AndroidKeyStore');
-            ks.load(null);
-            var aliases = ks.aliases();
-            var result = [];
-            while (aliases.hasMoreElements()) {
-                result.push(aliases.nextElement().toString());
+        var retval = null;
+        Java.performNow(function () {
+            try {
+                var KeyStore = Java.use('java.security.KeyStore');
+                var ks = KeyStore.getInstance('AndroidKeyStore');
+                ks.load(null);
+                var aliases = ks.aliases();
+                var result = [];
+                while (aliases.hasMoreElements()) {
+                    result.push(aliases.nextElement().toString());
+                }
+                retval = JSON.stringify(result);
+            } catch (e) {
+                retval = JSON.stringify({ error: e.toString() });
             }
-            return JSON.stringify(result);
         });
+        return retval || JSON.stringify({ error: 'Java.performNow returned without setting result' });
     },
 
     // Sign data with the VW pairing key from Android KeyStore
     // dataBase64: base64-encoded bytes to sign
     // alias: KeyStore alias (discovered via listKeystoreAliases)
     signWithKeystore: function (dataBase64, alias) {
-        return Java.perform(function () {
-            var KeyStore = Java.use('java.security.KeyStore');
-            var Signature = Java.use('java.security.Signature');
-            var Base64 = Java.use('android.util.Base64');
+        var retval = null;
+        Java.performNow(function () {
+            try {
+                var KeyStore = Java.use('java.security.KeyStore');
+                var Signature = Java.use('java.security.Signature');
+                var Base64 = Java.use('android.util.Base64');
 
-            var ks = KeyStore.getInstance('AndroidKeyStore');
-            ks.load(null);
+                var ks = KeyStore.getInstance('AndroidKeyStore');
+                ks.load(null);
 
-            if (!ks.containsAlias(alias)) {
-                return JSON.stringify({ error: 'alias_not_found', alias: alias });
+                if (!ks.containsAlias(alias)) {
+                    retval = JSON.stringify({ error: 'alias_not_found', alias: alias });
+                    return;
+                }
+
+                var entry = ks.getEntry(alias, null);
+                // Detect key type and use appropriate algorithm
+                var privateKey = Java.cast(entry, Java.use('java.security.KeyStore$PrivateKeyEntry')).getPrivateKey();
+                var keyAlgo = privateKey.getAlgorithm();
+
+                var sigAlgo;
+                if (keyAlgo === 'EC') {
+                    sigAlgo = 'SHA256withECDSA';
+                } else if (keyAlgo === 'RSA') {
+                    sigAlgo = 'SHA256withRSA';
+                } else {
+                    sigAlgo = 'SHA256with' + keyAlgo;
+                }
+
+                var sig = Signature.getInstance(sigAlgo);
+                sig.initSign(privateKey);
+                var dataBytes = Base64.decode(dataBase64, 0);
+                sig.update(dataBytes);
+                var sigBytes = sig.sign();
+                var sigB64 = Base64.encodeToString(sigBytes, 2); // NO_WRAP
+                retval = JSON.stringify({ signature: sigB64, algorithm: sigAlgo, keyType: keyAlgo });
+            } catch (e) {
+                retval = JSON.stringify({ error: e.toString() });
             }
-
-            var entry = ks.getEntry(alias, null);
-            var privateKey = Java.cast(entry, Java.use('java.security.KeyStore$PrivateKeyEntry')).getPrivateKey();
-
-            var sig = Signature.getInstance('SHA256withECDSA');
-            sig.initSign(privateKey);
-            var dataBytes = Base64.decode(dataBase64, 0);
-            sig.update(dataBytes);
-            var sigBytes = sig.sign();
-            var sigB64 = Base64.encodeToString(sigBytes, 2); // NO_WRAP
-            return JSON.stringify({ signature: sigB64 });
         });
+        return retval || JSON.stringify({ error: 'Java.performNow returned without setting result' });
     },
 };
 """
@@ -549,8 +573,18 @@ class VWTokenRelay:
         try:
             # First discover the KeyStore alias if we haven't yet
             if not hasattr(self, '_keystore_alias') or self._keystore_alias is None:
-                aliases_json = self.script.exports_sync.list_keystore_aliases()
-                aliases = json.loads(aliases_json)
+                aliases_raw = self.script.exports_sync.list_keystore_aliases()
+                if aliases_raw is None:
+                    log.error("KeyStore: RPC returned None — Frida script may not be attached")
+                    return None
+                aliases_data = json.loads(aliases_raw)
+
+                # Check if RPC returned an error
+                if isinstance(aliases_data, dict) and "error" in aliases_data:
+                    log.error("KeyStore alias listing failed: %s", aliases_data["error"])
+                    return None
+
+                aliases = aliases_data
                 log.info("Android KeyStore aliases: %s", aliases)
                 # Look for VW-related aliases
                 vw_aliases = [a for a in aliases if any(k in a.lower() for k in ['vw', 'pairing', 'rst', 'remote', 'carnet'])]
@@ -561,22 +595,35 @@ class VWTokenRelay:
                     # Try each alias — the VW key might have a generic name
                     for alias in aliases:
                         log.info("Trying KeyStore alias: %s", alias)
-                        result = json.loads(self.script.exports_sync.sign_with_keystore(data_b64, alias))
+                        sign_raw = self.script.exports_sync.sign_with_keystore(data_b64, alias)
+                        if sign_raw is None:
+                            continue
+                        result = json.loads(sign_raw)
                         if "signature" in result:
                             self._keystore_alias = alias
-                            log.info("Found working KeyStore alias: %s", alias)
+                            log.info("Found working KeyStore alias: %s (algo=%s, key=%s)",
+                                     alias, result.get("algorithm", "?"), result.get("keyType", "?"))
                             return result["signature"]
+                        else:
+                            log.debug("KeyStore alias %s failed: %s", alias, result.get("error", "?"))
                     log.error("No working KeyStore alias found")
                     return None
                 else:
-                    log.error("No KeyStore aliases found")
+                    log.error("No KeyStore aliases found (empty list)")
                     return None
 
-            result = json.loads(self.script.exports_sync.sign_with_keystore(data_b64, self._keystore_alias))
+            sign_raw = self.script.exports_sync.sign_with_keystore(data_b64, self._keystore_alias)
+            if sign_raw is None:
+                log.error("KeyStore signing returned None")
+                self._keystore_alias = None
+                return None
+            result = json.loads(sign_raw)
             if "error" in result:
                 log.error("KeyStore signing failed: %s", result)
                 self._keystore_alias = None  # Reset for rediscovery
                 return None
+            log.info("KeyStore signed successfully (algo=%s, key=%s)",
+                     result.get("algorithm", "?"), result.get("keyType", "?"))
             return result["signature"]
         except Exception as e:
             log.error("Frida RPC signing failed: %s", e)
