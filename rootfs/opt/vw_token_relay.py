@@ -471,11 +471,28 @@ class VWTokenRelay:
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         log.info("MQTT connected (rc=%d)", rc)
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/cmd/#")
+        # Subscribe to retained token_relay to restore id_token after restart
+        client.subscribe(f"{MQTT_TOPIC_PREFIX}/token_relay")
         client.publish(f"{MQTT_TOPIC_PREFIX}/status", "online", retain=True)
 
     def _on_mqtt_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="replace")
+
+        # Handle retained token_relay message — restore id_token on startup
+        if topic == f"{MQTT_TOPIC_PREFIX}/token_relay":
+            try:
+                data = json.loads(payload)
+                if "id_token" in data and not self.id_token:
+                    self.id_token = data["id_token"]
+                    log.info("Restored id_token from retained MQTT message")
+                if "access_token" in data:
+                    self._store_token_from_header(data["access_token"], "mqtt_retained")
+                    log.info("Restored access_token from retained MQTT message")
+            except Exception as e:
+                log.debug("Failed to parse retained token_relay: %s", e)
+            return
+
         log.info("MQTT cmd: %s -> %s", topic, payload[:200])
 
         cmd = topic.replace(f"{MQTT_TOPIC_PREFIX}/cmd/", "")
