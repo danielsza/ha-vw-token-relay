@@ -1037,7 +1037,6 @@ class VWTokenRelay:
 
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
         session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/session"
-        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl/check"
         rst_url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
 
         # ── Step 1: Fetch challenge1 ──
@@ -1104,30 +1103,67 @@ class VWTokenRelay:
         spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
         log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
 
-        # ── Step 4: climateControl/check → roToken ──
+        # ── Step 4: SPIN check → roToken ──
         # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
-        log.info("RST Step 4: climateControl/check for roToken (using ATC token)...")
+        # Try both operation names — "remoteStart" and "climateControl"
         check_body = json.dumps({"spinHash": spin_hash2}).encode()
-        result, err = self._api_request_with_token("POST", check_url,
-                                                    body=check_body,
-                                                    bearer_token=atc_token)
-        if result is None:
-            log.error("RST: climateControl/check failed: %s", err)
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "climate_check_failed", **err}))
-            return
+        ro_token = None
+        for operation in ("remoteStart", "climateControl"):
+            op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
+            log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
+            result, err = self._api_request_with_token("POST", op_url,
+                                                        body=check_body,
+                                                        bearer_token=atc_token)
+            if result is not None:
+                check_data = json.loads(result)
+                log.info("RST Step 4 (%s) response: %s", operation, json.dumps(check_data)[:500])
+                ro_token = check_data.get("data", {}).get("roToken", "")
+                if ro_token:
+                    log.info("RST: Got roToken (%d chars) via %s", len(ro_token), operation)
+                    break
+                else:
+                    log.warning("RST: %s/check returned 200 but no roToken: %s",
+                                operation, json.dumps(check_data)[:300])
+                    # If we get 200 with empty data, try next operation
+                    # Need a fresh challenge for the next try
+                    if operation == "remoteStart":
+                        log.info("RST: Fetching challenge3 for fallback operation...")
+                        result3, err3 = self._api_request("GET", challenge_url, vid=vid)
+                        if result3:
+                            c3_data = json.loads(result3)
+                            challenge3 = c3_data["data"]["challenge"]
+                            spin_hash2 = hashlib.sha512(
+                                f"{challenge3}.{self.vw_spin}".encode("utf-8")
+                            ).hexdigest().upper()
+                            check_body = json.dumps({"spinHash": spin_hash2}).encode()
+                            log.info("RST: Got challenge3, trying climateControl...")
+                        else:
+                            log.error("RST: Challenge3 fetch failed, can't try fallback")
+                            break
+            else:
+                log.warning("RST: %s/check failed: %s", operation, err)
+                # On failure (404 etc.), try next operation with a fresh challenge
+                if operation == "remoteStart":
+                    log.info("RST: Fetching challenge3 for fallback operation...")
+                    result3, err3 = self._api_request("GET", challenge_url, vid=vid)
+                    if result3:
+                        c3_data = json.loads(result3)
+                        challenge3 = c3_data["data"]["challenge"]
+                        spin_hash2 = hashlib.sha512(
+                            f"{challenge3}.{self.vw_spin}".encode("utf-8")
+                        ).hexdigest().upper()
+                        check_body = json.dumps({"spinHash": spin_hash2}).encode()
+                        log.info("RST: Got challenge3, trying climateControl...")
+                    else:
+                        log.error("RST: Challenge3 fetch failed, can't try fallback")
+                        break
 
-        check_data = json.loads(result)
-        log.info("RST Step 4 response: %s", json.dumps(check_data)[:500])
-        ro_token = check_data.get("data", {}).get("roToken", "")
         if not ro_token:
-            log.error("RST: No roToken in climateControl/check response")
+            log.error("RST: Could not obtain roToken from any operation")
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
                 json.dumps({"error": "no_ro_token",
-                            "msg": "climateControl/check returned no roToken",
-                            "response": json.dumps(check_data)[:300]}))
+                            "msg": "Neither remoteStart nor climateControl check returned roToken"}))
             return
-        log.info("RST: Got roToken (%d chars)", len(ro_token))
 
         # ── Step 5: POST /rst/v1/vehicle/{vid} ──
         # Body is just {"roToken": "..."} — no pairing, no encryption, no signature needed
