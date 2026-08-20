@@ -1555,69 +1555,115 @@ class VWTokenRelay:
         return r
 
     def _dump_rn_storage(self):
-        """Dump React Native AsyncStorage (SQLite DB) for vehicle data discovery."""
+        """Dump React Native AsyncStorage (SQLite DB) for vehicle data discovery.
+        Phone has no sqlite3, so we pull DB files and query locally with Python."""
+        import sqlite3 as pysqlite
         try:
             log.info("RN_STORAGE: Reading AsyncStorage database...")
-            db_path = f"/data/data/{VW_PACKAGE}/databases/RKStorage"
+            remote_db_dir = f"/data/data/{VW_PACKAGE}/databases"
+            local_tmp = "/tmp/vw_db_dump"
+            os.makedirs(local_tmp, exist_ok=True)
 
-            # 1. List all databases
-            r = self._adb_su(f"ls -la /data/data/{VW_PACKAGE}/databases/")
-            log.info("RN_STORAGE: databases dir:\n%s", r.stdout.strip()[:800])
+            # 1. List all databases on phone
+            r = self._adb_su(f"ls -la {remote_db_dir}/")
+            log.info("RN_STORAGE: databases dir:\n%s", r.stdout.strip()[:1000])
 
-            # 2. List tables in RKStorage
-            r = self._adb_su(f"sqlite3 {db_path} .tables")
-            tables = r.stdout.strip()
-            log.info("RN_STORAGE: tables in RKStorage: %s", tables)
+            # 2. Pull RKStorage to local and query with Python sqlite3
+            # Copy from app-private dir to /data/local/tmp first (adb pull needs accessible path)
+            self._adb_su(f"cp {remote_db_dir}/RKStorage /data/local/tmp/RKStorage")
+            self._adb_su(f"chmod 644 /data/local/tmp/RKStorage")
+            r = subprocess.run(
+                ["adb", "pull", "/data/local/tmp/RKStorage", f"{local_tmp}/RKStorage"],
+                capture_output=True, text=True, timeout=15,
+            )
+            log.info("RN_STORAGE: pull RKStorage: %s %s", r.stdout.strip(), r.stderr.strip())
 
-            # 3. Dump all rows (key + truncated value) — use .dump to avoid SQL parentheses
-            r = self._adb_su(f"sqlite3 {db_path} .dump", timeout=30)
-            if r.returncode == 0 and r.stdout.strip():
-                lines = r.stdout.strip().split('\n')
-                log.info("RN_STORAGE: .dump returned %d lines", len(lines))
-                for line in lines[:80]:
-                    log.info("RN_STORAGE: %s", line[:400])
-                if len(lines) > 80:
-                    log.info("RN_STORAGE: ... (%d more lines truncated)", len(lines) - 80)
+            rk_path = f"{local_tmp}/RKStorage"
+            if os.path.exists(rk_path) and os.path.getsize(rk_path) > 0:
+                conn = pysqlite.connect(rk_path)
+                cur = conn.cursor()
+
+                # List tables
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [row[0] for row in cur.fetchall()]
+                log.info("RN_STORAGE: RKStorage tables: %s", tables)
+
+                for table in tables:
+                    cur.execute(f"SELECT * FROM [{table}] LIMIT 100")
+                    cols = [d[0] for d in cur.description]
+                    rows = cur.fetchall()
+                    log.info("RN_STORAGE: [%s] cols=%s, %d rows", table, cols, len(rows))
+                    for row in rows:
+                        # Truncate values for logging
+                        row_str = " | ".join(str(v)[:200] for v in row)
+                        log.info("RN_STORAGE: [%s] %s", table, row_str[:400])
+
+                conn.close()
             else:
-                log.warning("RN_STORAGE: .dump failed (rc=%d): %s",
-                            r.returncode, r.stderr.strip()[:200])
+                log.warning("RN_STORAGE: RKStorage pull failed or empty")
 
-            # 4. Search for vehicle-related keys specifically
-            r = self._adb_su(
-                f"sqlite3 {db_path} "
-                "\"SELECT key FROM catalystLocalStorage WHERE "
-                "key LIKE '%vehicle%' OR key LIKE '%garage%' OR "
-                "key LIKE '%selected%' OR key LIKE '%current%' OR "
-                "key LIKE '%90bf07c5%' OR key LIKE '%702b3cc5%'\"",
-                timeout=15,
-            )
-            if r.stdout.strip():
-                log.info("RN_STORAGE: Vehicle keys found: %s", r.stdout.strip()[:500])
-            else:
-                log.info("RN_STORAGE: No vehicle-related keys in catalystLocalStorage")
+            # 3. Also pull any other .db files
+            db_files = r.stdout.strip() if r else ""
+            for line in (self._adb_su(f"ls {remote_db_dir}/").stdout or "").split():
+                fname = line.strip()
+                if fname and fname != "RKStorage" and not fname.endswith("-journal") and not fname.endswith("-wal"):
+                    self._adb_su(f"cp {remote_db_dir}/{fname} /data/local/tmp/{fname}")
+                    self._adb_su(f"chmod 644 /data/local/tmp/{fname}")
+                    r2 = subprocess.run(
+                        ["adb", "pull", f"/data/local/tmp/{fname}", f"{local_tmp}/{fname}"],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    local_path = f"{local_tmp}/{fname}"
+                    if os.path.exists(local_path) and os.path.getsize(local_path) > 100:
+                        try:
+                            conn = pysqlite.connect(local_path)
+                            cur = conn.cursor()
+                            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                            db_tables = [r[0] for r in cur.fetchall()]
+                            log.info("RN_STORAGE: [%s] tables: %s", fname, db_tables)
+                            # Search for vehicle-related data
+                            for t in db_tables:
+                                try:
+                                    cur.execute(f"SELECT * FROM [{t}] LIMIT 5")
+                                    sample = cur.fetchall()
+                                    if sample:
+                                        cols = [d[0] for d in cur.description]
+                                        log.info("RN_STORAGE: [%s.%s] cols=%s sample=%s",
+                                                 fname, t, cols, str(sample[0])[:200])
+                                except Exception:
+                                    pass
+                            conn.close()
+                        except Exception as e:
+                            log.debug("RN_STORAGE: %s not a valid DB: %s", fname, e)
 
-            # 5. Check all DB files in databases/
-            r = self._adb_su(
-                f"for db in /data/data/{VW_PACKAGE}/databases/*.db "
-                f"/data/data/{VW_PACKAGE}/databases/*Storage; do "
-                "echo \"=== $db ===\"; sqlite3 $db .tables 2>/dev/null; done"
-            )
-            if r.stdout.strip():
-                log.info("RN_STORAGE: All DB tables:\n%s", r.stdout.strip()[:800])
+            # 4. Grep SharedPreferences XML files for vehicle IDs
+            r = self._adb_su(f"ls /data/data/{VW_PACKAGE}/shared_prefs/")
+            prefs_files = r.stdout.strip().split() if r.stdout.strip() else []
+            log.info("RN_STORAGE: SharedPrefs files: %s", prefs_files[:20])
 
-            # 6. Grep SharedPreferences for vehicle IDs
-            r = self._adb_su(
-                f"grep -rl '90bf07c5\\|vehicle\\|garage\\|selected' "
-                f"/data/data/{VW_PACKAGE}/shared_prefs/ 2>/dev/null"
-            )
-            if r.stdout.strip():
-                log.info("RN_STORAGE: Vehicle-related prefs files: %s", r.stdout.strip()[:500])
-                for fp in r.stdout.strip().split('\n')[:5]:
-                    fp = fp.strip()
-                    if fp:
-                        r2 = self._adb_su(f"cat {fp}", timeout=10)
-                        log.info("RN_STORAGE: [%s] %s",
-                                 fp.split('/')[-1], r2.stdout.strip()[:500])
+            for pf in prefs_files[:15]:
+                pf = pf.strip()
+                if not pf:
+                    continue
+                self._adb_su(f"cp /data/data/{VW_PACKAGE}/shared_prefs/{pf} /data/local/tmp/{pf}")
+                r2 = subprocess.run(
+                    ["adb", "pull", f"/data/local/tmp/{pf}", f"{local_tmp}/{pf}"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                local_pf = f"{local_tmp}/{pf}"
+                if os.path.exists(local_pf):
+                    with open(local_pf, "r", errors="replace") as f:
+                        content = f.read()
+                    # Check for vehicle-related content
+                    keywords = ["90bf07c5", "702b3cc5", "vehicle", "garage",
+                                "selected", "vin", "atlas", "buzz"]
+                    hits = [kw for kw in keywords if kw.lower() in content.lower()]
+                    if hits:
+                        log.info("RN_STORAGE: MATCH [%s] keywords=%s content=%s",
+                                 pf, hits, content[:500])
+                    else:
+                        log.debug("RN_STORAGE: [%s] no vehicle keywords (%d bytes)",
+                                  pf, len(content))
 
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/rn_storage",
@@ -1635,30 +1681,73 @@ class VWTokenRelay:
 
         log.info("SWITCH: Attempting to switch to vehicle %s", target_vid[:16])
 
+        import sqlite3 as pysqlite
         try:
-            db_path = f"/data/data/{VW_PACKAGE}/databases/RKStorage"
+            remote_db = f"/data/data/{VW_PACKAGE}/databases/RKStorage"
+            local_db = "/tmp/vw_switch_RKStorage"
 
-            # First, dump current vehicle selection keys
-            r = self._adb_su(
-                f"sqlite3 {db_path} "
-                "\"SELECT key FROM catalystLocalStorage WHERE "
-                "key LIKE '%vehicle%' OR key LIKE '%selected%' OR "
-                "key LIKE '%garage%' OR key LIKE '%current%'\""
+            # Pull DB locally, modify, push back
+            self._adb_su(f"cp {remote_db} /data/local/tmp/RKStorage_sw")
+            self._adb_su("chmod 644 /data/local/tmp/RKStorage_sw")
+            subprocess.run(
+                ["adb", "pull", "/data/local/tmp/RKStorage_sw", local_db],
+                capture_output=True, timeout=15,
             )
-            log.info("SWITCH: Current vehicle keys: %s", r.stdout.strip()[:500])
 
-            # Try to update the selected vehicle in AsyncStorage
+            if not os.path.exists(local_db):
+                log.error("SWITCH: Failed to pull RKStorage")
+                return
+
+            conn = pysqlite.connect(local_db)
+            cur = conn.cursor()
+
+            # List tables and find vehicle-related keys
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            log.info("SWITCH: DB tables: %s", tables)
+
+            # Dump all keys that might relate to vehicles
+            for table in tables:
+                try:
+                    cur.execute(f"SELECT * FROM [{table}]")
+                    cols = [d[0] for d in cur.description]
+                    rows = cur.fetchall()
+                    for row in rows:
+                        row_str = " | ".join(str(v)[:150] for v in row)
+                        if any(kw in row_str.lower() for kw in
+                               ["vehicle", "selected", "garage", "current",
+                                "90bf07c5", "702b3cc5", "vin"]):
+                            log.info("SWITCH: MATCH [%s] %s", table, row_str[:400])
+                except Exception:
+                    pass
+
+            # Try updating known key patterns
             update_keys = [
                 "selectedVehicleId", "selected_vehicle_id", "currentVehicleId",
                 "@selectedVehicleId", "selectedVehicle", "activeVehicleId",
             ]
-            for key in update_keys:
-                self._adb_su(
-                    f'sqlite3 {db_path} '
-                    f"\"UPDATE catalystLocalStorage SET value='{target_vid}' "
-                    f"WHERE key='{key}'\"",
-                    timeout=10,
-                )
+            updated = 0
+            for table in tables:
+                for key in update_keys:
+                    try:
+                        cur.execute(f"UPDATE [{table}] SET value=? WHERE key=?",
+                                    (target_vid, key))
+                        updated += cur.rowcount
+                    except Exception:
+                        pass
+            conn.commit()
+            log.info("SWITCH: Updated %d rows in local DB", updated)
+            conn.close()
+
+            # Push modified DB back to phone
+            subprocess.run(
+                ["adb", "push", local_db, "/data/local/tmp/RKStorage_sw"],
+                capture_output=True, timeout=15,
+            )
+            self._adb_su(f"cp /data/local/tmp/RKStorage_sw {remote_db}")
+            self._adb_su(f"chmod 660 {remote_db}")
+            # Fix ownership (app uid)
+            self._adb_su(f"chown $(stat -c %u:%g {remote_db.rsplit('/', 1)[0]}) {remote_db}")
 
             # Force-stop and relaunch the app
             log.info("SWITCH: Force-restarting VW app...")
