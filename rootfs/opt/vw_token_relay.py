@@ -907,29 +907,81 @@ class VWTokenRelay:
             return False
 
     def _adb_tap(self, x, y, label=""):
-        """Send an ADB tap with wakeup-first. Uses short swipe as fallback
-        since 'input tap' can hang on some devices (Moto G Pure)."""
+        """Send an ADB tap. Tries multiple methods since 'input tap/swipe'
+        can hang indefinitely on Moto G Pure."""
+        log.info("NAV: Tapping %s at (%d, %d)", label, x, y)
+        # Method 1: sendevent (lowest-level, bypasses input binary)
         try:
-            # Ensure screen is on before tapping
-            subprocess.run(
-                ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+            # Find the touchscreen device
+            result = subprocess.run(
+                ["adb", "shell", "cat", "/proc/bus/input/devices"],
+                capture_output=True, text=True, timeout=5,
+            )
+            # Look for touchscreen device path
+            ts_dev = None
+            lines = result.stdout.split('\n')
+            for i, line in enumerate(lines):
+                if 'touch' in line.lower() or 'Touch' in line:
+                    for j in range(i, min(i + 10, len(lines))):
+                        if 'Handlers=' in lines[j] and 'event' in lines[j]:
+                            import re as _re
+                            m = _re.search(r'(event\d+)', lines[j])
+                            if m:
+                                ts_dev = f"/dev/input/{m.group(1)}"
+                                break
+                    if ts_dev:
+                        break
+
+            if ts_dev:
+                # Send touch down, then touch up via sendevent
+                cmds = (
+                    f"sendevent {ts_dev} 3 57 0;"   # ABS_MT_TRACKING_ID = 0
+                    f"sendevent {ts_dev} 3 53 {x};" # ABS_MT_POSITION_X
+                    f"sendevent {ts_dev} 3 54 {y};" # ABS_MT_POSITION_Y
+                    f"sendevent {ts_dev} 1 330 1;"  # BTN_TOUCH DOWN
+                    f"sendevent {ts_dev} 0 0 0;"    # SYN_REPORT
+                    f"sleep 0.05;"
+                    f"sendevent {ts_dev} 3 57 -1;"  # ABS_MT_TRACKING_ID = -1
+                    f"sendevent {ts_dev} 1 330 0;"  # BTN_TOUCH UP
+                    f"sendevent {ts_dev} 0 0 0"     # SYN_REPORT
+                )
+                r = subprocess.run(
+                    ["adb", "shell", f"su -c '{cmds}'"],
+                    capture_output=True, timeout=10,
+                )
+                if r.returncode == 0:
+                    log.info("NAV: sendevent tap succeeded at (%d, %d)", x, y)
+                    return True
+                log.warning("NAV: sendevent failed (rc=%d), trying monkey", r.returncode)
+        except Exception as e:
+            log.warning("NAV: sendevent method failed: %s — trying monkey", e)
+
+        # Method 2: monkey (generates events via a different path)
+        try:
+            result = subprocess.run(
+                ["adb", "shell",
+                 f"monkey --hprof -p {VW_PACKAGE} -v "
+                 f"--pct-touch 100 --pct-motion 0 --pct-trackball 0 "
+                 f"--pct-syskeys 0 --pct-nav 0 --pct-majornav 0 "
+                 f"--pct-appswitch 0 --pct-flip 0 --pct-anyevent 0 1"],
                 capture_output=True, timeout=10,
             )
-            time.sleep(0.3)
-            log.info("NAV: Tapping %s at (%d, %d)", label, x, y)
-            # Use 'input swipe' with 0 distance as tap — more reliable than
-            # 'input tap' which hangs on some devices
+            if result.returncode == 0:
+                log.info("NAV: monkey tap succeeded (random position in app)")
+                return True
+            log.warning("NAV: monkey failed (rc=%d)", result.returncode)
+        except Exception as e:
+            log.warning("NAV: monkey method failed: %s — trying input", e)
+
+        # Method 3: input tap (may hang, use short timeout)
+        try:
             result = subprocess.run(
-                ["adb", "shell", "input", "swipe",
-                 str(x), str(y), str(x), str(y), "100"],
-                capture_output=True, timeout=10,
+                ["adb", "shell", "input", "tap", str(x), str(y)],
+                capture_output=True, timeout=8,
             )
             return result.returncode == 0
         except subprocess.TimeoutExpired:
-            log.error("NAV: ADB tap (swipe) timed out at (%d, %d)", x, y)
-            return False
-        except Exception as e:
-            log.error("NAV: ADB tap failed: %s", e)
+            log.error("NAV: All tap methods failed at (%d, %d)", x, y)
             return False
 
     def _navigate_to_vehicle(self):
@@ -985,12 +1037,22 @@ class VWTokenRelay:
                 except ET.ParseError:
                     log.warning("NAV: Failed to parse UI XML — trying card area tap")
 
-            # Fallback: tap at common vehicle card positions
+            # Fallback: try tapping vehicle card positions, plus DPAD/ENTER as last resort
             # Moto G Pure is 720x1600. Vehicle cards are typically in the center
             log.info("NAV: Fallback — tapping center of vehicle card area")
             self._adb_tap(360, 600, label="fallback-center")
             time.sleep(2)
             self._adb_tap(360, 800, label="fallback-lower")
+            time.sleep(1)
+            # Last resort: DPAD center (ENTER/OK) — selects focused element
+            # VW app may auto-focus the first vehicle card
+            try:
+                subprocess.run(
+                    ["adb", "shell", "input", "keyevent", "KEYCODE_DPAD_CENTER"],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
             return True
         except Exception as e:
             log.error("NAV: Navigation failed: %s", e)
