@@ -1873,17 +1873,13 @@ class VWTokenRelay:
         log.info("SWITCH: Switching to %s (%s)...", target_name, target_vid[:16])
 
         try:
-            # Ensure VW app is in foreground
-            r = subprocess.run(
-                ["adb", "shell", "dumpsys", "activity", "top"],
-                capture_output=True, text=True, timeout=10)
-            if VW_PACKAGE not in r.stdout:
-                log.info("SWITCH: VW app not in FG — launching...")
-                subprocess.run(
-                    ["adb", "shell", "am", "start", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                    capture_output=True, timeout=10)
-                time.sleep(5)
+            # Force-launch the Garage activity which shows both vehicles
+            log.info("SWITCH: Launching Garage activity...")
+            subprocess.run(
+                ["adb", "shell", "am", "start", "-n",
+                 f"{VW_PACKAGE}/com.vw.myVW.activities.ForcedGarageActivity"],
+                capture_output=True, timeout=10)
+            time.sleep(5)
 
             # Step 1: Dump UI, dismiss blocking dialogs, then look for vehicle picker
             xml = self._dump_ui_xml()
@@ -1998,22 +1994,23 @@ class VWTokenRelay:
             except Exception as e:
                 log.warning("SWITCH: XML parse error: %s", e)
 
-            # Step 2: Look for vehicle name or picker elements
-            # Try finding current vehicle name (e.g., "ID. Buzz", "Atlas")
-            # or any element that looks like a vehicle selector
+            # Step 2: Look for vehicle cards in the Garage
+            # ForcedGarageActivity shows vehiclesRecyclerView with cards
+            # containing vehicleNameTextView (e.g., "2024 Atlas", "2025 ID. Buzz 1st Edition")
             picker_searches = [
-                # Search for vehicle names
+                # Search for vehicle names (Garage screen)
                 {"text": "Atlas"},
+                {"text": "2024 Atlas"},
                 {"text": "Buzz"},
                 {"text": "ID. Buzz"},
-                # Search for common picker/dropdown resource IDs
+                {"text": "2025 ID. Buzz"},
+                # Search by resource IDs
+                {"resource_id": "vehicleNameTextView"},
+                {"resource_id": "vehiclesRecyclerView"},
                 {"resource_id": "vehicle"},
                 {"resource_id": "vehiclePicker"},
-                {"resource_id": "vehicleSelector"},
                 {"resource_id": "garage"},
-                {"resource_id": "carSelector"},
                 {"content_desc": "vehicle"},
-                {"content_desc": "switch"},
             ]
 
             found_current = None
