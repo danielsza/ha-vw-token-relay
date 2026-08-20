@@ -244,6 +244,110 @@ rpc.exports = {
         return retval || JSON.stringify({ error: 'Java.performNow returned without setting result' });
     },
 
+    // Read SharedPreferences to find vehicle selection state
+    readSharedPrefs: function (prefName) {
+        var retval = null;
+        Java.performNow(function () {
+            try {
+                var ActivityThread = Java.use('android.app.ActivityThread');
+                var app = ActivityThread.currentApplication();
+                var context = app.getApplicationContext();
+
+                // List all SharedPreferences files if no name given
+                if (!prefName || prefName === '') {
+                    var prefsDir = context.getFilesDir().getParent() + '/shared_prefs';
+                    var File = Java.use('java.io.File');
+                    var dir = File.$new(prefsDir);
+                    var files = dir.list();
+                    var names = [];
+                    if (files) {
+                        for (var i = 0; i < files.length; i++) {
+                            names.push(files[i].toString());
+                        }
+                    }
+                    retval = JSON.stringify({ prefs_dir: prefsDir, files: names });
+                    return;
+                }
+
+                // Read a specific SharedPreferences file
+                var Context = Java.use('android.content.Context');
+                var prefs = context.getSharedPreferences(prefName, 0);
+                var allEntries = prefs.getAll();
+                var map = {};
+                var iterator = allEntries.entrySet().iterator();
+                while (iterator.hasNext()) {
+                    var entry = iterator.next();
+                    var key = entry.getKey().toString();
+                    var val = entry.getValue();
+                    map[key] = val !== null ? val.toString() : null;
+                }
+                retval = JSON.stringify({ name: prefName, entries: map });
+            } catch (e) {
+                retval = JSON.stringify({ error: e.toString() });
+            }
+        });
+        return retval || JSON.stringify({ error: 'Java.performNow returned without setting result' });
+    },
+
+    // Execute JS in React Native bridge (for navigation control)
+    evalReactNative: function (jsCode) {
+        var retval = null;
+        Java.performNow(function () {
+            try {
+                // Find the CatalystInstance to evaluate JS
+                var CatalystInstanceImpl = null;
+                try { CatalystInstanceImpl = Java.use('com.facebook.react.bridge.CatalystInstanceImpl'); } catch(e) {}
+
+                if (CatalystInstanceImpl) {
+                    // Find running instances
+                    Java.choose('com.facebook.react.bridge.CatalystInstanceImpl', {
+                        onMatch: function (instance) {
+                            try {
+                                // loadScriptFromAssets doesn't work, but we can use NativeModules
+                                retval = JSON.stringify({ found: true, msg: 'CatalystInstance found but direct JS eval not available. Use NativeModules approach.' });
+                            } catch (e) {
+                                retval = JSON.stringify({ error: 'instance eval failed: ' + e });
+                            }
+                        },
+                        onComplete: function () {}
+                    });
+                }
+
+                // Alternative: enumerate React Native modules
+                if (!retval) {
+                    var ReactContext = null;
+                    try { ReactContext = Java.use('com.facebook.react.bridge.ReactContext'); } catch(e) {}
+                    if (ReactContext) {
+                        Java.choose('com.facebook.react.bridge.ReactContext', {
+                            onMatch: function (ctx) {
+                                try {
+                                    var modules = ctx.getNativeModules();
+                                    var names = [];
+                                    var iterator = modules.entrySet().iterator();
+                                    var count = 0;
+                                    while (iterator.hasNext() && count < 50) {
+                                        var entry = iterator.next();
+                                        names.push(entry.getKey().toString());
+                                        count++;
+                                    }
+                                    retval = JSON.stringify({ react_modules: names, total: modules.size() });
+                                } catch (e) {
+                                    retval = JSON.stringify({ error: 'module enum failed: ' + e });
+                                }
+                            },
+                            onComplete: function () {}
+                        });
+                    }
+                }
+
+                if (!retval) retval = JSON.stringify({ error: 'No React Native bridge found' });
+            } catch (e) {
+                retval = JSON.stringify({ error: e.toString() });
+            }
+        });
+        return retval || JSON.stringify({ error: 'Java.performNow returned without setting result' });
+    },
+
     // Sign data with the VW pairing key from Android KeyStore
     // dataBase64: base64-encoded bytes to sign
     // alias: KeyStore alias (discovered via listKeystoreAliases)
@@ -1345,69 +1449,89 @@ class VWTokenRelay:
             )
 
     def _dump_ui(self):
-        """Dump the Android UI hierarchy via uiautomator for debugging.
-        Publishes the XML to MQTT and logs key elements."""
+        """Dump phone UI info via multiple methods for debugging.
+        Combines dumpsys, Frida SharedPrefs, and RN module enumeration."""
         try:
-            log.info("DUMP_UI: Running uiautomator dump...")
-            # Dump UI hierarchy to XML file on phone (use /data/local/tmp for reliability)
-            r = subprocess.run(
-                ["adb", "shell", "uiautomator", "dump", "/data/local/tmp/ui_dump.xml"],
-                capture_output=True, text=True, timeout=30,
-            )
-            log.info("DUMP_UI: dump rc=%d stdout=%s stderr=%s",
-                     r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200])
+            log.info("DUMP_UI: Starting comprehensive UI dump...")
 
-            # Pull the XML file
-            r2 = subprocess.run(
-                ["adb", "pull", "/data/local/tmp/ui_dump.xml", "/share/ui_dump.xml"],
-                capture_output=True, text=True, timeout=15,
-            )
-            log.info("DUMP_UI: pull rc=%d stdout=%s stderr=%s",
-                     r2.returncode, r2.stdout.strip()[:200], r2.stderr.strip()[:200])
-
-            # Read and parse
+            # 1. dumpsys activity top — shows current activity view hierarchy
             try:
-                with open("/share/ui_dump.xml", "r") as f:
-                    xml_content = f.read()
-            except FileNotFoundError:
-                log.error("DUMP_UI: XML file not found after pull")
-                return
+                r = subprocess.run(
+                    ["adb", "shell", "dumpsys", "activity", "top"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                # Extract just the top activity section
+                lines = r.stdout.split('\n')
+                relevant = []
+                capture = False
+                for line in lines:
+                    if 'ACTIVITY' in line and 'com.vw' in line:
+                        capture = True
+                    if capture:
+                        relevant.append(line)
+                    if capture and len(relevant) > 60:
+                        break
+                for line in relevant[:40]:
+                    log.info("DUMP_UI activity: %s", line.rstrip()[:200])
+            except Exception as e:
+                log.warning("DUMP_UI: dumpsys activity top failed: %s", e)
 
-            # Log the full XML (it's usually small enough)
-            log.info("DUMP_UI: XML length=%d", len(xml_content))
+            # 2. dumpsys window — shows window dimensions and layout
+            try:
+                r = subprocess.run(
+                    ["adb", "shell", "dumpsys", "window", "windows"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                for line in r.stdout.split('\n'):
+                    if 'com.vw' in line or 'mFrame' in line or 'mContaining' in line:
+                        log.info("DUMP_UI window: %s", line.strip()[:200])
+            except Exception as e:
+                log.warning("DUMP_UI: dumpsys window failed: %s", e)
 
-            # Parse and log clickable/important elements
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(xml_content)
-            interesting = []
-            for node in root.iter("node"):
-                text = node.get("text", "")
-                desc = node.get("content-desc", "")
-                clz = node.get("class", "")
-                bounds = node.get("bounds", "")
-                clickable = node.get("clickable", "false")
-                if text or desc or clickable == "true":
-                    interesting.append({
-                        "text": text,
-                        "desc": desc,
-                        "class": clz.split(".")[-1] if "." in clz else clz,
-                        "bounds": bounds,
-                        "clickable": clickable,
-                    })
+            # 3. Frida SharedPreferences — find vehicle selection state
+            if self.script:
+                try:
+                    # List all prefs files
+                    prefs_list = self.script.exports_sync.read_shared_prefs("")
+                    prefs_data = json.loads(prefs_list)
+                    log.info("DUMP_UI prefs files: %s", json.dumps(prefs_data.get("files", []))[:500])
 
-            for elem in interesting:
-                log.info("DUMP_UI: %s", json.dumps(elem))
+                    # Read each prefs file looking for vehicle-related keys
+                    for pf in prefs_data.get("files", []):
+                        pname = pf.replace(".xml", "")
+                        try:
+                            pdata = self.script.exports_sync.read_shared_prefs(pname)
+                            pd = json.loads(pdata)
+                            entries = pd.get("entries", {})
+                            # Look for vehicle-related keys
+                            for k, v in entries.items():
+                                kl = k.lower()
+                                if any(term in kl for term in ["vehicle", "car", "vin", "garage",
+                                        "selected", "default", "current", "active", "atlas", "buzz"]):
+                                    log.info("DUMP_UI pref [%s] %s = %s", pname, k, str(v)[:200])
+                        except Exception as e2:
+                            log.debug("DUMP_UI: prefs read %s failed: %s", pname, e2)
+                except Exception as e:
+                    log.warning("DUMP_UI: SharedPrefs read failed: %s", e)
 
-            # Publish summary to MQTT
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/ui_dump",
-                json.dumps({"status": "ok", "elements": len(interesting),
-                             "items": interesting[:50]}),  # limit to 50
-            )
+                # 4. React Native module enumeration
+                try:
+                    rn_info = self.script.exports_sync.eval_react_native("")
+                    rn_data = json.loads(rn_info)
+                    log.info("DUMP_UI RN modules: %s", json.dumps(rn_data)[:500])
+                except Exception as e:
+                    log.warning("DUMP_UI: RN module enum failed: %s", e)
+            else:
+                log.warning("DUMP_UI: No Frida script — skipping SharedPrefs and RN dump")
 
-            # Also log foreground activity
+            # 5. Foreground activity
             fg = self._get_foreground_activity()
             log.info("DUMP_UI: Foreground: %s", fg)
+
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/ui_dump",
+                json.dumps({"status": "ok", "msg": "See addon logs for full dump"}),
+            )
 
         except Exception as e:
             log.error("DUMP_UI: Failed: %s", e)
