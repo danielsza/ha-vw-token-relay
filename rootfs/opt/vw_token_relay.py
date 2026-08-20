@@ -1878,16 +1878,21 @@ class VWTokenRelay:
         except Exception:
             pass
 
-        if not self._attach_frida():
-            log.error("Could not attach to VW app")
-            return
+        frida_ok = False
+        try:
+            frida_ok = self._attach_frida()
+        except Exception as e:
+            log.warning("Frida attach failed (phone unavailable?): %s", e)
 
-        # Start keepalive thread
-        t = threading.Thread(target=self._keepalive_loop, daemon=True)
-        t.start()
+        if not frida_ok:
+            log.warning("Running WITHOUT Frida — MQTT commands available but no token capture")
+        else:
+            # Start keepalive thread only if Frida is connected
+            t = threading.Thread(target=self._keepalive_loop, daemon=True)
+            t.start()
 
         log.info("=" * 60)
-        log.info("VW Token Relay running")
+        log.info("VW Token Relay running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
         log.info("  Topics:")
         log.info("    %s/tokens       — current token state (retained)", MQTT_TOPIC_PREFIX)
