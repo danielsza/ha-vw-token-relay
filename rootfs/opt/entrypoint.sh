@@ -143,10 +143,24 @@ wake_screen() {
 }
 
 ensure_phone_ready() {
-    # Wait for ADB device
+    # Reset ADB server to re-detect USB devices after container restart
+    echo "Resetting ADB server..."
+    adb kill-server 2>/dev/null || true
+    sleep 2
+    adb start-server 2>/dev/null || true
+    sleep 2
+
+    # Wait for ADB device (with 120s timeout)
     echo "Waiting for USB device..."
+    USB_WAIT=0
+    USB_TIMEOUT=120
     while ! adb devices 2>/dev/null | grep -q "device$"; do
         sleep 5
+        USB_WAIT=$((USB_WAIT + 5))
+        if [ "${USB_WAIT}" -ge "${USB_TIMEOUT}" ]; then
+            echo "WARNING: No USB device after ${USB_TIMEOUT}s — starting relay without phone"
+            return 1
+        fi
     done
     DEVICE=$(adb devices | grep "device$" | head -1 | awk '{print $1}')
     echo "Found ADB device: ${DEVICE}"
