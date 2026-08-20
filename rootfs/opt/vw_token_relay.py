@@ -1055,9 +1055,19 @@ class VWTokenRelay:
             return
 
         check_data = json.loads(result)
-        ro_token = check_data["data"]["roToken"]
-        captcha_idx = check_data["data"].get("captchaIndex", "")
-        captcha_val = check_data["data"].get("captchaValue", "")
+        log.info("RST Step 4 response: %s", json.dumps(check_data)[:500])
+        data_block = check_data.get("data", {})
+        ro_token = data_block.get("roToken")
+        if not ro_token:
+            log.error("RST: SPIN check succeeded but no roToken in response. Keys: %s",
+                      list(data_block.keys()) if isinstance(data_block, dict) else type(data_block))
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "no_ro_token",
+                            "msg": "SPIN check response missing roToken",
+                            "response_keys": list(data_block.keys()) if isinstance(data_block, dict) else str(data_block)[:200]}))
+            return
+        captcha_idx = data_block.get("captchaIndex", "")
+        captcha_val = data_block.get("captchaValue", "")
         log.info("RST: Got roToken (%d chars), captcha=%s/%s", len(ro_token), captcha_idx, captcha_val)
 
         # Step 5: Build encrypted payload
