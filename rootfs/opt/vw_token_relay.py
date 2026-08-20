@@ -500,6 +500,10 @@ class VWTokenRelay:
             threading.Thread(target=self._switch_vehicle_rn, args=(payload,), daemon=True).start()
         elif cmd == "update_pif":
             threading.Thread(target=self._update_pif, daemon=True).start()
+        elif cmd == "clear_data":
+            threading.Thread(target=self._clear_app_data, daemon=True).start()
+        elif cmd == "auto_login":
+            threading.Thread(target=self._auto_login, daemon=True).start()
         else:
             log.warning("Unknown command: %s", cmd)
 
@@ -1797,6 +1801,198 @@ class VWTokenRelay:
             log.error("SWITCH: Failed: %s", e)
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
+                json.dumps({"status": "error", "msg": str(e)}),
+            )
+
+    def _clear_app_data(self):
+        """Clear VW app data to force fresh login."""
+        try:
+            log.info("CLEAR: Clearing VW app data...")
+            subprocess.run(
+                ["adb", "shell", "pm", "clear", VW_PACKAGE],
+                capture_output=True, timeout=15,
+            )
+            log.info("CLEAR: App data cleared. Use auto_login to re-authenticate.")
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/clear_data",
+                json.dumps({"status": "ok", "msg": "App data cleared"}),
+            )
+        except Exception as e:
+            log.error("CLEAR: Failed: %s", e)
+
+    def _auto_login(self):
+        """Automated login flow: clear data → launch → fill WebView credentials.
+        Screen: 720x1600 (Moto G Pure). Uses adb input for taps and text entry."""
+        if not self.vw_email or not self.vw_password:
+            log.error("AUTO_LOGIN: No credentials configured (vw_email/vw_password)")
+            return
+
+        def _tap(x, y, desc=""):
+            log.info("AUTO_LOGIN: tap(%d, %d) %s", x, y, desc)
+            subprocess.run(["adb", "shell", "input", "tap", str(x), str(y)],
+                           capture_output=True, timeout=10)
+            time.sleep(1.5)
+
+        def _input_text(text, desc=""):
+            log.info("AUTO_LOGIN: input_text '%s' %s", desc, desc)
+            # Use adb shell input text — escape special chars
+            escaped = text.replace(" ", "%s").replace("@", "\\@").replace("&", "\\&")
+            subprocess.run(["adb", "shell", "input", "text", escaped],
+                           capture_output=True, timeout=10)
+            time.sleep(1)
+
+        def _swipe(x1, y1, x2, y2, ms=300):
+            subprocess.run(
+                ["adb", "shell", "input", "swipe",
+                 str(x1), str(y1), str(x2), str(y2), str(ms)],
+                capture_output=True, timeout=10)
+            time.sleep(1)
+
+        def _get_activity():
+            r = subprocess.run(
+                ["adb", "shell", "dumpsys", "activity", "top"],
+                capture_output=True, text=True, timeout=10)
+            for line in r.stdout.split('\n'):
+                if 'ACTIVITY' in line and VW_PACKAGE in line:
+                    return line.strip()
+            return "unknown"
+
+        def _take_screenshot(label=""):
+            """Take screenshot for debugging."""
+            self._screencap()
+            log.info("AUTO_LOGIN: screenshot saved (%s)", label)
+
+        try:
+            log.info("AUTO_LOGIN: Starting automated login flow...")
+
+            # Step 1: Clear app data
+            log.info("AUTO_LOGIN: Step 1 — Clearing app data...")
+            subprocess.run(
+                ["adb", "shell", "pm", "clear", VW_PACKAGE],
+                capture_output=True, timeout=15,
+            )
+            time.sleep(2)
+
+            # Step 2: Wake screen
+            log.info("AUTO_LOGIN: Step 2 — Waking screen...")
+            subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+                           capture_output=True, timeout=10)
+            time.sleep(1)
+            _swipe(360, 1400, 360, 600, 300)  # Swipe up to dismiss lock screen
+            time.sleep(2)
+
+            # Step 3: Launch app fresh
+            log.info("AUTO_LOGIN: Step 3 — Launching VW app fresh...")
+            subprocess.run(
+                ["adb", "shell", "am", "start", "-n",
+                 f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                capture_output=True, timeout=10)
+            time.sleep(8)  # Wait for splash/welcome screen
+
+            activity = _get_activity()
+            log.info("AUTO_LOGIN: After launch, activity: %s", activity)
+            _take_screenshot("after_launch")
+
+            # Step 4: Navigate welcome/onboarding screens
+            # First fresh launch usually shows a welcome screen with "Let's Go" or "Log In"
+            # Try tapping common CTA button positions
+            log.info("AUTO_LOGIN: Step 4 — Navigating welcome screen...")
+
+            # Check if there's a consent/terms dialog first — dismiss it
+            _tap(360, 1350, "bottom CTA (Let's Go / Get Started)")
+            time.sleep(2)
+
+            activity = _get_activity()
+            log.info("AUTO_LOGIN: After welcome tap, activity: %s", activity)
+            _take_screenshot("after_welcome")
+
+            # The app might show a location permission dialog
+            # Tap "While using the app" or "Allow" if permission popup appears
+            _tap(360, 900, "permission allow (if shown)")
+            time.sleep(1)
+            _tap(360, 900, "second permission (if shown)")
+            time.sleep(2)
+
+            # Step 5: Look for Log In button
+            log.info("AUTO_LOGIN: Step 5 — Looking for login button...")
+            _tap(360, 1350, "Log In button")
+            time.sleep(5)  # Wait for WebView to load
+
+            activity = _get_activity()
+            log.info("AUTO_LOGIN: After login tap, activity: %s", activity)
+            _take_screenshot("after_login_tap")
+
+            # Step 6: Enter email in OIDC WebView
+            # The login page typically has email field at top-center
+            log.info("AUTO_LOGIN: Step 6 — Entering email...")
+            _tap(360, 550, "email field")  # Tap email input
+            time.sleep(1)
+            _input_text(self.vw_email, "email")
+            time.sleep(1)
+
+            # Hide keyboard and tap Next/Continue
+            subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                           capture_output=True, timeout=10)
+            time.sleep(1)
+            _tap(360, 750, "Next/Continue button")
+            time.sleep(4)
+
+            _take_screenshot("after_email")
+
+            # Step 7: Enter password
+            log.info("AUTO_LOGIN: Step 7 — Entering password...")
+            _tap(360, 550, "password field")
+            time.sleep(1)
+            _input_text(self.vw_password, "password")
+            time.sleep(1)
+
+            # Submit
+            subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                           capture_output=True, timeout=10)
+            time.sleep(2)
+            _tap(360, 750, "Sign In button")
+            time.sleep(10)  # Wait for OIDC redirect + app load
+
+            activity = _get_activity()
+            log.info("AUTO_LOGIN: After sign-in, activity: %s", activity)
+            _take_screenshot("after_signin")
+
+            # Step 8: Reattach Frida and wait for tokens
+            log.info("AUTO_LOGIN: Step 8 — Reattaching Frida...")
+            time.sleep(5)
+            try:
+                self._attach_frida()
+            except Exception as e:
+                log.warning("AUTO_LOGIN: Frida attach failed: %s, retrying...", e)
+                time.sleep(5)
+                try:
+                    self._attach_frida()
+                except Exception as e2:
+                    log.error("AUTO_LOGIN: Frida attach failed again: %s", e2)
+
+            # Wait for app to make API calls and capture tokens
+            log.info("AUTO_LOGIN: Waiting 30s for app to load and make API calls...")
+            time.sleep(30)
+
+            # Check if we got a fresh token
+            if self.global_token:
+                log.info("AUTO_LOGIN: SUCCESS — got fresh token!")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/auto_login",
+                    json.dumps({"status": "success", "msg": "Fresh token captured"}),
+                )
+            else:
+                log.warning("AUTO_LOGIN: No token captured yet. Check screenshots.")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/auto_login",
+                    json.dumps({"status": "no_token",
+                                "msg": "Login may have failed — check addon logs & screenshots"}),
+                )
+
+        except Exception as e:
+            log.error("AUTO_LOGIN: Failed: %s", e)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/auto_login",
                 json.dumps({"status": "error", "msg": str(e)}),
             )
 
