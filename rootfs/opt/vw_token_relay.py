@@ -907,22 +907,26 @@ class VWTokenRelay:
             return False
 
     def _adb_tap(self, x, y, label=""):
-        """Send an ADB tap with wakeup-first and longer timeout."""
+        """Send an ADB tap with wakeup-first. Uses short swipe as fallback
+        since 'input tap' can hang on some devices (Moto G Pure)."""
         try:
             # Ensure screen is on before tapping
             subprocess.run(
                 ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
                 capture_output=True, timeout=10,
             )
-            time.sleep(0.5)
+            time.sleep(0.3)
             log.info("NAV: Tapping %s at (%d, %d)", label, x, y)
+            # Use 'input swipe' with 0 distance as tap — more reliable than
+            # 'input tap' which hangs on some devices
             result = subprocess.run(
-                ["adb", "shell", "input", "tap", str(x), str(y)],
-                capture_output=True, timeout=15,
+                ["adb", "shell", "input", "swipe",
+                 str(x), str(y), str(x), str(y), "100"],
+                capture_output=True, timeout=10,
             )
             return result.returncode == 0
         except subprocess.TimeoutExpired:
-            log.error("NAV: ADB tap timed out at (%d, %d)", x, y)
+            log.error("NAV: ADB tap (swipe) timed out at (%d, %d)", x, y)
             return False
         except Exception as e:
             log.error("NAV: ADB tap failed: %s", e)
@@ -1040,7 +1044,11 @@ class VWTokenRelay:
                 log.error("WAKE: Failed to reattach Frida after app restart: %s", e)
 
             # Navigate to vehicle dashboard to trigger vehicle-scoped tokens
-            time.sleep(8)  # Wait for app to fully load (increased from 5s)
+            # VW app (React Native) takes 15-20s to fully render vehicle cards
+            time.sleep(15)
+            self._navigate_to_vehicle()
+            # Wait and try a second navigation attempt in case first was too early
+            time.sleep(10)
             self._navigate_to_vehicle()
         except Exception as e:
             log.error("WAKE: Failed to wake app: %s", e)
@@ -1590,6 +1598,17 @@ class VWTokenRelay:
         signal.signal(signal.SIGTERM, _handle_sigterm)
 
         self._setup_mqtt()
+
+        # Ensure phone screen stays on while USB-connected (critical for ADB taps)
+        try:
+            subprocess.run(
+                ["adb", "shell", "settings", "put", "global",
+                 "stay_on_while_plugged_in", "3"],
+                capture_output=True, timeout=5,
+            )
+            log.info("Set stay_on_while_plugged_in=3 (screen always on via USB)")
+        except Exception:
+            pass
 
         if not self._attach_frida():
             log.error("Could not attach to VW app")
