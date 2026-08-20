@@ -950,7 +950,7 @@ class VWTokenRelay:
           1. GET /pair/v1/vehicle/{vid} → get pairingId + pairingKeySeed
           2. GET /ss/v1/user/{uid}/challenge → get SPIN challenge
           3. Compute rstPinHash = SHA512(challenge + "." + spin).hex().upper()
-          4. POST /ss/v1/user/{uid}/vehicle/{vid}/operation/climateControl/check
+          4. POST /ss/v1/user/{uid}/vehicle/{vid}/operation/remoteStart/check
              body: {"spinHash": rstPinHash} → get roToken
           5. Build encryptedPayload (timestamps + XOR + AES/ECB + XOR + base64)
           6. Sign encryptedPayload via Frida RPC (Android KeyStore ECDSA)
@@ -1035,8 +1035,10 @@ class VWTokenRelay:
         log.info("RST Step 3: Computed rstPinHash (%d chars)", len(rst_pin_hash))
 
         # Step 4: SPIN check → get roToken
-        log.info("RST Step 4: SPIN check for roToken...")
-        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl/check"
+        # ATC/MQB (ICE) vehicles use "remoteStart", WCT/MEB (BEV) use "climateControl"
+        spin_operation = "remoteStart"
+        log.info("RST Step 4: SPIN check for roToken (operation=%s)...", spin_operation)
+        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{spin_operation}/check"
         check_body = json.dumps({"spinHash": rst_pin_hash}).encode()
         result, err = self._api_request("POST", check_url, body=check_body, vid=vid)
         if result is None:
@@ -2860,8 +2862,7 @@ class VWTokenRelay:
                 try:
                     resp_data = json.loads(resp_body).get("data", {})
                     if resp_data.get("pairingKeySeed") and resp_data.get("pairingId"):
-                        # Extract vehicle_id from URL
-                        import re
+                        # Extract vehicle_id from URL (re imported at module level)
                         vid_match = re.search(r'/vehicle/([a-f0-9-]+)/', url)
                         if vid_match:
                             vid = vid_match.group(1)
