@@ -520,6 +520,8 @@ class VWTokenRelay:
             threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
         elif cmd == "remote_start_stop":
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
+        elif cmd == "get_pairing":
+            threading.Thread(target=self._cmd_get_pairing, args=(payload,), daemon=True).start()
         elif cmd == "dump_ui":
             threading.Thread(target=self._dump_ui, daemon=True).start()
         elif cmd == "dump_storage":
@@ -961,6 +963,19 @@ class VWTokenRelay:
         log.error("No active pairing found for vehicle %s (API empty, no cache)", vehicle_id)
         return None
 
+    def _cmd_get_pairing(self, vehicle_id):
+        """Query and publish pairing status for a vehicle."""
+        vid = vehicle_id.strip()
+        log.info("═══ GET PAIRING ═══ vehicle=%s", vid)
+        pairing = self._get_pairing_data(vid)
+        if pairing:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/pairing",
+                json.dumps(pairing, default=str), retain=False)
+            log.info("Pairing data published: %s", json.dumps(pairing, default=str)[:500])
+        else:
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/pairing",
+                json.dumps({"error": "no_pairing_found"}), retain=False)
+
     def _api_remote_start(self, vehicle_id):
         """Execute remote start for an ICE vehicle.
 
@@ -1133,7 +1148,7 @@ class VWTokenRelay:
         # consumes the challenge but returns empty data, poisoning the state.
         check_body = json.dumps({"spinHash": spin_hash2}).encode()
         ro_token = None
-        for operation in ("climateControl", "remoteStart"):
+        for operation in ("remoteStart", "climateControl"):
             op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
             log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
             result, err = self._api_request_with_token("POST", op_url,
