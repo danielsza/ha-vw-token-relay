@@ -152,13 +152,19 @@ ensure_phone_ready() {
 
     # Wait for ADB device (with 120s timeout)
     echo "Waiting for USB device..."
+    echo "ADB devices output: $(adb devices 2>&1)"
+    echo "USB bus contents: $(ls /dev/bus/usb/002/ 2>/dev/null || echo 'no bus 002')"
     USB_WAIT=0
     USB_TIMEOUT=120
     while ! adb devices 2>/dev/null | grep -q "device$"; do
         sleep 5
         USB_WAIT=$((USB_WAIT + 5))
+        if [ "$((USB_WAIT % 30))" -eq 0 ]; then
+            echo "ADB wait ${USB_WAIT}s: $(adb devices 2>&1 | tail -1)"
+        fi
         if [ "${USB_WAIT}" -ge "${USB_TIMEOUT}" ]; then
             echo "WARNING: No USB device after ${USB_TIMEOUT}s — starting relay without phone"
+            echo "Final ADB state: $(adb devices 2>&1)"
             return 1
         fi
     done
