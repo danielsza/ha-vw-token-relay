@@ -369,7 +369,11 @@ class VWTokenRelay:
         if cmd == "get_tokens":
             self._publish_tokens()
         elif cmd == "wake_app":
-            self._wake_app()
+            threading.Thread(target=self._wake_app, daemon=True).start()
+        elif cmd == "force_relaunch":
+            threading.Thread(target=self._wake_app_full_restart, daemon=True).start()
+        elif cmd == "screencap":
+            threading.Thread(target=self._screencap, daemon=True).start()
         elif cmd == "vehicle_status":
             self._api_call("GET", payload)
         elif cmd == "lock":
@@ -1238,6 +1242,40 @@ class VWTokenRelay:
         self._navigate_to_vehicle()
         time.sleep(10)
         self._navigate_to_vehicle()
+
+    def _screencap(self):
+        """Take a screenshot of the phone and save to /share/ for debugging."""
+        try:
+            log.info("SCREENCAP: Taking screenshot...")
+            subprocess.run(
+                ["adb", "shell", "screencap", "-p", "/sdcard/vw_screen.png"],
+                capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["adb", "pull", "/sdcard/vw_screen.png", "/share/vw_screen.png"],
+                capture_output=True, timeout=15,
+            )
+            # Also save to /media/ for HA media browser access
+            subprocess.run(
+                ["cp", "/share/vw_screen.png", "/media/vw_screen.png"],
+                capture_output=True, timeout=5,
+            )
+            log.info("SCREENCAP: Saved to /share/vw_screen.png and /media/vw_screen.png")
+
+            # Also log the current activity for context
+            fg = self._get_foreground_activity()
+            log.info("SCREENCAP: Current foreground: %s", fg)
+
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/screencap",
+                json.dumps({"status": "saved", "path": "/share/vw_screen.png"}),
+            )
+        except Exception as e:
+            log.error("SCREENCAP: Failed: %s", e)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/screencap",
+                json.dumps({"status": "error", "msg": str(e)}),
+            )
 
     def _update_pif(self):
         """Run the Play Integrity fingerprint updater script."""
