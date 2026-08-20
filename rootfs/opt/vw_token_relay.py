@@ -548,13 +548,16 @@ class VWTokenRelay:
             # Dump uiautomator XML and log interactive elements
             try:
                 log.info("UIXML: Running uiautomator dump...")
-                subprocess.run(
+                dr = subprocess.run(
                     ["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
-                    capture_output=True, timeout=15)
+                    capture_output=True, text=True, timeout=15)
+                log.info("UIXML: dump stdout=%s stderr=%s rc=%d",
+                         dr.stdout.strip()[:200], dr.stderr.strip()[:200], dr.returncode)
                 r = subprocess.run(
                     ["adb", "shell", "cat", "/sdcard/ui.xml"],
                     capture_output=True, text=True, timeout=15)
                 xml_str = r.stdout.strip()
+                log.info("UIXML: xml length=%d", len(xml_str))
                 if not xml_str:
                     log.error("UIXML: Empty dump")
                 else:
