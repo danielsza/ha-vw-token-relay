@@ -412,15 +412,18 @@ class VWTokenRelay:
         log.info("Published token summary to MQTT")
 
     # ── Direct API calls using captured tokens ──────────────────────
-    def _get_valid_token(self, vehicle_id=None):
-        """Get a valid token, preferring vehicle-scoped if available."""
+    def _get_valid_token(self, vehicle_id=None, vehicle_only=False):
+        """Get a valid token, preferring vehicle-scoped if available.
+        If vehicle_only=True, only return a vehicle-scoped token (required
+        for vehicle-specific endpoints like pairing, SPIN, RST)."""
         with self._lock:
             if vehicle_id and vehicle_id in self.tokens:
                 t = self.tokens[vehicle_id]
                 if datetime.now() < t["expiry"]:
                     return t["token"]
-            if self.global_token and self.global_expiry and datetime.now() < self.global_expiry:
-                return self.global_token
+            if not vehicle_only:
+                if self.global_token and self.global_expiry and datetime.now() < self.global_expiry:
+                    return self.global_token
         return None
 
     def _api_request(self, method, url, body=None, vid=None, timeout=15):
@@ -674,6 +677,20 @@ class VWTokenRelay:
           8. Poll /history/v1/vehicle/{vid}/correlationId/{cid}/ro/ for result
         """
         vid = vehicle_id.strip()
+
+        # Prevent concurrent RST commands
+        if not hasattr(self, '_rst_lock'):
+            self._rst_lock = threading.Lock()
+        if not self._rst_lock.acquire(blocking=False):
+            log.warning("RST: Another remote start is already in progress — ignoring")
+            return
+        try:
+            self._api_remote_start_inner(vid)
+        finally:
+            self._rst_lock.release()
+
+    def _api_remote_start_inner(self, vid):
+        """Inner RST logic (runs under _rst_lock)."""
         log.info("═══ REMOTE START ═══ vehicle=%s", vid)
 
         if not self.vw_spin:
@@ -681,25 +698,24 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
-        # Pre-check: ensure we have a token before starting the multi-step flow
-        # Vehicle-scoped endpoints (pairing, SPIN, RST) need tokens with tid.
-        # After app restart, only global tokens are available until the app
-        # navigates to a vehicle dashboard. We drive this via ADB.
-        token = self._get_valid_token(vid)
+        # Pre-check: vehicle-scoped endpoints (pairing, SPIN, RST) need tokens
+        # with tid. Global tokens get 403. After app restart, only global tokens
+        # exist until the app navigates to a vehicle dashboard.
+        token = self._get_valid_token(vid, vehicle_only=True)
         if not token:
-            log.info("RST: No valid token — waking app with navigation...")
+            log.info("RST: No vehicle-scoped token — waking app with navigation...")
             self._wake_app()
-            # Wait up to 45s for vehicle-scoped token (app needs to load + navigate)
-            for i in range(9):
+            # Wait up to 60s for vehicle-scoped token (app needs to load + navigate)
+            for i in range(12):
                 time.sleep(5)
-                token = self._get_valid_token(vid)
+                token = self._get_valid_token(vid, vehicle_only=True)
                 if token:
-                    log.info("RST: Got token after %ds", (i + 1) * 5)
+                    log.info("RST: Got vehicle-scoped token after %ds", (i + 1) * 5)
                     break
             if not token:
-                log.error("RST: Still no valid token after app wake + navigation")
+                log.error("RST: Still no vehicle-scoped token after app wake + navigation")
                 self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                    json.dumps({"error": "no_valid_token", "msg": "Token expired — no fresh token after app navigation"}))
+                    json.dumps({"error": "no_valid_token", "msg": "No vehicle-scoped token after app navigation"}))
                 return
 
         # Step 1: Get pairing data (uses _api_request with auto-retry on 403)
@@ -859,15 +875,73 @@ class VWTokenRelay:
             log.error("RST stop failed: %s", err)
 
     # ── Wake the VW app to trigger token refresh ────────────────────
+    def _adb_check(self):
+        """Verify ADB can reach the phone. Returns True if device is online."""
+        try:
+            result = subprocess.run(
+                ["adb", "devices"], capture_output=True, text=True, timeout=5,
+            )
+            lines = [l for l in result.stdout.strip().splitlines()
+                     if l and not l.startswith("List") and "device" in l]
+            if lines:
+                log.debug("ADB: device(s) online: %s", lines)
+                return True
+            # No device — try reconnecting USB
+            log.warning("ADB: no device found — running adb reconnect")
+            subprocess.run(["adb", "kill-server"], capture_output=True, timeout=5)
+            time.sleep(1)
+            subprocess.run(["adb", "start-server"], capture_output=True, timeout=5)
+            time.sleep(2)
+            result2 = subprocess.run(
+                ["adb", "devices"], capture_output=True, text=True, timeout=5,
+            )
+            lines2 = [l for l in result2.stdout.strip().splitlines()
+                      if l and not l.startswith("List") and "device" in l]
+            if lines2:
+                log.info("ADB: device reconnected: %s", lines2)
+                return True
+            log.error("ADB: still no device after reconnect")
+            return False
+        except Exception as e:
+            log.error("ADB: device check failed: %s", e)
+            return False
+
+    def _adb_tap(self, x, y, label=""):
+        """Send an ADB tap with wakeup-first and longer timeout."""
+        try:
+            # Ensure screen is on before tapping
+            subprocess.run(
+                ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(0.5)
+            log.info("NAV: Tapping %s at (%d, %d)", label, x, y)
+            result = subprocess.run(
+                ["adb", "shell", "input", "tap", str(x), str(y)],
+                capture_output=True, timeout=15,
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            log.error("NAV: ADB tap timed out at (%d, %d)", x, y)
+            return False
+        except Exception as e:
+            log.error("NAV: ADB tap failed: %s", e)
+            return False
+
     def _navigate_to_vehicle(self):
         """Use ADB to navigate the VW app to a vehicle dashboard.
         After force-restart, the app lands on the home screen.
         We need to tap on a vehicle card to trigger vehicle-scoped API calls."""
+        # Verify ADB connectivity first
+        if not self._adb_check():
+            log.error("NAV: Cannot navigate — ADB not connected")
+            return False
+
         try:
             # Dump UI hierarchy to find vehicle elements
             subprocess.run(
                 ["adb", "shell", "uiautomator", "dump", "/sdcard/window_dump.xml"],
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=15,
             )
             result = subprocess.run(
                 ["adb", "shell", "cat", "/sdcard/window_dump.xml"],
@@ -877,41 +951,30 @@ class VWTokenRelay:
 
             if ui_xml:
                 # Parse UI dump to find clickable vehicle-related elements
-                # Look for text containing vehicle names or "My Vehicle" patterns
                 import xml.etree.ElementTree as ET
                 try:
                     root = ET.fromstring(ui_xml)
-                    # Find all clickable nodes
                     clickable = []
                     for node in root.iter('node'):
                         text = (node.get('text', '') or '').lower()
                         desc = (node.get('content-desc', '') or '').lower()
-                        cls = node.get('class', '')
                         bounds = node.get('bounds', '')
-                        is_clickable = node.get('clickable', '') == 'true'
 
-                        # Look for vehicle-related text
                         vehicle_keywords = ['atlas', 'buzz', 'vehicle', 'tiguan', 'jetta',
                                             'golf', 'taos', 'passat', 'arteon', 'id.4',
-                                            'id.buzz', 'start', 'my vw', 'myvw']
+                                            'id.buzz', 'my vw', 'myvw']
                         if any(kw in text or kw in desc for kw in vehicle_keywords):
-                            clickable.append((text or desc, bounds, is_clickable))
+                            clickable.append((text or desc, bounds))
 
                     if clickable:
-                        # Tap on the first vehicle-related element
                         target = clickable[0]
                         bounds_str = target[1]
-                        # Parse bounds "[x1,y1][x2,y2]"
                         import re as _re
                         m = _re.findall(r'\[(\d+),(\d+)\]', bounds_str)
                         if len(m) >= 2:
                             x = (int(m[0][0]) + int(m[1][0])) // 2
                             y = (int(m[0][1]) + int(m[1][1])) // 2
-                            log.info("NAV: Tapping '%s' at (%d, %d)", target[0], x, y)
-                            subprocess.run(
-                                ["adb", "shell", "input", "tap", str(x), str(y)],
-                                capture_output=True, timeout=5,
-                            )
+                            self._adb_tap(x, y, label=f"'{target[0]}'")
                             return True
                     else:
                         log.info("NAV: No vehicle keywords in UI — trying card area tap")
@@ -920,18 +983,10 @@ class VWTokenRelay:
 
             # Fallback: tap at common vehicle card positions
             # Moto G Pure is 720x1600. Vehicle cards are typically in the center
-            # Try tapping center of screen (where first vehicle card usually is)
             log.info("NAV: Fallback — tapping center of vehicle card area")
-            subprocess.run(
-                ["adb", "shell", "input", "tap", "360", "600"],
-                capture_output=True, timeout=5,
-            )
+            self._adb_tap(360, 600, label="fallback-center")
             time.sleep(2)
-            # Also try a bit lower in case there's a header
-            subprocess.run(
-                ["adb", "shell", "input", "tap", "360", "800"],
-                capture_output=True, timeout=5,
-            )
+            self._adb_tap(360, 800, label="fallback-lower")
             return True
         except Exception as e:
             log.error("NAV: Navigation failed: %s", e)
@@ -940,44 +995,55 @@ class VWTokenRelay:
     def _wake_app(self):
         """Force-restart the VW app to trigger fresh API calls and token capture.
         Just 'am start' on an already-running app doesn't trigger new traffic."""
+        if not self._adb_check():
+            log.error("WAKE: Cannot wake app — ADB not connected")
+            return
         try:
             # Wake screen first
             subprocess.run(
                 ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
-                capture_output=True, timeout=5,
+                capture_output=True, timeout=10,
             )
             time.sleep(1)
             # Swipe up to dismiss lock screen
             subprocess.run(
                 ["adb", "shell", "input", "swipe", "540", "1800", "540", "800", "300"],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(1)
+            # Dismiss keyguard if present
+            subprocess.run(
+                ["adb", "shell", "wm", "dismiss-keyguard"],
                 capture_output=True, timeout=5,
             )
             time.sleep(1)
             # Force-stop the app so relaunch triggers fresh API calls
+            log.info("WAKE: Force-stopping VW app...")
             subprocess.run(
                 ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                 capture_output=True, timeout=10,
             )
             time.sleep(2)
             # Relaunch
+            log.info("WAKE: Relaunching VW app...")
             subprocess.run(
                 ["adb", "shell", "am", "start", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
                 capture_output=True, timeout=10,
             )
-            log.info("Force-restarted VW app — waiting for token capture")
+            log.info("WAKE: Force-restarted VW app — waiting for token capture")
             # Need to re-attach Frida since the app got a new PID
             time.sleep(5)
             try:
                 self._attach_frida()
             except Exception as e:
-                log.error("Failed to reattach Frida after app restart: %s", e)
+                log.error("WAKE: Failed to reattach Frida after app restart: %s", e)
 
             # Navigate to vehicle dashboard to trigger vehicle-scoped tokens
-            time.sleep(5)  # Wait for app to fully load
+            time.sleep(8)  # Wait for app to fully load (increased from 5s)
             self._navigate_to_vehicle()
         except Exception as e:
-            log.error("Failed to wake app: %s", e)
+            log.error("WAKE: Failed to wake app: %s", e)
 
     def _update_pif(self):
         """Run the Play Integrity fingerprint updater script."""
