@@ -544,6 +544,49 @@ class VWTokenRelay:
                     log.info("PERM: Granted %s", perm)
             except Exception as e:
                 log.error("PERM: Failed: %s", e)
+        elif cmd == "adb_uixml":
+            # Dump uiautomator XML and log interactive elements
+            try:
+                log.info("UIXML: Running uiautomator dump...")
+                subprocess.run(
+                    ["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
+                    capture_output=True, timeout=15)
+                r = subprocess.run(
+                    ["adb", "shell", "cat", "/sdcard/ui.xml"],
+                    capture_output=True, text=True, timeout=15)
+                xml_str = r.stdout.strip()
+                if not xml_str:
+                    log.error("UIXML: Empty dump")
+                else:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(xml_str)
+                    for node in root.iter():
+                        txt = node.get("text", "")
+                        rid = node.get("resource-id", "")
+                        cls = node.get("class", "")
+                        bnds = node.get("bounds", "")
+                        click = node.get("clickable", "false")
+                        desc = node.get("content-desc", "")
+                        # Log elements with text, resource-id, or clickable
+                        if txt or rid or click == "true" or desc:
+                            short_cls = cls.split(".")[-1] if cls else ""
+                            log.info("UIXML: %s id=%s txt='%s' desc='%s' click=%s bounds=%s",
+                                     short_cls, rid.split("/")[-1] if rid else "",
+                                     txt[:60], desc[:40], click, bnds)
+            except Exception as e:
+                log.error("UIXML: Failed: %s", e)
+        elif cmd == "adb_swipe":
+            # Swipe gesture: payload = "x1,y1,x2,y2,duration_ms" e.g. "360,800,360,400,300"
+            try:
+                parts = payload.strip().split(",")
+                x1, y1, x2, y2 = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+                dur = parts[4].strip() if len(parts) > 4 else "300"
+                log.info("ADB_SWIPE: (%s,%s) -> (%s,%s) dur=%sms", x1, y1, x2, y2, dur)
+                subprocess.run(
+                    ["adb", "shell", "input", "swipe", x1, y1, x2, y2, dur],
+                    capture_output=True, timeout=10)
+            except Exception as e:
+                log.error("ADB_SWIPE: Failed: %s", e)
         else:
             log.warning("Unknown command: %s", cmd)
 
