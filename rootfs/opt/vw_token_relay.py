@@ -703,17 +703,28 @@ class VWTokenRelay:
         # exist until the app navigates to a vehicle dashboard.
         token = self._get_valid_token(vid, vehicle_only=True)
         if not token:
-            log.info("RST: No vehicle-scoped token — waking app with navigation...")
+            # Phase 1: Light wake — navigate the running app (no force-stop)
+            log.info("RST: No vehicle-scoped token — trying light navigation...")
             self._wake_app()
-            # Wait up to 60s for vehicle-scoped token (app needs to load + navigate)
-            for i in range(12):
+            for i in range(6):  # 30s polling
                 time.sleep(5)
                 token = self._get_valid_token(vid, vehicle_only=True)
                 if token:
-                    log.info("RST: Got vehicle-scoped token after %ds", (i + 1) * 5)
+                    log.info("RST: Got vehicle-scoped token (light wake) after %ds", (i + 1) * 5)
+                    break
+
+        if not token:
+            # Phase 2: Full restart — force-stop + relaunch + Frida reattach
+            log.info("RST: Light wake failed — trying full app restart...")
+            self._wake_app_full_restart()
+            for i in range(8):  # 40s polling
+                time.sleep(5)
+                token = self._get_valid_token(vid, vehicle_only=True)
+                if token:
+                    log.info("RST: Got vehicle-scoped token (full restart) after %ds", (i + 1) * 5)
                     break
             if not token:
-                log.error("RST: Still no vehicle-scoped token after app wake + navigation")
+                log.error("RST: Still no vehicle-scoped token after light + full restart")
                 self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
                     json.dumps({"error": "no_valid_token", "msg": "No vehicle-scoped token after app navigation"}))
                 return
@@ -985,9 +996,7 @@ class VWTokenRelay:
 
     def _navigate_to_vehicle(self):
         """Use ADB to navigate the VW app to a vehicle dashboard.
-        After force-restart, the app lands on the home screen.
         We need to tap on a vehicle card to trigger vehicle-scoped API calls."""
-        # Verify ADB connectivity first
         if not self._adb_check():
             log.error("NAV: Cannot navigate — ADB not connected")
             return False
@@ -1005,46 +1014,85 @@ class VWTokenRelay:
             ui_xml = result.stdout if result.returncode == 0 else ""
 
             if ui_xml:
-                # Parse UI dump to find clickable vehicle-related elements
                 import xml.etree.ElementTree as ET
                 try:
                     root = ET.fromstring(ui_xml)
-                    clickable = []
+
+                    # Diagnostic: log all text/content-desc values for debugging
+                    all_texts = []
+                    all_clickable = []
+                    for node in root.iter('node'):
+                        text = (node.get('text', '') or '')
+                        desc = (node.get('content-desc', '') or '')
+                        bounds = node.get('bounds', '')
+                        clickable = node.get('clickable', '') == 'true'
+                        if text or desc:
+                            label = text or desc
+                            all_texts.append(label[:40])
+                        if clickable and bounds:
+                            all_clickable.append((text or desc or 'unnamed', bounds))
+
+                    log.info("NAV: UI texts found: %s", all_texts[:20])
+                    log.info("NAV: Clickable elements: %d", len(all_clickable))
+
+                    # Search for vehicle-related elements
+                    vehicle_keywords = ['atlas', 'buzz', 'vehicle', 'tiguan', 'jetta',
+                                        'golf', 'taos', 'passat', 'arteon', 'id.4',
+                                        'id.buzz', 'my vw', 'myvw', 'garage',
+                                        'dashboard', 'home']
+                    matches = []
                     for node in root.iter('node'):
                         text = (node.get('text', '') or '').lower()
                         desc = (node.get('content-desc', '') or '').lower()
                         bounds = node.get('bounds', '')
-
-                        vehicle_keywords = ['atlas', 'buzz', 'vehicle', 'tiguan', 'jetta',
-                                            'golf', 'taos', 'passat', 'arteon', 'id.4',
-                                            'id.buzz', 'my vw', 'myvw']
                         if any(kw in text or kw in desc for kw in vehicle_keywords):
-                            clickable.append((text or desc, bounds))
+                            matches.append((text or desc, bounds))
 
-                    if clickable:
-                        target = clickable[0]
-                        bounds_str = target[1]
+                    if matches:
+                        target = matches[0]
+                        log.info("NAV: Found vehicle element: '%s'", target[0])
                         import re as _re
-                        m = _re.findall(r'\[(\d+),(\d+)\]', bounds_str)
+                        m = _re.findall(r'\[(\d+),(\d+)\]', target[1])
                         if len(m) >= 2:
                             x = (int(m[0][0]) + int(m[1][0])) // 2
                             y = (int(m[0][1]) + int(m[1][1])) // 2
                             self._adb_tap(x, y, label=f"'{target[0]}'")
                             return True
-                    else:
-                        log.info("NAV: No vehicle keywords in UI — trying card area tap")
-                except ET.ParseError:
-                    log.warning("NAV: Failed to parse UI XML — trying card area tap")
 
-            # Fallback: try tapping vehicle card positions, plus DPAD/ENTER as last resort
-            # Moto G Pure is 720x1600. Vehicle cards are typically in the center
-            log.info("NAV: Fallback — tapping center of vehicle card area")
-            self._adb_tap(360, 600, label="fallback-center")
+                    # No vehicle keywords found — try tapping first large clickable
+                    # element in the middle area (likely a card)
+                    import re as _re
+                    for name, bounds in all_clickable:
+                        m = _re.findall(r'\[(\d+),(\d+)\]', bounds)
+                        if len(m) >= 2:
+                            x1, y1 = int(m[0][0]), int(m[0][1])
+                            x2, y2 = int(m[1][0]), int(m[1][1])
+                            w, h = x2 - x1, y2 - y1
+                            # Look for card-sized elements in the middle area
+                            if w > 200 and h > 80 and y1 > 200 and y1 < 1200:
+                                cx = (x1 + x2) // 2
+                                cy = (y1 + y2) // 2
+                                log.info("NAV: Tapping large clickable '%s' at (%d,%d) size %dx%d",
+                                         name[:30], cx, cy, w, h)
+                                self._adb_tap(cx, cy, label=f"clickable-'{name[:20]}'")
+                                return True
+
+                    log.info("NAV: No vehicle keywords or large clickables — using fallback taps")
+                except ET.ParseError:
+                    log.warning("NAV: Failed to parse UI XML — using fallback taps")
+            else:
+                log.warning("NAV: UI dump empty — app may not be rendering")
+
+            # Fallback: tap common vehicle card positions
+            # Moto G Pure is 720x1600. Vehicle cards typically center-ish
+            log.info("NAV: Fallback — tapping card area positions")
+            self._adb_tap(360, 500, label="fallback-upper")
             time.sleep(2)
-            self._adb_tap(360, 800, label="fallback-lower")
+            self._adb_tap(360, 700, label="fallback-center")
+            time.sleep(2)
+            self._adb_tap(360, 900, label="fallback-lower")
             time.sleep(1)
-            # Last resort: DPAD center (ENTER/OK) — selects focused element
-            # VW app may auto-focus the first vehicle card
+            # DPAD center as absolute last resort
             try:
                 subprocess.run(
                     ["adb", "shell", "input", "keyevent", "KEYCODE_DPAD_CENTER"],
@@ -1057,16 +1105,8 @@ class VWTokenRelay:
             log.error("NAV: Navigation failed: %s", e)
             return False
 
-    def _wake_app(self):
-        """Force-restart the VW app to trigger fresh API calls and token capture.
-        Just 'am start' on an already-running app doesn't trigger new traffic.
-        Each step is individually protected so a screen-wake failure doesn't
-        prevent the critical force-stop → relaunch → navigate flow."""
-        if not self._adb_check():
-            log.error("WAKE: Cannot wake app — ADB not connected")
-            return
-
-        # Step 1: Wake screen + dismiss lock (non-critical, best effort)
+    def _wake_screen(self):
+        """Wake the screen and dismiss lock screen. Best effort."""
         try:
             subprocess.run(
                 ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
@@ -1075,9 +1115,7 @@ class VWTokenRelay:
             time.sleep(1)
         except Exception as e:
             log.warning("WAKE: screen wake failed (non-critical): %s", e)
-
         try:
-            # Must use su — bare 'input swipe' hangs on Moto G Pure
             subprocess.run(
                 ["adb", "shell", "su", "-c", "input swipe 540 1800 540 800 300"],
                 capture_output=True, timeout=10,
@@ -1085,47 +1123,119 @@ class VWTokenRelay:
             time.sleep(1)
         except Exception as e:
             log.warning("WAKE: lock screen swipe failed (non-critical): %s", e)
-
         try:
             subprocess.run(
                 ["adb", "shell", "wm", "dismiss-keyguard"],
                 capture_output=True, timeout=5,
             )
-            time.sleep(1)
         except Exception:
             pass
 
-        # Step 2: Force-stop + relaunch (critical)
+    def _get_foreground_activity(self):
+        """Get the current foreground activity name."""
         try:
-            log.info("WAKE: Force-stopping VW app...")
+            r = subprocess.run(
+                ["adb", "shell", "dumpsys", "activity", "activities"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in r.stdout.split('\n'):
+                if 'mResumedActivity' in line or 'topResumedActivity' in line:
+                    return line.strip()
+            return "unknown"
+        except Exception:
+            return "error"
+
+    def _wake_app(self):
+        """Get VW app to a vehicle dashboard for vehicle-scoped tokens.
+        Strategy:
+          1. Try navigating the already-running app first (no force-stop).
+             Force-stopping + relaunching causes white screen on Moto G Pure.
+          2. Only force-stop if the app isn't in the foreground."""
+        if not self._adb_check():
+            log.error("WAKE: Cannot wake app — ADB not connected")
+            return
+
+        self._wake_screen()
+
+        # Check if VW app is already running in foreground
+        fg = self._get_foreground_activity()
+        log.info("WAKE: Foreground activity: %s", fg)
+
+        vw_in_fg = VW_PACKAGE in fg if fg else False
+
+        if not vw_in_fg:
+            # App not in foreground — bring it up (don't force-stop, just launch)
+            log.info("WAKE: VW app not in foreground — launching...")
+            try:
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=10,
+                )
+                time.sleep(10)  # Give app time to render
+            except Exception as e:
+                log.error("WAKE: Failed to launch VW app: %s", e)
+                return
+        else:
+            log.info("WAKE: VW app already in foreground")
+
+        # Try navigating without force-stop first
+        log.info("WAKE: Attempting navigation on running app...")
+        time.sleep(5)
+        self._navigate_to_vehicle()
+
+        # Check if we got a vehicle-scoped token from that
+        time.sleep(10)
+        # The caller polls for tokens, but let's try a second nav attempt
+        self._navigate_to_vehicle()
+
+        # If still no joy after caller's polling, the caller will handle it.
+        # But log the current state for diagnostics
+        time.sleep(5)
+        fg2 = self._get_foreground_activity()
+        log.info("WAKE: After navigation, foreground: %s", fg2)
+
+    def _wake_app_full_restart(self):
+        """Full force-stop + relaunch cycle. Called if light wake didn't
+        produce vehicle-scoped tokens. Gives the app more time to render
+        before Frida re-attach."""
+        if not self._adb_check():
+            log.error("WAKE: Cannot wake app — ADB not connected")
+            return
+
+        self._wake_screen()
+
+        log.info("WAKE: Full restart — force-stopping VW app...")
+        try:
             subprocess.run(
                 ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                 capture_output=True, timeout=10,
             )
-            time.sleep(2)
+            time.sleep(3)
             log.info("WAKE: Relaunching VW app...")
             subprocess.run(
                 ["adb", "shell", "am", "start", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
                 capture_output=True, timeout=10,
             )
-            log.info("WAKE: Force-restarted VW app — waiting for token capture")
         except Exception as e:
             log.error("WAKE: Failed to restart VW app: %s", e)
             return
 
-        # Step 3: Re-attach Frida (new PID after force-stop)
-        time.sleep(5)
+        # Wait longer before Frida attach — React Native on Moto G Pure
+        # needs 10-15s to initialize JS bridge. Attaching too early causes
+        # white screen.
+        log.info("WAKE: Waiting 12s for React Native to init before Frida attach...")
+        time.sleep(12)
         try:
             self._attach_frida()
         except Exception as e:
-            log.error("WAKE: Failed to reattach Frida after app restart: %s", e)
+            log.error("WAKE: Failed to reattach Frida: %s", e)
 
-        # Step 4: Navigate to vehicle dashboard to trigger vehicle-scoped tokens
-        # VW app (React Native) takes 15-20s to fully render vehicle cards
-        time.sleep(15)
+        # Wait for app to fully render vehicle cards
+        log.info("WAKE: Waiting 20s for vehicle cards to render...")
+        time.sleep(20)
         self._navigate_to_vehicle()
-        # Second attempt in case first was too early
         time.sleep(10)
         self._navigate_to_vehicle()
 
