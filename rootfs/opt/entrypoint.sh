@@ -171,6 +171,14 @@ ensure_phone_ready() {
     DEVICE=$(adb devices | grep "device$" | head -1 | awk '{print $1}')
     echo "Found ADB device: ${DEVICE}"
 
+    # Persist ADB key on phone to prevent future "unauthorized" state
+    if [ -f "${DATA_ANDROID}/adbkey.pub" ]; then
+        adb push "${DATA_ANDROID}/adbkey.pub" /data/local/tmp/adbkey.pub 2>/dev/null && \
+        adb shell "su -c 'cat /data/local/tmp/adbkey.pub >> /data/misc/adb/adb_keys && sort -u -o /data/misc/adb/adb_keys /data/misc/adb/adb_keys && chmod 640 /data/misc/adb/adb_keys && chown system:shell /data/misc/adb/adb_keys'" 2>/dev/null && \
+        echo "ADB key persisted on phone (will survive reboots)" || \
+        echo "ADB key persist failed (non-fatal)"
+    fi
+
     # Force-restart frida-server (don't trust stale PIDs after phone reboot)
     echo "Starting frida-server on phone..."
     adb shell "su -c 'killall frida-server'" 2>/dev/null || true

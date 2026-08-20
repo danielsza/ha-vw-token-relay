@@ -420,20 +420,18 @@ class VWTokenRelay:
         """Get a valid token, preferring vehicle-scoped if available.
         If vehicle_only=True, only return a vehicle-scoped token (required
         for vehicle-specific endpoints like pairing, SPIN, RST).
-        Falls back to ANY vehicle-scoped token if the exact vehicle's
-        token isn't available — the backend may accept any tid."""
+        VW backend validates tid strictly — cross-vehicle tokens get 403."""
         with self._lock:
             # 1. Exact vehicle match
             if vehicle_id and vehicle_id in self.tokens:
                 t = self.tokens[vehicle_id]
                 if datetime.now() < t["expiry"]:
                     return t["token"]
-            # 2. Any vehicle-scoped token (tid present but different vehicle)
-            if vehicle_only or vehicle_id:
+            # 2. Any vehicle-scoped token (only if no specific vehicle requested)
+            if vehicle_only and not vehicle_id:
                 for vid, t in self.tokens.items():
                     if datetime.now() < t["expiry"]:
-                        log.info("TOKEN: Using %s-scoped token for %s (cross-vehicle fallback)",
-                                 vid[:8], vehicle_id[:8] if vehicle_id else "any")
+                        log.info("TOKEN: Using %s-scoped token (any vehicle)", vid[:8])
                         return t["token"]
             # 3. Global token (no tid)
             if not vehicle_only:
@@ -471,7 +469,7 @@ class VWTokenRelay:
                 err = e.read().decode("utf-8", errors="replace")
                 if e.code in (401, 403) and attempt < max_retries:
                     log.warning("API %d on %s — refreshing token and retrying...", e.code, url[:60])
-                    self._wake_app()
+                    self._wake_app(target_vid=vid)
                     time.sleep(30)
                     continue
                 if e.code >= 500 and attempt < max_retries:
@@ -1287,7 +1285,7 @@ class VWTokenRelay:
             log.info("SCREENCAP: Taking screenshot...")
             subprocess.run(
                 ["adb", "shell", "screencap", "-p", "/sdcard/vw_screen.png"],
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=30,
             )
             subprocess.run(
                 ["adb", "pull", "/sdcard/vw_screen.png", "/share/vw_screen.png"],
