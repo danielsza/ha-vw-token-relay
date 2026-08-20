@@ -3175,6 +3175,24 @@ class VWTokenRelay:
             url = payload.get("url", "")
             method = payload.get("method", "?")
             status = payload.get("status", "?")
+
+            # ── Extract id_token from URL query params ──
+            # The VW app passes idToken as a query param (e.g. /garage?idToken=eyJ...)
+            # This is our primary capture path since the OIDC token exchange
+            # happens in a WebView that Frida can't hook.
+            if "idToken=" in url:
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(url)
+                    qp = parse_qs(parsed.query)
+                    if "idToken" in qp:
+                        captured_id = qp["idToken"][0]
+                        if captured_id.startswith("eyJ") and len(captured_id) > 100:
+                            with self._lock:
+                                self.id_token = captured_id
+                            log.info("id_token captured from URL query param! (len=%d)", len(captured_id))
+                except Exception as e:
+                    log.debug("Failed to extract idToken from URL: %s", e)
             req_body = payload.get("requestBody", "")
             resp_body = payload.get("responseBody", "")
             log.info("═══ TRAFFIC ═══ %s %s → %s", method, url, status)
