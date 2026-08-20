@@ -421,6 +421,7 @@ class VWTokenRelay:
         self.global_expiry = None
         self.refresh_token = None
         self.id_token = None
+        self.code_verifier = None  # PKCE verifier from OIDC token exchange
         self.vehicle_ids = []
         self.user_id = None
 
@@ -1026,10 +1027,16 @@ class VWTokenRelay:
             return
 
         if not self.id_token:
-            log.error("RST: No id_token available — need app to have logged in")
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_id_token", "msg": "No OIDC id_token — wake app first"}))
-            return
+            log.info("RST: No id_token — trying direct IDP refresh...")
+            if not self._direct_idp_refresh():
+                log.info("RST: IDP refresh failed — waking app for full login...")
+                self._wake_app(target_vid=vid)
+                time.sleep(30)
+            if not self.id_token:
+                log.error("RST: No id_token available — need app to have logged in")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                    json.dumps({"error": "no_id_token", "msg": "No OIDC id_token — wake app first"}))
+                return
 
         if not self.user_id:
             log.error("RST: No user_id available")
@@ -1276,6 +1283,9 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured"}))
             return
 
+        if not self.id_token:
+            log.info("RST STOP: No id_token — trying direct IDP refresh...")
+            self._direct_idp_refresh()
         if not self.id_token or not self.user_id:
             log.error("RST STOP: Missing id_token or user_id")
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
@@ -2841,12 +2851,39 @@ class VWTokenRelay:
         except Exception as e:
             log.debug("Token parse error: %s", e)
 
-    def _store_tokens_from_response(self, body_str):
-        """Parse and store tokens from an OIDC token response."""
+    def _store_tokens_from_response(self, body_str, request_body_str=None):
+        """Parse and store tokens from an OIDC token response.
+        VW IDP returns camelCase keys (idToken, accessToken, refreshToken)
+        so we normalize to snake_case before processing."""
         try:
             body = json.loads(body_str)
         except json.JSONDecodeError:
             return
+
+        # ── Normalize camelCase → snake_case (VW IDP convention) ──
+        key_map = {
+            "idToken": "id_token",
+            "accessToken": "access_token",
+            "refreshToken": "refresh_token",
+            "tokenType": "token_type",
+            "expiresIn": "expires_in",
+        }
+        for camel, snake in key_map.items():
+            if camel in body and snake not in body:
+                body[snake] = body.pop(camel)
+                log.debug("Token key normalized: %s → %s", camel, snake)
+
+        # ── Extract code_verifier from request body (needed for direct IDP refresh) ──
+        if request_body_str:
+            try:
+                # Request body is URL-encoded: grant_type=...&code_verifier=...
+                from urllib.parse import parse_qs
+                req_params = parse_qs(request_body_str)
+                if "code_verifier" in req_params:
+                    self.code_verifier = req_params["code_verifier"][0]
+                    log.info("Captured code_verifier from token request (len=%d)", len(self.code_verifier))
+            except Exception:
+                pass
 
         with self._lock:
             if "refresh_token" in body:
@@ -2855,6 +2892,7 @@ class VWTokenRelay:
                 log.info("Refresh token captured (expires in %dd)", rt_exp // 86400)
             if "id_token" in body:
                 self.id_token = body["id_token"]
+                log.info("id_token captured! (len=%d)", len(self.id_token))
             if "access_token" in body:
                 self._store_token_from_header(body["access_token"], "token_response")
 
@@ -2878,6 +2916,53 @@ class VWTokenRelay:
             )
             log.info("Published full token to %s/token_relay for connector (id_token=%s)",
                      MQTT_TOPIC_PREFIX, "yes" if "id_token" in token_relay else "no")
+
+    # ── Direct IDP token refresh (fallback for id_token capture) ──
+    VW_CA_CLIENT_ID = "69eb3c39-d2be-4006-8197-37cc4971e8fe_MYVW_ANDROID"
+    VW_CA_TOKEN_URL = "https://b-h-s.spr.ca00.p.con-veh.net/oidc/v1/token"
+
+    def _direct_idp_refresh(self):
+        """Call the VW IDP token endpoint directly with refresh_token grant.
+        This bypasses Frida and gets a fresh token set including id_token.
+        Requires: refresh_token and code_verifier (both captured from Frida)."""
+        if not self.refresh_token:
+            log.warning("IDP refresh: no refresh_token available")
+            return False
+        if not self.code_verifier:
+            log.warning("IDP refresh: no code_verifier — need app to do a full login first")
+            return False
+
+        log.info("IDP refresh: calling token endpoint directly...")
+        data = (
+            f"grant_type=refresh_token"
+            f"&client_id={self.VW_CA_CLIENT_ID}"
+            f"&code_verifier={self.code_verifier}"
+            f"&refresh_token={self.refresh_token}"
+        )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Car-Net/60 CFNetwork/1121.2.2 Darwin/19.3.0",
+            "Accept": "*/*",
+        }
+        req = Request(self.VW_CA_TOKEN_URL, data=data.encode(), headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=15) as resp:
+                body_str = resp.read().decode()
+                log.info("IDP refresh: got response (len=%d)", len(body_str))
+                self._store_tokens_from_response(body_str)
+                if self.id_token:
+                    log.info("IDP refresh: SUCCESS — id_token captured!")
+                    return True
+                else:
+                    log.warning("IDP refresh: response had no id_token")
+                    return False
+        except HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")[:500]
+            log.error("IDP refresh: HTTP %d — %s", e.code, err)
+            return False
+        except Exception as e:
+            log.error("IDP refresh: %s", e)
+            return False
 
     # ── Vehicle data parsing & MQTT publishing ────────────────────
     def _parse_and_publish_vehicle_data(self, url, body_str, method="GET"):
@@ -3054,7 +3139,7 @@ class VWTokenRelay:
             log.info("Frida: %s", payload["msg"])
 
         elif msg_type == "token_response":
-            self._store_tokens_from_response(payload["body"])
+            self._store_tokens_from_response(payload["body"], payload.get("requestBody"))
             self._publish_tokens()
 
         elif msg_type == "auth_header":
