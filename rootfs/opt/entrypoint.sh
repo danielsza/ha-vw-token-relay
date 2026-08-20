@@ -60,20 +60,49 @@ fi
 # DISABLED: Running action.sh during/after boot caused phone boot loops.
 # PIF fingerprint updates should be triggered manually via MQTT:
 #   mosquitto_pub -t vw/cmd/update_pif -m ""
-# The update_pif.sh script still exists and can be called manually.
-# PIF_UPDATE_INTERVAL=3600
 echo "PIF auto-updater: DISABLED (manual via vw/cmd/update_pif)"
 
-# ── One-time PIF module fix ──
-# Disable PIF module to recover from boot loop caused by bad fingerprint.
-# This runs once on startup; remove after phone is stable.
+# ── Auto-install PIF module if missing ──
+# Downloads and installs chiteroman's PlayIntegrityFix via Magisk CLI.
+# Does NOT run action.sh (which caused boot loops). Uses built-in fingerprint.
 (
     while ! adb devices 2>/dev/null | grep -q "device$"; do sleep 5; done
-    echo "PIF-FIX: Attempting to disable PIF module via ADB..."
-    adb shell "su -c 'touch /data/adb/modules/playintegrityfix/disable'" 2>&1 || echo "PIF-FIX: su failed (safe mode?)"
-    # Also try to revert the bad fingerprint
-    adb shell "su -c 'rm -f /data/adb/modules/playintegrityfix/custom.pif.prop'" 2>&1 || true
-    echo "PIF-FIX: Done. Reboot phone to apply."
+    sleep 5  # Let phone finish booting
+
+    if adb shell "su -c 'test -d /data/adb/modules/playintegrityfix'" 2>/dev/null || \
+       adb shell "su -c 'test -d /data/adb/modules/playintegrityfork'" 2>/dev/null; then
+        echo "PIF: Module already installed, skipping"
+    else
+        echo "PIF: Module not found — installing PlayIntegrityFork (osm0sis)..."
+        PIF_VERSION="v17"
+        PIF_URL="https://github.com/osm0sis/PlayIntegrityFork/releases/download/${PIF_VERSION}/PlayIntegrityFork-${PIF_VERSION}.zip"
+
+        echo "PIF: Downloading ${PIF_VERSION} from GitHub..."
+        if wget -q -O /tmp/pif_module.zip "${PIF_URL}" 2>/dev/null || \
+           /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('${PIF_URL}', '/tmp/pif_module.zip')" 2>/dev/null; then
+
+            echo "PIF: Pushing to phone..."
+            adb push /tmp/pif_module.zip /data/local/tmp/pif_module.zip 2>&1
+
+            echo "PIF: Installing via Magisk..."
+            adb shell "su -c 'magisk --install-module /data/local/tmp/pif_module.zip'" 2>&1
+            INSTALL_RC=$?
+
+            if [ "$INSTALL_RC" -eq 0 ]; then
+                echo "PIF: Module installed successfully!"
+                # Remove auto-update scripts to prevent boot loops
+                adb shell "su -c 'rm -f /data/adb/modules/playintegrityfork/action.sh'" 2>/dev/null || true
+                adb shell "su -c 'rm -f /data/adb/modules/playintegrityfork/autopif2.sh'" 2>/dev/null || true
+                echo "PIF: Rebooting phone to activate module..."
+                adb reboot 2>/dev/null || true
+            else
+                echo "PIF: Install failed (rc=${INSTALL_RC})"
+            fi
+            rm -f /tmp/pif_module.zip
+        else
+            echo "PIF: Download failed — check network"
+        fi
+    fi
 ) &
 
 echo "============================================="
