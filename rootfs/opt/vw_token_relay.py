@@ -1878,6 +1878,13 @@ class VWTokenRelay:
         except Exception:
             pass
 
+        # Diagnostic: check ADB state before Frida
+        try:
+            adb_out = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10)
+            log.info("ADB DIAG: devices=%s", adb_out.stdout.strip().replace('\n', ' | '))
+        except Exception as e:
+            log.warning("ADB DIAG: adb devices failed: %s", e)
+
         frida_ok = False
         try:
             frida_ok = self._attach_frida()
