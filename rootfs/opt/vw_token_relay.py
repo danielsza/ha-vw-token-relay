@@ -964,9 +964,15 @@ class VWTokenRelay:
             return None
 
     def _get_pairing_data(self, vehicle_id):
-        """Get pairing data for a vehicle from the API.
-        Uses _api_request for auto-retry on 401/403 (token refresh).
-        Falls back to cached pairing data from Frida traffic capture."""
+        """Get pairing data for a vehicle.
+        Checks cache FIRST (to avoid 403 retry cycles that kill Frida),
+        then falls back to API if no cache exists."""
+        # Check cache first — avoids wake/nav cycle that can kill Frida
+        cached = self._get_cached_pairing(vehicle_id)
+        if cached:
+            log.info("Using cached pairing for RST (avoiding API call)")
+            return cached
+
         url = f"{BASE_URL}/pair/v1/vehicle/{vehicle_id}"
         result, err = self._api_request("GET", url, vid=vehicle_id)
         if result is None:
