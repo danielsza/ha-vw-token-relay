@@ -907,25 +907,42 @@ class VWTokenRelay:
             return False
 
     def _adb_tap(self, x, y, label=""):
-        """Send an ADB tap. Tries multiple methods since 'input tap/swipe'
-        can hang indefinitely on Moto G Pure."""
+        """Send an ADB tap at specific coordinates.
+        'input tap' hangs as shell user on Moto G Pure but works via su."""
         log.info("NAV: Tapping %s at (%d, %d)", label, x, y)
-        # Method 1: sendevent (lowest-level, bypasses input binary)
+
+        # Method 1: input tap via su (root) — this bypasses the permission
+        # issue that causes 'input tap' to hang as shell user
         try:
-            # Find the touchscreen device
+            result = subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"input tap {x} {y}"],
+                capture_output=True, timeout=10,
+            )
+            if result.returncode == 0:
+                log.info("NAV: su input tap succeeded at (%d, %d)", x, y)
+                return True
+            log.warning("NAV: su input tap failed (rc=%d)", result.returncode)
+        except subprocess.TimeoutExpired:
+            log.warning("NAV: su input tap timed out — trying sendevent")
+        except Exception as e:
+            log.warning("NAV: su input tap error: %s", e)
+
+        # Method 2: sendevent (raw touch events)
+        try:
+            # Find touchscreen device
             result = subprocess.run(
                 ["adb", "shell", "cat", "/proc/bus/input/devices"],
                 capture_output=True, text=True, timeout=5,
             )
-            # Look for touchscreen device path
             ts_dev = None
-            lines = result.stdout.split('\n')
-            for i, line in enumerate(lines):
-                if 'touch' in line.lower() or 'Touch' in line:
-                    for j in range(i, min(i + 10, len(lines))):
-                        if 'Handlers=' in lines[j] and 'event' in lines[j]:
+            dev_lines = result.stdout.split('\n')
+            for i, line in enumerate(dev_lines):
+                if 'touch' in line.lower():
+                    for j in range(i, min(i + 10, len(dev_lines))):
+                        if 'Handlers=' in dev_lines[j] and 'event' in dev_lines[j]:
                             import re as _re
-                            m = _re.search(r'(event\d+)', lines[j])
+                            m = _re.search(r'(event\d+)', dev_lines[j])
                             if m:
                                 ts_dev = f"/dev/input/{m.group(1)}"
                                 break
@@ -933,17 +950,16 @@ class VWTokenRelay:
                         break
 
             if ts_dev:
-                # Send touch down, then touch up via sendevent
                 cmds = (
-                    f"sendevent {ts_dev} 3 57 0;"   # ABS_MT_TRACKING_ID = 0
-                    f"sendevent {ts_dev} 3 53 {x};" # ABS_MT_POSITION_X
-                    f"sendevent {ts_dev} 3 54 {y};" # ABS_MT_POSITION_Y
-                    f"sendevent {ts_dev} 1 330 1;"  # BTN_TOUCH DOWN
-                    f"sendevent {ts_dev} 0 0 0;"    # SYN_REPORT
+                    f"sendevent {ts_dev} 3 57 0;"
+                    f"sendevent {ts_dev} 3 53 {x};"
+                    f"sendevent {ts_dev} 3 54 {y};"
+                    f"sendevent {ts_dev} 1 330 1;"
+                    f"sendevent {ts_dev} 0 0 0;"
                     f"sleep 0.05;"
-                    f"sendevent {ts_dev} 3 57 -1;"  # ABS_MT_TRACKING_ID = -1
-                    f"sendevent {ts_dev} 1 330 0;"  # BTN_TOUCH UP
-                    f"sendevent {ts_dev} 0 0 0"     # SYN_REPORT
+                    f"sendevent {ts_dev} 3 57 -1;"
+                    f"sendevent {ts_dev} 1 330 0;"
+                    f"sendevent {ts_dev} 0 0 0"
                 )
                 r = subprocess.run(
                     ["adb", "shell", f"su -c '{cmds}'"],
@@ -952,28 +968,11 @@ class VWTokenRelay:
                 if r.returncode == 0:
                     log.info("NAV: sendevent tap succeeded at (%d, %d)", x, y)
                     return True
-                log.warning("NAV: sendevent failed (rc=%d), trying monkey", r.returncode)
+                log.warning("NAV: sendevent failed (rc=%d)", r.returncode)
         except Exception as e:
-            log.warning("NAV: sendevent method failed: %s — trying monkey", e)
+            log.warning("NAV: sendevent failed: %s", e)
 
-        # Method 2: monkey (generates events via a different path)
-        try:
-            result = subprocess.run(
-                ["adb", "shell",
-                 f"monkey --hprof -p {VW_PACKAGE} -v "
-                 f"--pct-touch 100 --pct-motion 0 --pct-trackball 0 "
-                 f"--pct-syskeys 0 --pct-nav 0 --pct-majornav 0 "
-                 f"--pct-appswitch 0 --pct-flip 0 --pct-anyevent 0 1"],
-                capture_output=True, timeout=10,
-            )
-            if result.returncode == 0:
-                log.info("NAV: monkey tap succeeded (random position in app)")
-                return True
-            log.warning("NAV: monkey failed (rc=%d)", result.returncode)
-        except Exception as e:
-            log.warning("NAV: monkey method failed: %s — trying input", e)
-
-        # Method 3: input tap (may hang, use short timeout)
+        # Method 3: input tap as shell user (last resort, may hang)
         try:
             result = subprocess.run(
                 ["adb", "shell", "input", "tap", str(x), str(y)],
