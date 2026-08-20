@@ -137,7 +137,7 @@ wake_screen() {
         adb shell "input keyevent KEYCODE_WAKEUP" 2>/dev/null || true
         sleep 1
         # Swipe up to dismiss lock screen
-        adb shell "input swipe 540 1800 540 800 300" 2>/dev/null || true
+        adb shell "su -c 'input swipe 540 1800 540 800 300'" 2>/dev/null || true
         sleep 1
     fi
 }

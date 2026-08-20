@@ -1059,37 +1059,50 @@ class VWTokenRelay:
 
     def _wake_app(self):
         """Force-restart the VW app to trigger fresh API calls and token capture.
-        Just 'am start' on an already-running app doesn't trigger new traffic."""
+        Just 'am start' on an already-running app doesn't trigger new traffic.
+        Each step is individually protected so a screen-wake failure doesn't
+        prevent the critical force-stop → relaunch → navigate flow."""
         if not self._adb_check():
             log.error("WAKE: Cannot wake app — ADB not connected")
             return
+
+        # Step 1: Wake screen + dismiss lock (non-critical, best effort)
         try:
-            # Wake screen first
             subprocess.run(
                 ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
                 capture_output=True, timeout=10,
             )
             time.sleep(1)
-            # Swipe up to dismiss lock screen
+        except Exception as e:
+            log.warning("WAKE: screen wake failed (non-critical): %s", e)
+
+        try:
+            # Must use su — bare 'input swipe' hangs on Moto G Pure
             subprocess.run(
-                ["adb", "shell", "input", "swipe", "540", "1800", "540", "800", "300"],
+                ["adb", "shell", "su", "-c", "input swipe 540 1800 540 800 300"],
                 capture_output=True, timeout=10,
             )
             time.sleep(1)
-            # Dismiss keyguard if present
+        except Exception as e:
+            log.warning("WAKE: lock screen swipe failed (non-critical): %s", e)
+
+        try:
             subprocess.run(
                 ["adb", "shell", "wm", "dismiss-keyguard"],
                 capture_output=True, timeout=5,
             )
             time.sleep(1)
-            # Force-stop the app so relaunch triggers fresh API calls
+        except Exception:
+            pass
+
+        # Step 2: Force-stop + relaunch (critical)
+        try:
             log.info("WAKE: Force-stopping VW app...")
             subprocess.run(
                 ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                 capture_output=True, timeout=10,
             )
             time.sleep(2)
-            # Relaunch
             log.info("WAKE: Relaunching VW app...")
             subprocess.run(
                 ["adb", "shell", "am", "start", "-n",
@@ -1097,22 +1110,24 @@ class VWTokenRelay:
                 capture_output=True, timeout=10,
             )
             log.info("WAKE: Force-restarted VW app — waiting for token capture")
-            # Need to re-attach Frida since the app got a new PID
-            time.sleep(5)
-            try:
-                self._attach_frida()
-            except Exception as e:
-                log.error("WAKE: Failed to reattach Frida after app restart: %s", e)
-
-            # Navigate to vehicle dashboard to trigger vehicle-scoped tokens
-            # VW app (React Native) takes 15-20s to fully render vehicle cards
-            time.sleep(15)
-            self._navigate_to_vehicle()
-            # Wait and try a second navigation attempt in case first was too early
-            time.sleep(10)
-            self._navigate_to_vehicle()
         except Exception as e:
-            log.error("WAKE: Failed to wake app: %s", e)
+            log.error("WAKE: Failed to restart VW app: %s", e)
+            return
+
+        # Step 3: Re-attach Frida (new PID after force-stop)
+        time.sleep(5)
+        try:
+            self._attach_frida()
+        except Exception as e:
+            log.error("WAKE: Failed to reattach Frida after app restart: %s", e)
+
+        # Step 4: Navigate to vehicle dashboard to trigger vehicle-scoped tokens
+        # VW app (React Native) takes 15-20s to fully render vehicle cards
+        time.sleep(15)
+        self._navigate_to_vehicle()
+        # Second attempt in case first was too early
+        time.sleep(10)
+        self._navigate_to_vehicle()
 
     def _update_pif(self):
         """Run the Play Integrity fingerprint updater script."""
