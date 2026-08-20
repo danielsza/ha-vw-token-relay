@@ -1439,10 +1439,21 @@ class VWTokenRelay:
             log.info("SCREENCAP: Current foreground: %s", fg)
 
             if os.path.exists("/share/vw_screen.png"):
+                sz = os.path.getsize("/share/vw_screen.png")
+                # Base64 encode for viewing through ingress proxy
+                import base64
+                try:
+                    with open("/share/vw_screen.png", "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    with open("/share/vw_screen_b64.txt", "w") as f:
+                        f.write(b64)
+                    log.info("SCREENCAP: Base64 written (%d chars)", len(b64))
+                except Exception as be:
+                    log.error("SCREENCAP: Base64 encode failed: %s", be)
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/screencap",
                     json.dumps({"status": "saved", "path": "/share/vw_screen.png",
-                                "size": os.path.getsize("/share/vw_screen.png")}),
+                                "size": sz, "b64_path": "/share/vw_screen_b64.txt"}),
                 )
             else:
                 self.mqttc.publish(
