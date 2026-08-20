@@ -2866,13 +2866,18 @@ class VWTokenRelay:
                      "expires_in", "scope"):
             if key in body:
                 token_relay[key] = body[key]
+        # Preserve id_token from memory if response doesn't include it
+        # (refresh_token grants don't return id_token, but we need it for RST)
+        if "id_token" not in token_relay and self.id_token:
+            token_relay["id_token"] = self.id_token
         if token_relay.get("access_token"):
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/token_relay",
                 json.dumps(token_relay),
                 retain=True,
             )
-            log.info("Published full token to %s/token_relay for connector", MQTT_TOPIC_PREFIX)
+            log.info("Published full token to %s/token_relay for connector (id_token=%s)",
+                     MQTT_TOPIC_PREFIX, "yes" if "id_token" in token_relay else "no")
 
     # ── Vehicle data parsing & MQTT publishing ────────────────────
     def _parse_and_publish_vehicle_data(self, url, body_str, method="GET"):
