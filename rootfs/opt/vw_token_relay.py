@@ -610,6 +610,18 @@ class VWTokenRelay:
                     capture_output=True, timeout=10)
             except Exception as e:
                 log.error("ADB_SWIPE: Failed: %s", e)
+        elif cmd == "adb_shell":
+            # Run arbitrary ADB shell command: payload = command string
+            try:
+                log.info("ADB_SHELL: Running: %s", payload.strip()[:100])
+                r = subprocess.run(
+                    ["adb", "shell"] + payload.strip().split(),
+                    capture_output=True, text=True, timeout=15)
+                log.info("ADB_SHELL: stdout=%s", r.stdout.strip()[:500])
+                if r.stderr.strip():
+                    log.info("ADB_SHELL: stderr=%s", r.stderr.strip()[:200])
+            except Exception as e:
+                log.error("ADB_SHELL: Failed: %s", e)
         else:
             log.warning("Unknown command: %s", cmd)
 
