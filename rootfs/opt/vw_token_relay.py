@@ -497,7 +497,7 @@ class VWTokenRelay:
         elif cmd == "dump_storage":
             threading.Thread(target=self._dump_rn_storage, daemon=True).start()
         elif cmd == "switch_vehicle":
-            threading.Thread(target=self._switch_vehicle_rn, args=(payload,), daemon=True).start()
+            threading.Thread(target=self._switch_vehicle, args=(payload,), daemon=True).start()
         elif cmd == "update_pif":
             threading.Thread(target=self._update_pif, daemon=True).start()
         elif cmd == "clear_data":
@@ -825,27 +825,22 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
-        # Try vehicle-scoped token first, then fall back to global token.
-        # Previous assumption was that VW validates tid strictly, but
-        # the same OAuth session token should work for all user's vehicles.
-        # If global token gets 403, _api_request auto-retries after wake.
+        # Vehicle-scoped endpoints need tokens with tid in the JWT.
+        # VW issues tid-stamped tokens when the app navigates to a vehicle
+        # dashboard. If we don't have one, switch vehicle via UI.
         token = self._get_valid_token(vid, vehicle_only=True)
         if token:
             log.info("RST: Using vehicle-scoped token for %s", vid[:8])
         else:
-            token = self._get_valid_token(vid, vehicle_only=False)
-            if token:
-                log.info("RST: No vehicle-scoped token — using global token for %s", vid[:8])
-            else:
-                log.info("RST: No token at all — waking app...")
-                self._wake_app(target_vid=vid)
-                time.sleep(15)
-                token = self._get_valid_token(vid, vehicle_only=False)
-                if not token:
-                    log.error("RST: Still no token after wake")
-                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                        json.dumps({"error": "no_valid_token", "msg": "No token available"}))
-                    return
+            log.info("RST: No vehicle-scoped token for %s — switching vehicle in app...", vid[:8])
+            self._switch_vehicle(vid)
+            token = self._get_valid_token(vid, vehicle_only=True)
+            if not token:
+                log.error("RST: Vehicle switch failed — no token for %s", vid[:8])
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                    json.dumps({"error": "no_valid_token",
+                                "msg": f"Could not get vehicle-scoped token for {vid[:8]}"}))
+                return
 
         # Step 1: Get pairing data (uses _api_request with auto-retry on 403)
         log.info("RST Step 1: Getting pairing data...")
@@ -1690,126 +1685,167 @@ class VWTokenRelay:
         except Exception as e:
             log.error("RN_STORAGE: Failed: %s", e)
 
-    def _switch_vehicle_rn(self, target_vid=None):
-        """Switch the VW app to a different vehicle by modifying RN AsyncStorage
-        and relaunching the app. This is more reliable than blind UI tapping."""
+    def _switch_vehicle(self, target_vid=None):
+        """Switch the VW app to a different vehicle using uiautomator.
+        Finds vehicle picker in the UI, taps to switch, waits for token."""
         if not target_vid:
             log.error("SWITCH: No target vehicle ID provided")
             return
 
-        log.info("SWITCH: Attempting to switch to vehicle %s", target_vid[:16])
+        # Map vehicle IDs to expected display names for UI matching
+        vid_names = {
+            "702b3cc5": "Buzz",
+            "90bf07c5": "Atlas",
+        }
+        target_short = target_vid[:8]
+        target_name = vid_names.get(target_short, target_short)
+        log.info("SWITCH: Switching to %s (%s)...", target_name, target_vid[:16])
 
-        import sqlite3 as pysqlite
         try:
-            remote_db = f"/data/data/{VW_PACKAGE}/databases/RKStorage"
-            local_db = "/tmp/vw_switch_RKStorage"
+            # Ensure VW app is in foreground
+            r = subprocess.run(
+                ["adb", "shell", "dumpsys", "activity", "top"],
+                capture_output=True, text=True, timeout=10)
+            if VW_PACKAGE not in r.stdout:
+                log.info("SWITCH: VW app not in FG — launching...")
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=10)
+                time.sleep(5)
 
-            # Pull DB locally, modify, push back
-            self._adb_su(f"cp {remote_db} /data/local/tmp/RKStorage_sw")
-            self._adb_su("chmod 644 /data/local/tmp/RKStorage_sw")
-            subprocess.run(
-                ["adb", "pull", "/data/local/tmp/RKStorage_sw", local_db],
-                capture_output=True, timeout=15,
-            )
-
-            if not os.path.exists(local_db):
-                log.error("SWITCH: Failed to pull RKStorage")
+            # Step 1: Dump UI and look for vehicle picker
+            xml = self._dump_ui_xml()
+            if not xml:
+                log.error("SWITCH: uiautomator dump failed")
                 return
 
-            conn = pysqlite.connect(local_db)
-            cur = conn.cursor()
-
-            # List tables and find vehicle-related keys
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [r[0] for r in cur.fetchall()]
-            log.info("SWITCH: DB tables: %s", tables)
-
-            # Dump all keys that might relate to vehicles
-            for table in tables:
-                try:
-                    cur.execute(f"SELECT * FROM [{table}]")
-                    cols = [d[0] for d in cur.description]
-                    rows = cur.fetchall()
-                    for row in rows:
-                        row_str = " | ".join(str(v)[:150] for v in row)
-                        if any(kw in row_str.lower() for kw in
-                               ["vehicle", "selected", "garage", "current",
-                                "90bf07c5", "702b3cc5", "vin"]):
-                            log.info("SWITCH: MATCH [%s] %s", table, row_str[:400])
-                except Exception:
-                    pass
-
-            # Try updating known key patterns
-            update_keys = [
-                "selectedVehicleId", "selected_vehicle_id", "currentVehicleId",
-                "@selectedVehicleId", "selectedVehicle", "activeVehicleId",
-            ]
-            updated = 0
-            for table in tables:
-                for key in update_keys:
-                    try:
-                        cur.execute(f"UPDATE [{table}] SET value=? WHERE key=?",
-                                    (target_vid, key))
-                        updated += cur.rowcount
-                    except Exception:
-                        pass
-            conn.commit()
-            log.info("SWITCH: Updated %d rows in local DB", updated)
-            conn.close()
-
-            # Push modified DB back to phone
-            subprocess.run(
-                ["adb", "push", local_db, "/data/local/tmp/RKStorage_sw"],
-                capture_output=True, timeout=15,
-            )
-            self._adb_su(f"cp /data/local/tmp/RKStorage_sw {remote_db}")
-            self._adb_su(f"chmod 660 {remote_db}")
-            # Fix ownership (app uid)
-            self._adb_su(f"chown $(stat -c %u:%g {remote_db.rsplit('/', 1)[0]}) {remote_db}")
-
-            # Force-stop and relaunch the app
-            log.info("SWITCH: Force-restarting VW app...")
-            subprocess.run(
-                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
-                capture_output=True, timeout=10,
-            )
-            time.sleep(3)
-            subprocess.run(
-                ["adb", "shell", "am", "start", "-n",
-                 f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                capture_output=True, timeout=10,
-            )
-            time.sleep(10)
-
-            # Reattach Frida
-            log.info("SWITCH: Reattaching Frida after app restart...")
+            # Log all elements for debugging
+            import xml.etree.ElementTree as ET
+            import re
             try:
-                self._attach_frida()
+                root = ET.fromstring(xml)
+                for node in root.iter("node"):
+                    a = node.attrib
+                    txt = a.get("text", "")
+                    desc = a.get("content-desc", "")
+                    rid = a.get("resource-id", "")
+                    cls = a.get("class", "").split(".")[-1]
+                    clickable = a.get("clickable", "false")
+                    bounds = a.get("bounds", "")
+                    if txt or desc or clickable == "true":
+                        log.info("SWITCH_UI: %s bounds=%s click=%s text='%s' desc='%s' id='%s'",
+                                 cls, bounds, clickable, txt[:50], desc[:50], rid[:60])
             except Exception as e:
-                log.warning("SWITCH: Frida reattach failed: %s — will retry", e)
+                log.warning("SWITCH: XML parse error: %s", e)
+
+            # Step 2: Look for vehicle name or picker elements
+            # Try finding current vehicle name (e.g., "ID. Buzz", "Atlas")
+            # or any element that looks like a vehicle selector
+            picker_searches = [
+                # Search for vehicle names
+                {"text": "Atlas"},
+                {"text": "Buzz"},
+                {"text": "ID. Buzz"},
+                # Search for common picker/dropdown resource IDs
+                {"resource_id": "vehicle"},
+                {"resource_id": "vehiclePicker"},
+                {"resource_id": "vehicleSelector"},
+                {"resource_id": "garage"},
+                {"resource_id": "carSelector"},
+                {"content_desc": "vehicle"},
+                {"content_desc": "switch"},
+            ]
+
+            found_current = None
+            found_target = None
+            for search in picker_searches:
+                elems = self._find_ui_elements(xml, **search)
+                for cx, cy, bounds, attrs in elems:
+                    txt = attrs.get("text", "").lower()
+                    desc = attrs.get("content-desc", "").lower()
+                    combined = txt + " " + desc
+                    if target_name.lower() in combined:
+                        found_target = (cx, cy, bounds, attrs)
+                        log.info("SWITCH: Found TARGET '%s' at (%d,%d) %s",
+                                 target_name, cx, cy, bounds)
+                    elif any(v in combined for v in ["buzz", "atlas"]):
+                        found_current = (cx, cy, bounds, attrs)
+                        log.info("SWITCH: Found CURRENT vehicle at (%d,%d) %s text='%s'",
+                                 cx, cy, bounds, attrs.get("text", "")[:40])
+
+            # If target vehicle is directly visible, tap it
+            if found_target:
+                cx, cy, bounds, attrs = found_target
+                log.info("SWITCH: Tapping target vehicle '%s' at (%d,%d)", target_name, cx, cy)
+                subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                               capture_output=True, timeout=10)
                 time.sleep(5)
-                try:
-                    self._attach_frida()
-                except Exception as e2:
-                    log.error("SWITCH: Frida reattach failed again: %s", e2)
+            elif found_current:
+                # Tap the current vehicle to open picker, then look for target
+                cx, cy, bounds, attrs = found_current
+                log.info("SWITCH: Tapping current vehicle to open picker at (%d,%d)", cx, cy)
+                subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                               capture_output=True, timeout=10)
+                time.sleep(3)
 
-            # Wait for app to load and make API calls
-            time.sleep(20)
-
-            # Check if we got a token for the target vehicle
-            target_token = self._get_valid_token(target_vid, vehicle_only=True)
-            if target_token:
-                log.info("SWITCH: SUCCESS — got token for %s", target_vid[:16])
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
-                    json.dumps({"status": "success", "vehicle": target_vid}),
-                )
+                # Re-dump UI to find target in dropdown
+                xml2 = self._dump_ui_xml()
+                if xml2:
+                    target_elems = self._find_ui_elements(xml2, text=target_name)
+                    if target_elems:
+                        cx2, cy2, bounds2, attrs2 = target_elems[0]
+                        log.info("SWITCH: Tapping '%s' in dropdown at (%d,%d)",
+                                 target_name, cx2, cy2)
+                        subprocess.run(["adb", "shell", "input", "tap", str(cx2), str(cy2)],
+                                       capture_output=True, timeout=10)
+                        time.sleep(5)
+                    else:
+                        log.warning("SWITCH: Target '%s' not found in dropdown", target_name)
+                        # Log dropdown elements
+                        try:
+                            root2 = ET.fromstring(xml2)
+                            for node in root2.iter("node"):
+                                a = node.attrib
+                                if a.get("text") or a.get("content-desc"):
+                                    log.info("SWITCH_DROPDOWN: text='%s' desc='%s' bounds=%s",
+                                             a.get("text", "")[:40], a.get("content-desc", "")[:40],
+                                             a.get("bounds", ""))
+                        except Exception:
+                            pass
             else:
-                log.warning("SWITCH: No token for %s after restart", target_vid[:16])
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
-                    json.dumps({"status": "no_token", "vehicle": target_vid}),
-                )
+                log.warning("SWITCH: No vehicle picker found in UI — trying tap at top of screen")
+                # Fallback: tap the top area where vehicle picker usually is
+                subprocess.run(["adb", "shell", "input", "tap", "360", "150"],
+                               capture_output=True, timeout=10)
+                time.sleep(3)
+                xml2 = self._dump_ui_xml()
+                if xml2:
+                    target_elems = self._find_ui_elements(xml2, text=target_name)
+                    if target_elems:
+                        cx2, cy2 = target_elems[0][0], target_elems[0][1]
+                        log.info("SWITCH: Found '%s' after top tap at (%d,%d)", target_name, cx2, cy2)
+                        subprocess.run(["adb", "shell", "input", "tap", str(cx2), str(cy2)],
+                                       capture_output=True, timeout=10)
+                        time.sleep(5)
+
+            # Step 3: Wait for vehicle-scoped token
+            log.info("SWITCH: Waiting for %s-scoped token...", target_name)
+            for i in range(12):  # 60s max
+                time.sleep(5)
+                token = self._get_valid_token(target_vid, vehicle_only=True)
+                if token:
+                    log.info("SWITCH: SUCCESS — got %s token after %ds!", target_name, (i + 1) * 5)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
+                        json.dumps({"status": "success", "vehicle": target_vid}),
+                    )
+                    return
+            log.warning("SWITCH: No %s token after 60s", target_name)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/switch_vehicle",
+                json.dumps({"status": "no_token", "vehicle": target_vid}),
+            )
 
         except Exception as e:
             log.error("SWITCH: Failed: %s", e)
