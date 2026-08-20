@@ -1054,18 +1054,14 @@ class VWTokenRelay:
         check_data = json.loads(result)
         log.info("RST Step 4 response: %s", json.dumps(check_data)[:500])
         data_block = check_data.get("data", {})
-        ro_token = data_block.get("roToken")
-        if not ro_token:
-            log.error("RST: SPIN check succeeded but no roToken in response. Keys: %s",
-                      list(data_block.keys()) if isinstance(data_block, dict) else type(data_block))
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "no_ro_token",
-                            "msg": "SPIN check response missing roToken",
-                            "response_keys": list(data_block.keys()) if isinstance(data_block, dict) else str(data_block)[:200]}))
-            return
+        ro_token = data_block.get("roToken", "")
         captcha_idx = data_block.get("captchaIndex", "")
         captcha_val = data_block.get("captchaValue", "")
-        log.info("RST: Got roToken (%d chars), captcha=%s/%s", len(ro_token), captcha_idx, captcha_val)
+        if ro_token:
+            log.info("RST: Got roToken (%d chars), captcha=%s/%s", len(ro_token), captcha_idx, captcha_val)
+        else:
+            # MQB/ATC vehicles return empty data — roToken not needed for RST POST
+            log.info("RST: SPIN check returned empty data (MQB/ATC) — proceeding without roToken")
 
         # Step 5: Build encrypted payload
         log.info("RST Step 5: Building encrypted payload...")
@@ -1082,13 +1078,17 @@ class VWTokenRelay:
         # Step 7: POST to /rst/v1/
         log.info("RST Step 7: Sending remote start command...")
         rst_url = f"{BASE_URL}/rst/v1/vehicle/{vid}"
-        rst_body = json.dumps({
+        rst_payload = {
             "pairingId": pairing_id,
             "rstPinHash": rst_pin_hash,
             "encryptedPayload": encrypted_payload,
-            "roToken": ro_token,
             "dataToSign": data_to_sign,
-        }).encode()
+        }
+        if ro_token:
+            rst_payload["roToken"] = ro_token
+        else:
+            log.info("RST: Omitting roToken from POST body (MQB/ATC)")
+        rst_body = json.dumps(rst_payload).encode()
         log.info("RST: POST body size=%d bytes", len(rst_body))
 
         result, err = self._api_request("POST", rst_url, body=rst_body, vid=vid, timeout=30)
