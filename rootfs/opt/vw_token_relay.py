@@ -1129,10 +1129,11 @@ class VWTokenRelay:
 
         # ── Step 4: SPIN check → roToken ──
         # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
-        # Try both operation names — "remoteStart" and "climateControl"
+        # Reference implementation uses climateControl ONLY — remoteStart/check
+        # consumes the challenge but returns empty data, poisoning the state.
         check_body = json.dumps({"spinHash": spin_hash2}).encode()
         ro_token = None
-        for operation in ("remoteStart", "climateControl"):
+        for operation in ("climateControl", "remoteStart"):
             op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
             log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
             result, err = self._api_request_with_token("POST", op_url,
@@ -1148,27 +1149,8 @@ class VWTokenRelay:
                 else:
                     log.warning("RST: %s/check returned 200 but no roToken: %s",
                                 operation, json.dumps(check_data)[:300])
-                    # If we get 200 with empty data, try next operation
-                    # Need a fresh challenge for the next try
-                    if operation == "remoteStart":
-                        log.info("RST: Fetching challenge3 for fallback operation...")
-                        result3, err3 = self._api_request("GET", challenge_url, vid=vid)
-                        if result3:
-                            c3_data = json.loads(result3)
-                            challenge3 = c3_data["data"]["challenge"]
-                            spin_hash2 = hashlib.sha512(
-                                f"{challenge3}.{self.vw_spin}".encode("utf-8")
-                            ).hexdigest().upper()
-                            check_body = json.dumps({"spinHash": spin_hash2}).encode()
-                            log.info("RST: Got challenge3, trying climateControl...")
-                        else:
-                            log.error("RST: Challenge3 fetch failed, can't try fallback")
-                            break
-            else:
-                log.warning("RST: %s/check failed: %s", operation, err)
-                # On failure (404 etc.), try next operation with a fresh challenge
-                if operation == "remoteStart":
-                    log.info("RST: Fetching challenge3 for fallback operation...")
+                    # Challenge was consumed — fetch a fresh one for fallback operation
+                    log.info("RST: Fetching fresh challenge for fallback operation...")
                     result3, err3 = self._api_request("GET", challenge_url, vid=vid)
                     if result3:
                         c3_data = json.loads(result3)
@@ -1177,10 +1159,26 @@ class VWTokenRelay:
                             f"{challenge3}.{self.vw_spin}".encode("utf-8")
                         ).hexdigest().upper()
                         check_body = json.dumps({"spinHash": spin_hash2}).encode()
-                        log.info("RST: Got challenge3, trying climateControl...")
+                        log.info("RST: Got fresh challenge, trying next operation...")
                     else:
-                        log.error("RST: Challenge3 fetch failed, can't try fallback")
+                        log.error("RST: Fresh challenge fetch failed, can't try fallback")
                         break
+            else:
+                log.warning("RST: %s/check failed: %s", operation, err)
+                # On failure (404 etc.), fetch fresh challenge for fallback
+                log.info("RST: Fetching fresh challenge for fallback operation...")
+                result3, err3 = self._api_request("GET", challenge_url, vid=vid)
+                if result3:
+                    c3_data = json.loads(result3)
+                    challenge3 = c3_data["data"]["challenge"]
+                    spin_hash2 = hashlib.sha512(
+                        f"{challenge3}.{self.vw_spin}".encode("utf-8")
+                    ).hexdigest().upper()
+                    check_body = json.dumps({"spinHash": spin_hash2}).encode()
+                    log.info("RST: Got fresh challenge, trying next operation...")
+                else:
+                    log.error("RST: Fresh challenge fetch failed, can't try fallback")
+                    break
 
         if not ro_token:
             log.error("RST: Could not obtain roToken from any operation")
