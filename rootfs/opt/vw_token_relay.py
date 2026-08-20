@@ -825,36 +825,27 @@ class VWTokenRelay:
                 json.dumps({"error": "no_spin", "msg": "S-PIN not configured — required for remote start"}))
             return
 
-        # Pre-check: vehicle-scoped endpoints (pairing, SPIN, RST) need tokens
-        # with tid. Global tokens get 403. After app restart, only global tokens
-        # exist until the app navigates to a vehicle dashboard.
+        # Try vehicle-scoped token first, then fall back to global token.
+        # Previous assumption was that VW validates tid strictly, but
+        # the same OAuth session token should work for all user's vehicles.
+        # If global token gets 403, _api_request auto-retries after wake.
         token = self._get_valid_token(vid, vehicle_only=True)
-        if not token:
-            # Phase 1: Light wake — navigate the running app (no force-stop)
-            log.info("RST: No vehicle-scoped token — trying light navigation...")
-            self._wake_app(target_vid=vid)
-            for i in range(6):  # 30s polling
-                time.sleep(5)
-                token = self._get_valid_token(vid, vehicle_only=True)
-                if token:
-                    log.info("RST: Got vehicle-scoped token (light wake) after %ds", (i + 1) * 5)
-                    break
-
-        if not token:
-            # Phase 2: Full restart — force-stop + relaunch + Frida reattach
-            log.info("RST: Light wake failed — trying full app restart...")
-            self._wake_app_full_restart(target_vid=vid)
-            for i in range(8):  # 40s polling
-                time.sleep(5)
-                token = self._get_valid_token(vid, vehicle_only=True)
-                if token:
-                    log.info("RST: Got vehicle-scoped token (full restart) after %ds", (i + 1) * 5)
-                    break
-            if not token:
-                log.error("RST: Still no vehicle-scoped token after light + full restart")
-                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                    json.dumps({"error": "no_valid_token", "msg": "No vehicle-scoped token after app navigation"}))
-                return
+        if token:
+            log.info("RST: Using vehicle-scoped token for %s", vid[:8])
+        else:
+            token = self._get_valid_token(vid, vehicle_only=False)
+            if token:
+                log.info("RST: No vehicle-scoped token — using global token for %s", vid[:8])
+            else:
+                log.info("RST: No token at all — waking app...")
+                self._wake_app(target_vid=vid)
+                time.sleep(15)
+                token = self._get_valid_token(vid, vehicle_only=False)
+                if not token:
+                    log.error("RST: Still no token after wake")
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                        json.dumps({"error": "no_valid_token", "msg": "No token available"}))
+                    return
 
         # Step 1: Get pairing data (uses _api_request with auto-retry on 403)
         log.info("RST Step 1: Getting pairing data...")
