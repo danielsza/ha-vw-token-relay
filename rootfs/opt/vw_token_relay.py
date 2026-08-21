@@ -2226,6 +2226,10 @@ class VWTokenRelay:
         try:
             log.info("SCREENCAP: Taking screenshot...")
 
+            # Wake screen first — screencap hangs on some devices when display is off
+            self._wake_screen()
+            time.sleep(1)
+
             # Method 1: Use su for screencap (more reliable on rooted phones)
             r1 = subprocess.run(
                 ["adb", "shell", "su", "-c", "screencap -p /data/local/tmp/vw_screen.png"],
