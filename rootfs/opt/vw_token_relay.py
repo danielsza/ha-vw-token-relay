@@ -654,6 +654,85 @@ class VWTokenRelay:
                     log.info("ADB_SHELL: stderr=%s", r.stderr.strip()[:200])
             except Exception as e:
                 log.error("ADB_SHELL: Failed: %s", e)
+        elif cmd == "ui_find":
+            # Find UI elements by text and write results to /share/ui_find.txt
+            search = payload.strip() if payload.strip() else ""
+            try:
+                xml = self._dump_ui_xml()
+                if not xml:
+                    log.error("UI_FIND: uiautomator dump failed")
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_find",
+                                      json.dumps({"error": "dump_failed"}))
+                else:
+                    import xml.etree.ElementTree as ET
+                    import re
+                    root = ET.fromstring(xml)
+                    results = []
+                    for node in root.iter("node"):
+                        attrs = node.attrib
+                        txt = attrs.get("text", "")
+                        desc = attrs.get("content-desc", "")
+                        rid = attrs.get("resource-id", "")
+                        cls = attrs.get("class", "").split(".")[-1]
+                        bnds = attrs.get("bounds", "")
+                        click = attrs.get("clickable", "false")
+                        # Include if matches search or if no search show all with text
+                        if search:
+                            if search.lower() in txt.lower() or \
+                               search.lower() in desc.lower() or \
+                               search.lower() in rid.lower():
+                                results.append(f"{cls} txt='{txt}' desc='{desc}' "
+                                               f"id={rid.split('/')[-1] if rid else ''} "
+                                               f"click={click} bounds={bnds}")
+                        elif txt or desc or click == "true":
+                            results.append(f"{cls} txt='{txt}' desc='{desc}' "
+                                           f"id={rid.split('/')[-1] if rid else ''} "
+                                           f"click={click} bounds={bnds}")
+                    output = f"UI_FIND: search='{search}', found {len(results)} elements\n"
+                    output += "\n".join(results)
+                    with open("/share/ui_find.txt", "w") as f:
+                        f.write(output)
+                    log.info("UI_FIND: search='%s' → %d results, written to /share/ui_find.txt",
+                             search, len(results))
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_find",
+                                      json.dumps({"count": len(results),
+                                                  "results": results[:10]}))
+            except Exception as e:
+                log.error("UI_FIND: Failed: %s", e)
+        elif cmd == "ui_tap":
+            # Find UI element by text and tap its center
+            search = payload.strip()
+            if not search:
+                log.error("UI_TAP: No search text provided")
+            else:
+                try:
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        log.error("UI_TAP: uiautomator dump failed")
+                    else:
+                        elems = self._find_ui_elements(xml, text=search)
+                        if not elems:
+                            # Try content-desc
+                            elems = self._find_ui_elements(xml, content_desc=search)
+                        if elems:
+                            cx, cy, bounds, attrs = elems[0]
+                            log.info("UI_TAP: Found '%s' at (%d,%d) bounds=%s — tapping",
+                                     search, cx, cy, bounds)
+                            subprocess.run(["adb", "shell", "input", "tap",
+                                            str(cx), str(cy)],
+                                           capture_output=True, timeout=10)
+                            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_tap",
+                                              json.dumps({"tapped": True, "x": cx, "y": cy,
+                                                          "bounds": bounds,
+                                                          "text": attrs.get("text", "")}))
+                        else:
+                            log.warning("UI_TAP: Element '%s' NOT FOUND", search)
+                            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_tap",
+                                              json.dumps({"tapped": False,
+                                                          "error": "not_found",
+                                                          "search": search}))
+                except Exception as e:
+                    log.error("UI_TAP: Failed: %s", e)
         else:
             log.warning("Unknown command: %s", cmd)
 
