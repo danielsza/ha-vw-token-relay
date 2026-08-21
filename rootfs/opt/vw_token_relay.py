@@ -520,6 +520,13 @@ class VWTokenRelay:
             threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
         elif cmd == "remote_start_stop":
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
+        elif cmd == "ui_remote_start":
+            # UI-driven remote start — drives the VW app's own buttons
+            threading.Thread(target=self._ui_remote_start_flow,
+                             args=(payload, False), daemon=True).start()
+        elif cmd == "ui_remote_start_stop":
+            threading.Thread(target=self._ui_remote_start_flow,
+                             args=(payload, True), daemon=True).start()
         elif cmd == "get_pairing":
             threading.Thread(target=self._cmd_get_pairing, args=(payload,), daemon=True).start()
         elif cmd == "dump_ui":
@@ -1647,6 +1654,144 @@ class VWTokenRelay:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
                 json.dumps({"error": "rst_stop_failed", **err}))
 
+    # ── UI-driven remote start (drives the VW app's own buttons) ────
+    def _ui_remote_start_flow(self, vehicle_id, stop=False):
+        """Automate remote start/stop by driving the VW app's UI.
+
+        This bypasses the captcha/API issues entirely by using the app's own
+        "Remote start" button, which handles captcha creation internally.
+
+        Flow:
+          1. Navigate to the target vehicle dashboard
+          2. Dismiss any system dialogs
+          3. Tap "Remote start" → bottom sheet appears
+          4. Tap "Start" (or "Stop" if stop=True)
+          5. Handle device pairing dialog if it appears
+          6. Wait for confirmation
+
+        Returns True if the flow completed, False on failure.
+        """
+        vid = vehicle_id
+        action = "Stop" if stop else "Start"
+        log.info("═══ UI REMOTE %s ═══ vehicle=%s", action.upper(), vid)
+
+        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+            json.dumps({"status": f"ui_{action.lower()}_initiated"}), retain=False)
+
+        try:
+            # Step 0: Wake screen
+            self._wake_screen()
+            time.sleep(1)
+
+            # Step 1: Navigate to vehicle dashboard
+            log.info("UI_RST: Navigating to vehicle...")
+            self._switch_vehicle(vid)
+            time.sleep(3)
+
+            # Step 2: Dismiss system dialogs
+            self._dismiss_system_dialogs()
+
+            # Step 3: Find and tap "Remote start" on the dashboard
+            xml = self._dump_ui_xml()
+            if not xml:
+                log.error("UI_RST: Cannot get UI XML")
+                return False
+
+            # Try resource ID first (more reliable)
+            elems = self._find_ui_elements(xml, resource_id="remoteStartButton")
+            if not elems:
+                # Fall back to text
+                elems = self._find_ui_elements(xml, text="Remote start")
+            if not elems:
+                log.error("UI_RST: Cannot find Remote start button on dashboard")
+                self._screencap()
+                return False
+
+            cx, cy = elems[0][0], elems[0][1]
+            log.info("UI_RST: Tapping Remote start at (%d,%d)", cx, cy)
+            subprocess.run(["adb", "shell", "su", "-c",
+                            f"input tap {cx} {cy}"],
+                           capture_output=True, timeout=10)
+            time.sleep(3)
+
+            # Step 4: Dismiss any system dialog that appeared
+            self._dismiss_system_dialogs()
+
+            # Step 5: Look for the bottom sheet with Start/Stop buttons
+            xml = self._dump_ui_xml()
+            if not xml:
+                log.error("UI_RST: Cannot get UI XML after tapping Remote start")
+                return False
+
+            # Check if a device pairing dialog appeared instead
+            pairing_elems = self._find_ui_elements(xml, text="Accept")
+            if pairing_elems:
+                log.info("UI_RST: Device pairing dialog detected — tapping Accept")
+                cx, cy = pairing_elems[0][0], pairing_elems[0][1]
+                subprocess.run(["adb", "shell", "su", "-c",
+                                f"input tap {cx} {cy}"],
+                               capture_output=True, timeout=10)
+                time.sleep(3)
+                xml = self._dump_ui_xml()
+                if not xml:
+                    return False
+
+            # Look for the action button (Start or Stop)
+            action_elems = self._find_ui_elements(xml, text=action)
+            if not action_elems:
+                # Try resource IDs from the bottom sheet
+                rid = "secondCommandTextView" if action == "Start" else "firstCommandTextView"
+                action_elems = self._find_ui_elements(xml, resource_id=rid)
+            if not action_elems:
+                log.error("UI_RST: Cannot find '%s' button in bottom sheet", action)
+                self._screencap()
+                return False
+
+            cx, cy = action_elems[0][0], action_elems[0][1]
+            log.info("UI_RST: Tapping '%s' at (%d,%d)", action, cx, cy)
+            subprocess.run(["adb", "shell", "su", "-c",
+                            f"input tap {cx} {cy}"],
+                           capture_output=True, timeout=10)
+            time.sleep(5)
+
+            # Step 6: Check result — dismiss system dialogs, check for SPIN entry
+            self._dismiss_system_dialogs()
+            xml = self._dump_ui_xml()
+            if xml:
+                # If SPIN entry dialog appears, enter it
+                spin_entered = self._enter_spin_if_present(xml)
+                if spin_entered:
+                    log.info("UI_RST: SPIN entered, waiting for confirmation...")
+                    time.sleep(10)
+
+                # Check for device pairing form (needs phone number)
+                pairing_form = self._find_ui_elements(xml, text="Mobile number")
+                if pairing_form:
+                    log.warning("UI_RST: Device pairing form appeared — "
+                                "pairing required before remote start")
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                        json.dumps({"status": "pairing_required",
+                                    "msg": "Device pairing form appeared — "
+                                           "manual completion needed"}),
+                        retain=False)
+                    self._screencap()
+                    return False
+
+            # Take final screencap for debugging
+            self._screencap()
+
+            log.info("═══ UI REMOTE %s FLOW COMPLETE ═══", action.upper())
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                json.dumps({"status": f"ui_{action.lower()}_completed"}),
+                retain=False)
+            return True
+
+        except Exception as e:
+            log.error("UI_RST: Exception: %s", e, exc_info=True)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "ui_rst_exception", "msg": str(e)}))
+            return False
+
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _adb_check(self):
         """Verify ADB can reach the phone. Returns True if device is online."""
@@ -1938,6 +2083,54 @@ class VWTokenRelay:
             )
         except Exception:
             pass
+
+    def _dismiss_system_dialogs(self, max_attempts=3):
+        """Dismiss system crash dialogs (e.g. 'Media Storage keeps stopping').
+
+        These dialogs appear randomly and block ALL touch events on the VW app.
+        They must be dismissed before any UI automation can work.
+        Returns True if a dialog was found and dismissed."""
+        dismissed_any = False
+        for attempt in range(max_attempts):
+            xml = self._dump_ui_xml()
+            if not xml:
+                break
+            # Look for crash dialog indicators
+            elems = self._find_ui_elements(xml, text="Close app")
+            if not elems:
+                elems = self._find_ui_elements(xml, text="close app")
+            if not elems:
+                # Check for the alertTitle with "keeps stopping"
+                import xml.etree.ElementTree as ET
+                try:
+                    root = ET.fromstring(xml)
+                    has_crash = False
+                    for node in root.iter("node"):
+                        txt = node.attrib.get("text", "")
+                        if "keeps stopping" in txt.lower():
+                            has_crash = True
+                            break
+                    if not has_crash:
+                        break  # No crash dialog found
+                    # Try aerr_close button by resource-id
+                    elems = self._find_ui_elements(xml, resource_id="aerr_close")
+                except Exception:
+                    break
+
+            if elems:
+                cx, cy, bounds, attrs = elems[0]
+                log.info("DISMISS: Found crash dialog button at (%d,%d) — tapping",
+                         cx, cy)
+                subprocess.run(["adb", "shell", "su", "-c",
+                                f"input tap {cx} {cy}"],
+                               capture_output=True, timeout=10)
+                dismissed_any = True
+                time.sleep(2)  # Wait for dialog to close
+            else:
+                break
+        if dismissed_any:
+            log.info("DISMISS: Cleared %d system dialog(s)", attempt + 1)
+        return dismissed_any
 
     def _get_foreground_activity(self):
         """Get the current foreground activity name."""
@@ -2419,7 +2612,8 @@ class VWTokenRelay:
 
                 # 5. Generic dismiss buttons (OK, Close, Continue, Skip, etc.)
                 else:
-                    for dismiss_text in ["OK", "Close", "Dismiss", "Not Now", "Continue",
+                    for dismiss_text in ["Close app", "OK", "Close", "Dismiss",
+                                         "Not Now", "Continue",
                                          "Skip", "Got it", "CONTINUE", "SKIP"]:
                         if self._find_ui_elements(xml, text=dismiss_text):
                             self._tap_element(xml, f"dismiss:{dismiss_text}", text=dismiss_text)
