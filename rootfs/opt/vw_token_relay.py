@@ -414,6 +414,7 @@ class VWTokenRelay:
         # PIF health tracking
         self._last_token_time = None  # set on every fresh token capture
         self._pif_reboot_cooldown = None  # prevent reboot loops
+        self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
 
         # Token state — keyed by vehicle ID
         self.tokens = {}       # {vehicle_id: {"token": str, "expiry": datetime}}
@@ -793,10 +794,13 @@ class VWTokenRelay:
                     return self.global_token
         return None
 
-    def _api_request(self, method, url, body=None, vid=None, timeout=15):
+    def _api_request(self, method, url, body=None, vid=None, timeout=15, allow_pif_fix=True):
         """Make an API request with auto-retry on auth or server failure.
 
-        On 401/403: wakes the VW app for fresh tokens, waits, retries once.
+        Retry strategy (two levels):
+          Level 1: On 401/403 → wake the VW app for fresh tokens, retry once.
+          Level 2: If Level 1 fails → trigger PIF update + reboot, wait for
+                   phone to come back and new tokens, retry once more.
         On 5xx: retries once after a short delay.
         Returns (response_body_str, None) on success, (None, error_dict) on failure.
         """
@@ -809,6 +813,12 @@ class VWTokenRelay:
                     self._wake_app()
                     time.sleep(30)
                     continue
+                # Level 2: PIF fix before giving up
+                if allow_pif_fix:
+                    log.warning("No valid token after wake — attempting PIF fix + reboot...")
+                    result = self._pif_fix_and_retry(method, url, body, vid, timeout)
+                    if result is not None:
+                        return result
                 return None, {"error": "no_valid_token", "msg": "Token expired — no fresh token after retry"}
 
             headers = {**VW_API_HEADERS, "Authorization": f"Bearer {token}"}
@@ -826,6 +836,14 @@ class VWTokenRelay:
                     self._wake_app(target_vid=vid)
                     time.sleep(30)
                     continue
+                if e.code in (401, 403) and allow_pif_fix:
+                    # Level 2: PIF fix for persistent auth failure
+                    log.warning("API %d persists after wake — attempting PIF fix + reboot...", e.code)
+                    result = self._pif_fix_and_retry(method, url, body, vid, timeout)
+                    if result is not None:
+                        return result
+                    return None, {"error": f"http_{e.code}", "url": url, "body": err[:500],
+                                  "code": e.code, "msg": "Auth failed even after PIF fix + reboot"}
                 if e.code >= 500 and attempt < max_retries:
                     log.warning("API %d on %s — server error, retrying in 10s...", e.code, url[:60])
                     time.sleep(10)
@@ -839,6 +857,43 @@ class VWTokenRelay:
                 return None, {"error": "exception", "msg": str(e)}
 
         return None, {"error": "max_retries", "msg": "All retry attempts exhausted"}
+
+    def _pif_fix_and_retry(self, method, url, body, vid, timeout):
+        """Trigger PIF update + phone reboot, wait for recovery, retry the API call.
+
+        Returns (response_body_str, None) on success, or None on failure.
+        """
+        cooldown_ok = (
+            self._pif_reboot_cooldown is None
+            or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 7200
+        )
+        if not cooldown_ok:
+            log.info("PIF fix skipped — still in reboot cooldown")
+            return None
+
+        self._pif_reboot_cooldown = datetime.now()
+        self._pif_fix_attempts += 1
+        log.info("PIF FIX: Starting PIF update + reboot (attempt #%d)...", self._pif_fix_attempts)
+
+        # Run PIF update synchronously (includes reboot + wait for phone)
+        self._update_pif()
+
+        # Wait for fresh tokens (app needs to relaunch after reboot)
+        log.info("PIF FIX: Waiting for fresh tokens after reboot...")
+        self._wake_app(target_vid=vid)
+        time.sleep(45)
+
+        # Retry the original request (without allowing another PIF fix)
+        log.info("PIF FIX: Retrying original %s %s...", method, url[:60])
+        result, err = self._api_request(method, url, body=body, vid=vid,
+                                         timeout=timeout, allow_pif_fix=False)
+        if result is not None:
+            log.info("PIF FIX: Retry succeeded!")
+            self._pif_fix_attempts = 0
+            return (result, None)
+        else:
+            log.error("PIF FIX: Retry still failed: %s", err)
+            return None
 
     def _api_call(self, method, url_or_vid):
         """Make a direct API call using captured token."""
@@ -4029,7 +4084,9 @@ class VWTokenRelay:
 
             # ── PIF health check ──
             # If no fresh token in 45+ minutes and we haven't rebooted recently,
-            # assume Play Integrity is broken → update fingerprint + reboot phone
+            # assume Play Integrity is broken → update fingerprint + reboot phone.
+            # Only notify the user (via 'critical' status) after auto-fix has been
+            # attempted and failed — not on the first degradation.
             pif_status = "healthy"
             if self._last_token_time:
                 token_age_min = (datetime.now() - self._last_token_time).total_seconds() / 60
@@ -4037,14 +4094,30 @@ class VWTokenRelay:
                     self._pif_reboot_cooldown is None
                     or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 7200  # 2hr cooldown
                 )
-                if token_age_min > 45 and cooldown_ok:
-                    pif_status = "degraded"
-                    log.warning("PIF HEALTH: No fresh token in %.0f min — triggering PIF update + reboot", token_age_min)
-                    self._pif_reboot_cooldown = datetime.now()
-                    threading.Thread(target=self._update_pif, daemon=True).start()
+                if token_age_min <= 45:
+                    # Token is fresh — reset fix counter
+                    if self._pif_fix_attempts > 0:
+                        log.info("PIF HEALTH: Token refreshed after %d fix attempt(s)", self._pif_fix_attempts)
+                    self._pif_fix_attempts = 0
+                elif token_age_min > 45 and cooldown_ok:
+                    self._pif_fix_attempts += 1
+                    if self._pif_fix_attempts <= 2:
+                        pif_status = "degraded"
+                        log.warning("PIF HEALTH: No fresh token in %.0f min — auto-fix attempt #%d",
+                                    token_age_min, self._pif_fix_attempts)
+                        self._pif_reboot_cooldown = datetime.now()
+                        threading.Thread(target=self._update_pif, daemon=True).start()
+                    else:
+                        pif_status = "critical"
+                        log.error("PIF HEALTH: Still no fresh token after %d fix attempts (%.0f min stale) — NOTIFY USER",
+                                  self._pif_fix_attempts, token_age_min)
+                        self._pif_reboot_cooldown = datetime.now()
+                        # Still try one more time, but notify the user too
+                        threading.Thread(target=self._update_pif, daemon=True).start()
                 elif token_age_min > 45:
                     pif_status = "cooldown"
-                    log.info("PIF HEALTH: Token stale (%.0f min) but in reboot cooldown", token_age_min)
+                    log.info("PIF HEALTH: Token stale (%.0f min) but in reboot cooldown (attempt #%d)",
+                             token_age_min, self._pif_fix_attempts)
 
             # Publish health status
             self.mqttc.publish(
