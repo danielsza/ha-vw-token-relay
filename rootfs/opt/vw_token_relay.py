@@ -1244,6 +1244,7 @@ class VWTokenRelay:
             return
 
         session_data = json.loads(result)
+        log.info("RST Step 2 full response: %s", json.dumps(session_data)[:1000])
         log.info("RST Step 2 response keys: %s", list(session_data.get("data", {}).keys()))
         atc_token = session_data.get("data", {}).get("carnetVehicleToken")
         if not atc_token:
@@ -1270,33 +1271,40 @@ class VWTokenRelay:
         spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
         log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
 
-        # ── Step 3b: Create captcha via POST /operation/remoteStart ──
+        # ── Step 3b: Create captcha via POST/GET /operation/remoteStart ──
         # The captcha is server-side state that must be created BEFORE /check.
-        # Atlas is ICE so use remoteStart (not climateControl which is BEV-only).
-        # Uses _api_request_with_token (no auto-retry, no _wake_app delays).
-        for init_op in ("remoteStart", "climateControl"):
+        # Try with OAuth token first (app creates captcha before ATC session),
+        # then with ATC token.  Try both POST and GET, with and without body.
+        for init_op in ("remoteStart",):
             init_url = (f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}"
                         f"/operation/{init_op}")
-            init_body = json.dumps({"spinHash": spin_hash2}).encode()
-            log.info("RST Step 3b: POST /operation/%s to create captcha (ATC bearer)...", init_op)
+            # Attempt 1: OAuth token + POST empty body
+            log.info("RST Step 3b-1: POST /operation/%s with OAuth token (empty body)...", init_op)
             init_result, init_err = self._api_request_with_token(
-                "POST", init_url, body=init_body, bearer_token=atc_token)
+                "POST", init_url, body=b'{}', bearer_token=oauth_token)
             if init_result is not None:
-                log.info("RST Step 3b: /operation/%s → 200: %s",
-                         init_op, init_result[:500])
-                break  # captcha created
+                log.info("RST Step 3b-1: SUCCESS → %s", init_result[:500])
             else:
-                log.warning("RST Step 3b: /operation/%s failed: %s",
-                            init_op, init_err)
-                # Fetch fresh challenge since the spinHash may have been consumed
-                result3b, _ = self._api_request("GET", challenge_url, vid=vid)
-                if result3b:
-                    c3b = json.loads(result3b)
-                    challenge_3b = c3b["data"]["challenge"]
-                    spin_hash2 = hashlib.sha512(
-                        f"{challenge_3b}.{self.vw_spin}".encode("utf-8")
-                    ).hexdigest().upper()
-                    log.info("RST Step 3b: Got fresh challenge for next init op")
+                log.warning("RST Step 3b-1: Failed: %s", init_err)
+
+            # Attempt 2: OAuth token + GET
+            log.info("RST Step 3b-2: GET /operation/%s with OAuth token...", init_op)
+            init_result2, init_err2 = self._api_request_with_token(
+                "GET", init_url, bearer_token=oauth_token)
+            if init_result2 is not None:
+                log.info("RST Step 3b-2: SUCCESS → %s", init_result2[:500])
+            else:
+                log.warning("RST Step 3b-2: Failed: %s", init_err2)
+
+            # Attempt 3: ATC token + POST with spinHash
+            init_body3 = json.dumps({"spinHash": spin_hash2}).encode()
+            log.info("RST Step 3b-3: POST /operation/%s with ATC token + spinHash...", init_op)
+            init_result3, init_err3 = self._api_request_with_token(
+                "POST", init_url, body=init_body3, bearer_token=atc_token)
+            if init_result3 is not None:
+                log.info("RST Step 3b-3: SUCCESS → %s", init_result3[:500])
+            else:
+                log.warning("RST Step 3b-3: Failed: %s", init_err3)
 
         # Fetch a fresh challenge for the /check call (challenges are single-use)
         log.info("RST Step 3c: Fetching fresh challenge for /check...")
