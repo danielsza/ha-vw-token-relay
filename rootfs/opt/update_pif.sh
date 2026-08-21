@@ -121,8 +121,48 @@ NEW_FP=$(adb shell "su -c 'cat ${PIF_DIR}/custom.pif.prop 2>/dev/null || cat ${P
 
 if [ "$OLD_FP" != "$NEW_FP" ]; then
     echo "PIF: Fingerprint changed — killing DroidGuard for refresh..."
-    echo "PIF: NOTE: Phone reboot disabled (risk of boot loop). Reboot manually if PI fails."
     adb shell "su -c 'killall com.google.android.gms.unstable'" 2>/dev/null || true
+
+    if [ -n "$REBOOT_FLAG" ]; then
+        # ── Safe reboot with boot-loop protection ──
+        # Read uptime (seconds since boot) from /proc/uptime
+        UPTIME=$(adb shell "cat /proc/uptime" 2>/dev/null | awk '{printf "%d", $1}')
+        if [ -z "$UPTIME" ]; then
+            echo "PIF: Cannot read uptime, skipping reboot for safety"
+        elif [ "$UPTIME" -lt 1800 ]; then
+            echo "PIF: Phone uptime only ${UPTIME}s (<30min) — SKIPPING reboot to prevent boot loop"
+        else
+            echo "PIF: Phone uptime ${UPTIME}s (>30min) — safe to reboot"
+            echo "PIF: Rebooting phone..."
+            adb shell "su -c 'reboot'" 2>/dev/null || true
+            sleep 5
+
+            # Wait for phone to come back (up to 3 minutes)
+            echo "PIF: Waiting for phone to come back online..."
+            ATTEMPTS=0
+            MAX_ATTEMPTS=36  # 36 * 5s = 3 min
+            while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+                sleep 5
+                ATTEMPTS=$((ATTEMPTS + 1))
+                if adb devices 2>/dev/null | grep -q "device$"; then
+                    # Verify su still works (phone is fully booted)
+                    if adb shell "su -c 'id'" 2>/dev/null | grep -q "uid=0"; then
+                        echo "PIF: Phone back online after ~$((ATTEMPTS * 5))s"
+                        # Kill DroidGuard again after reboot
+                        sleep 10
+                        adb shell "su -c 'killall com.google.android.gms.unstable'" 2>/dev/null || true
+                        break
+                    fi
+                fi
+            done
+
+            if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+                echo "PIF: WARNING — phone did not come back after 3 min!"
+            fi
+        fi
+    else
+        echo "PIF: Reboot not requested (pass --reboot to enable)"
+    fi
 else
     echo "PIF: Fingerprint unchanged, no reboot needed"
     # Still kill DroidGuard as a lighter refresh
