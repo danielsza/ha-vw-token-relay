@@ -1270,21 +1270,55 @@ class VWTokenRelay:
         spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
         log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
 
-        # NOTE: Step 3b (API-based captcha init) was REMOVED.
-        # GET/POST to /operation/climateControl returns 403 from SpinService
-        # and each call triggered a ~2min _wake_app retry.  The captcha is
-        # created server-side when the VW app loads the vehicle dashboard,
-        # which is now handled by Step 0 (_switch_vehicle) above.
+        # ── Step 3b: Create captcha via POST /operation/remoteStart ──
+        # The captcha is server-side state that must be created BEFORE /check.
+        # Atlas is ICE so use remoteStart (not climateControl which is BEV-only).
+        # Uses _api_request_with_token (no auto-retry, no _wake_app delays).
+        for init_op in ("remoteStart", "climateControl"):
+            init_url = (f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}"
+                        f"/operation/{init_op}")
+            init_body = json.dumps({"spinHash": spin_hash2}).encode()
+            log.info("RST Step 3b: POST /operation/%s to create captcha (ATC bearer)...", init_op)
+            init_result, init_err = self._api_request_with_token(
+                "POST", init_url, body=init_body, bearer_token=atc_token)
+            if init_result is not None:
+                log.info("RST Step 3b: /operation/%s → 200: %s",
+                         init_op, init_result[:500])
+                break  # captcha created
+            else:
+                log.warning("RST Step 3b: /operation/%s failed: %s",
+                            init_op, init_err)
+                # Fetch fresh challenge since the spinHash may have been consumed
+                result3b, _ = self._api_request("GET", challenge_url, vid=vid)
+                if result3b:
+                    c3b = json.loads(result3b)
+                    challenge_3b = c3b["data"]["challenge"]
+                    spin_hash2 = hashlib.sha512(
+                        f"{challenge_3b}.{self.vw_spin}".encode("utf-8")
+                    ).hexdigest().upper()
+                    log.info("RST Step 3b: Got fresh challenge for next init op")
+
+        # Fetch a fresh challenge for the /check call (challenges are single-use)
+        log.info("RST Step 3c: Fetching fresh challenge for /check...")
+        result_3c, err_3c = self._api_request("GET", challenge_url, vid=vid)
+        if result_3c is None:
+            log.error("RST: Challenge for /check failed: %s", err_3c)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": "challenge_check_failed", **(err_3c or {})}))
+            return
+        c_3c = json.loads(result_3c)
+        challenge_check = c_3c["data"]["challenge"]
+        spin_hash_check = hashlib.sha512(
+            f"{challenge_check}.{self.vw_spin}".encode("utf-8")
+        ).hexdigest().upper()
 
         # ── Step 4: SPIN check → roToken ──
         # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
-        # Use climateControl ONLY — remoteStart/check consumes the captcha
-        # but returns empty data, leaving nothing for the RST POST.
-        check_body = json.dumps({"spinHash": spin_hash2}).encode()
+        check_body = json.dumps({"spinHash": spin_hash_check}).encode()
         ro_token = None
         captcha_index = "0"
         captcha_value = "0"
-        for operation in ("climateControl", "remoteStart"):
+        for operation in ("remoteStart", "climateControl"):
             op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
             log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
             result, err = self._api_request_with_token("POST", op_url,
@@ -1309,10 +1343,10 @@ class VWTokenRelay:
                     if result3:
                         c3_data = json.loads(result3)
                         challenge3 = c3_data["data"]["challenge"]
-                        spin_hash2 = hashlib.sha512(
+                        spin_hash_check = hashlib.sha512(
                             f"{challenge3}.{self.vw_spin}".encode("utf-8")
                         ).hexdigest().upper()
-                        check_body = json.dumps({"spinHash": spin_hash2}).encode()
+                        check_body = json.dumps({"spinHash": spin_hash_check}).encode()
                         log.info("RST: Got fresh challenge, trying next operation...")
                     else:
                         log.error("RST: Fresh challenge fetch failed, can't try fallback")
@@ -1325,46 +1359,20 @@ class VWTokenRelay:
                 if result3:
                     c3_data = json.loads(result3)
                     challenge3 = c3_data["data"]["challenge"]
-                    spin_hash2 = hashlib.sha512(
+                    spin_hash_check = hashlib.sha512(
                         f"{challenge3}.{self.vw_spin}".encode("utf-8")
                     ).hexdigest().upper()
-                    check_body = json.dumps({"spinHash": spin_hash2}).encode()
+                    check_body = json.dumps({"spinHash": spin_hash_check}).encode()
                     log.info("RST: Got fresh challenge, trying next operation...")
                 else:
                     log.error("RST: Fresh challenge fetch failed, can't try fallback")
                     break
 
         if not ro_token:
-            # ── Step 4b: Retry after auto_login ──
-            # "Captcha not found" means the VW app didn't load the vehicle
-            # page properly.  Run auto_login (full app restart + login) which
-            # reliably creates the captcha, then retry Steps 1-4.
-            if not hasattr(self, '_rst_retried'):
-                self._rst_retried = False
-            if not self._rst_retried:
-                self._rst_retried = True
-                log.warning("RST Step 4b: No roToken — running auto_login to create captcha...")
-                self._auto_login()
-                log.info("RST Step 4b: auto_login done — waiting 20s for captcha...")
-                time.sleep(20)
-                # Navigate to target vehicle after login
-                log.info("RST Step 4b: Switching to target vehicle...")
-                self._switch_vehicle(target_vid=vid)
-                time.sleep(10)
-                log.info("RST Step 4b: Retrying full RST flow...")
-                self._api_remote_start_inner(vid)
-                return
-            else:
-                self._rst_retried = False
-                log.error("RST: Could not obtain roToken even after auto_login retry")
-                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                    json.dumps({"error": "no_ro_token",
-                                "msg": "Neither remoteStart nor climateControl check returned roToken (even after auto_login)"}))
-                return
-        else:
-            # Reset retry flag on success
-            if hasattr(self, '_rst_retried'):
-                self._rst_retried = False
+            # Proceed anyway with empty roToken — the server response will
+            # tell us whether it's truly required or not.
+            log.warning("RST: No roToken obtained — proceeding with empty roToken to test server response...")
+            ro_token = ""
 
         # ── Step 5: POST /rst/v1/vehicle/{vid} ──
         # MUST use carnetVehicleToken as Bearer
