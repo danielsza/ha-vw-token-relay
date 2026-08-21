@@ -559,7 +559,8 @@ class VWTokenRelay:
             try:
                 log.info("ADB_KEY: Pressing %s", payload.strip())
                 subprocess.run(
-                    ["adb", "shell", "input", "keyevent", payload.strip()],
+                    ["adb", "shell", "su", "-c",
+                     f"input keyevent {payload.strip()}"],
                     capture_output=True, timeout=10)
             except Exception as e:
                 log.error("ADB_KEY: Failed: %s", e)
@@ -568,7 +569,8 @@ class VWTokenRelay:
             try:
                 log.info("ADB_TEXT: Typing '%s'", payload.strip()[:20])
                 subprocess.run(
-                    ["adb", "shell", "input", "text", payload.strip()],
+                    ["adb", "shell", "su", "-c",
+                     f"input text {payload.strip()}"],
                     capture_output=True, timeout=10)
             except Exception as e:
                 log.error("ADB_TEXT: Failed: %s", e)
@@ -646,7 +648,8 @@ class VWTokenRelay:
                 dur = parts[4].strip() if len(parts) > 4 else "300"
                 log.info("ADB_SWIPE: (%s,%s) -> (%s,%s) dur=%sms", x1, y1, x2, y2, dur)
                 subprocess.run(
-                    ["adb", "shell", "input", "swipe", x1, y1, x2, y2, dur],
+                    ["adb", "shell", "su", "-c",
+                     f"input swipe {x1} {y1} {x2} {y2} {dur}"],
                     capture_output=True, timeout=10)
             except Exception as e:
                 log.error("ADB_SWIPE: Failed: %s", e)
@@ -1890,10 +1893,10 @@ class VWTokenRelay:
         except Exception as e:
             log.warning("NAV: sendevent failed: %s", e)
 
-        # Method 3: input tap as shell user (last resort, may hang)
+        # Method 3: input tap via su (shell user hangs on Moto G Pure)
         try:
             result = subprocess.run(
-                ["adb", "shell", "input", "tap", str(x), str(y)],
+                ["adb", "shell", "su", "-c", f"input tap {x} {y}"],
                 capture_output=True, timeout=8,
             )
             return result.returncode == 0
@@ -2062,7 +2065,7 @@ class VWTokenRelay:
         """Wake the screen and dismiss lock screen. Best effort."""
         try:
             subprocess.run(
-                ["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+                ["adb", "shell", "su", "-c", "input keyevent KEYCODE_WAKEUP"],
                 capture_output=True, timeout=10,
             )
             time.sleep(1)
@@ -2575,7 +2578,7 @@ class VWTokenRelay:
                     log.info("SWITCH: Dismissing PIN/SPIN dialog (attempt %d)...",
                              dismiss_attempt + 1)
                     if not self._tap_element(xml, "cancel PIN", resource_id="button_cancel"):
-                        subprocess.run(["adb", "shell", "input", "keyevent", "BACK"],
+                        subprocess.run(["adb", "shell", "su", "-c", "input keyevent BACK"],
                                        capture_output=True, timeout=10)
                     time.sleep(2)
                     dismissed_this_round = True
@@ -2710,14 +2713,16 @@ class VWTokenRelay:
             if found_target:
                 cx, cy, bounds, attrs = found_target
                 log.info("SWITCH: Tapping target vehicle '%s' at (%d,%d)", target_name, cx, cy)
-                subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                subprocess.run(["adb", "shell", "su", "-c",
+                                f"input tap {cx} {cy}"],
                                capture_output=True, timeout=10)
                 time.sleep(5)
             elif found_current:
                 # Tap the current vehicle to open picker, then look for target
                 cx, cy, bounds, attrs = found_current
                 log.info("SWITCH: Tapping current vehicle to open picker at (%d,%d)", cx, cy)
-                subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                subprocess.run(["adb", "shell", "su", "-c",
+                                f"input tap {cx} {cy}"],
                                capture_output=True, timeout=10)
                 time.sleep(3)
 
@@ -2729,7 +2734,8 @@ class VWTokenRelay:
                         cx2, cy2, bounds2, attrs2 = target_elems[0]
                         log.info("SWITCH: Tapping '%s' in dropdown at (%d,%d)",
                                  target_name, cx2, cy2)
-                        subprocess.run(["adb", "shell", "input", "tap", str(cx2), str(cy2)],
+                        subprocess.run(["adb", "shell", "su", "-c",
+                                        f"input tap {cx2} {cy2}"],
                                        capture_output=True, timeout=10)
                         time.sleep(5)
                     else:
@@ -2748,7 +2754,8 @@ class VWTokenRelay:
             else:
                 log.warning("SWITCH: No vehicle picker found in UI — trying tap at top of screen")
                 # Fallback: tap the top area where vehicle picker usually is
-                subprocess.run(["adb", "shell", "input", "tap", "360", "150"],
+                subprocess.run(["adb", "shell", "su", "-c",
+                                "input tap 360 150"],
                                capture_output=True, timeout=10)
                 time.sleep(3)
                 xml2 = self._dump_ui_xml()
@@ -2757,7 +2764,8 @@ class VWTokenRelay:
                     if target_elems:
                         cx2, cy2 = target_elems[0][0], target_elems[0][1]
                         log.info("SWITCH: Found '%s' after top tap at (%d,%d)", target_name, cx2, cy2)
-                        subprocess.run(["adb", "shell", "input", "tap", str(cx2), str(cy2)],
+                        subprocess.run(["adb", "shell", "su", "-c",
+                                        f"input tap {cx2} {cy2}"],
                                        capture_output=True, timeout=10)
                         time.sleep(5)
 
@@ -2835,13 +2843,15 @@ class VWTokenRelay:
         if target_field:
             cx, cy = target_field[0], target_field[1]
             log.info("SPIN_ENTRY: Tapping PIN field at (%d, %d)", cx, cy)
-            subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+            subprocess.run(["adb", "shell", "su", "-c",
+                            f"input tap {cx} {cy}"],
                           capture_output=True, timeout=10)
             time.sleep(1)
 
         # Type the SPIN digits
         log.info("SPIN_ENTRY: Typing S-PIN (%d digits)...", len(self.vw_spin))
-        subprocess.run(["adb", "shell", "input", "text", self.vw_spin],
+        subprocess.run(["adb", "shell", "su", "-c",
+                        f"input text {self.vw_spin}"],
                       capture_output=True, timeout=10)
         time.sleep(1)
 
@@ -2862,14 +2872,15 @@ class VWTokenRelay:
                     cx, cy = elems[0][0], elems[0][1]
                     log.info("SPIN_ENTRY: Tapping confirm button at (%d, %d) [%s]",
                              cx, cy, btn_search)
-                    subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                    subprocess.run(["adb", "shell", "su", "-c",
+                                    f"input tap {cx} {cy}"],
                                   capture_output=True, timeout=10)
                     log.info("SPIN_ENTRY: S-PIN submitted successfully")
                     return True
 
         # Fallback: press Enter key
         log.info("SPIN_ENTRY: No confirm button found — pressing Enter")
-        subprocess.run(["adb", "shell", "input", "keyevent", "ENTER"],
+        subprocess.run(["adb", "shell", "su", "-c", "input keyevent ENTER"],
                       capture_output=True, timeout=10)
         return True
 
@@ -2992,21 +3003,23 @@ class VWTokenRelay:
 
         def _tap(x, y, desc=""):
             log.info("AUTO_LOGIN: tap(%d, %d) %s", x, y, desc)
-            subprocess.run(["adb", "shell", "input", "tap", str(x), str(y)],
+            subprocess.run(["adb", "shell", "su", "-c",
+                            f"input tap {x} {y}"],
                            capture_output=True, timeout=10)
             time.sleep(1.5)
 
         def _input_text(text, desc=""):
             log.info("AUTO_LOGIN: input_text [%s]", desc)
             escaped = text.replace(" ", "%s").replace("@", "\\@").replace("&", "\\&")
-            subprocess.run(["adb", "shell", "input", "text", escaped],
+            subprocess.run(["adb", "shell", "su", "-c",
+                            f"input text {escaped}"],
                            capture_output=True, timeout=10)
             time.sleep(1)
 
         def _swipe(x1, y1, x2, y2, ms=300):
             subprocess.run(
-                ["adb", "shell", "input", "swipe",
-                 str(x1), str(y1), str(x2), str(y2), str(ms)],
+                ["adb", "shell", "su", "-c",
+                 f"input swipe {x1} {y1} {x2} {y2} {ms}"],
                 capture_output=True, timeout=10)
             time.sleep(1)
 
@@ -3085,7 +3098,7 @@ class VWTokenRelay:
 
             # Step 2: Wake screen
             log.info("AUTO_LOGIN: Step 2 — Waking screen...")
-            subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+            subprocess.run(["adb", "shell", "su", "-c", "input keyevent KEYCODE_WAKEUP"],
                            capture_output=True, timeout=10)
             time.sleep(1)
             _swipe(360, 1400, 360, 600, 300)  # Swipe up to dismiss lock screen
@@ -3138,7 +3151,8 @@ class VWTokenRelay:
                         cx, cy, bounds, attrs = btn_elems[0]
                         log.info("AUTO_LOGIN: tapping first Button(%d,%d) text='%s'",
                                  cx, cy, attrs.get("text", "")[:30])
-                        subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+                        subprocess.run(["adb", "shell", "su", "-c",
+                                        f"input tap {cx} {cy}"],
                                        capture_output=True, timeout=10)
                         tapped = True
                         time.sleep(3)
