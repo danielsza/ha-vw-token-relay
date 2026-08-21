@@ -1657,6 +1657,57 @@ class VWTokenRelay:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
                 json.dumps({"error": "rst_stop_failed", **err}))
 
+    def _read_result_text(self, xml_str):
+        """Read the result/status text from the VW app UI after a remote start.
+
+        Looks for snackbar messages, dialog text, status labels, or toast-like
+        elements that indicate success or failure.
+        Returns the text string, or empty string if nothing found.
+        """
+        if not xml_str:
+            return ""
+
+        # Look for common VW app result indicators
+        result_text = ""
+
+        # 1. Snackbar / toast text (usually a TextView near bottom of screen)
+        for search in [
+            {"resource_id": "snackbar_text"},
+            {"resource_id": "snackbar_action"},
+            {"resource_id": "design_snackbar"},
+            {"resource_id": "status_text"},
+            {"resource_id": "message_text"},
+            {"resource_id": "errorText"},
+            {"resource_id": "infoText"},
+        ]:
+            elems = self._find_ui_elements(xml_str, **search)
+            if elems:
+                txt = elems[0][3].get("text", "").strip()
+                if txt:
+                    log.info("UI_RST_RESULT: Found via %s: '%s'", search, txt)
+                    return txt
+
+        # 2. Look for key phrases in any TextView
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(xml_str)
+        except ET.ParseError:
+            return ""
+
+        indicators = ["remote start", "unavailable", "not possible", "started",
+                       "stopped", "engine", "fuel", "error", "success",
+                       "request sent", "request received", "please wait",
+                       "check vehicle", "try again"]
+        for node in root.iter("node"):
+            txt = node.attrib.get("text", "").strip()
+            if txt and len(txt) > 5:
+                if any(kw in txt.lower() for kw in indicators):
+                    log.info("UI_RST_RESULT: Found indicator text: '%s'", txt)
+                    if not result_text or len(txt) > len(result_text):
+                        result_text = txt
+
+        return result_text
+
     # ── UI-driven remote start (drives the VW app's own buttons) ────
     def _ui_remote_start_flow(self, vehicle_id, stop=False):
         """Automate remote start/stop by driving the VW app's UI.
@@ -1780,12 +1831,34 @@ class VWTokenRelay:
                     self._screencap()
                     return False
 
+            # Step 7: Wait for result and read status text from the app
+            log.info("UI_RST: Waiting for result dialog...")
+            time.sleep(8)
+            self._dismiss_system_dialogs()
+            result_xml = self._dump_ui_xml()
+            result_msg = self._read_result_text(result_xml) if result_xml else ""
+
             # Take final screencap for debugging
             self._screencap()
 
+            # Check if the result indicates an error
+            is_error = False
+            if result_msg:
+                error_keywords = ["unavailable", "not possible", "error",
+                                  "failed", "fuel", "cannot", "unable"]
+                is_error = any(kw in result_msg.lower() for kw in error_keywords)
+
+            if is_error:
+                log.warning("UI_RST: App reported error: %s", result_msg)
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                    json.dumps({"status": "error", "msg": result_msg}),
+                    retain=False)
+                return False
+
             log.info("═══ UI REMOTE %s FLOW COMPLETE ═══", action.upper())
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
-                json.dumps({"status": f"ui_{action.lower()}_completed"}),
+                json.dumps({"status": f"ui_{action.lower()}_completed",
+                            "msg": result_msg or f"Remote {action.lower()} sent"}),
                 retain=False)
             return True
 
