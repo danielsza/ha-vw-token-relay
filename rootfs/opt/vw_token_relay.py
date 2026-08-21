@@ -542,7 +542,8 @@ class VWTokenRelay:
                 x, y = payload.strip().split(",")
                 log.info("ADB_TAP: Tapping (%s, %s)", x.strip(), y.strip())
                 subprocess.run(
-                    ["adb", "shell", "input", "tap", x.strip(), y.strip()],
+                    ["adb", "shell", "su", "-c",
+                     f"input tap {x.strip()} {y.strip()}"],
                     capture_output=True, timeout=10)
             except Exception as e:
                 log.error("ADB_TAP: Failed: %s", e)
@@ -718,8 +719,8 @@ class VWTokenRelay:
                             cx, cy, bounds, attrs = elems[0]
                             log.info("UI_TAP: Found '%s' at (%d,%d) bounds=%s — tapping",
                                      search, cx, cy, bounds)
-                            subprocess.run(["adb", "shell", "input", "tap",
-                                            str(cx), str(cy)],
+                            subprocess.run(["adb", "shell", "su", "-c",
+                                            f"input tap {cx} {cy}"],
                                            capture_output=True, timeout=10)
                             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/ui_tap",
                                               json.dumps({"tapped": True, "x": cx, "y": cy,
@@ -2724,10 +2725,23 @@ class VWTokenRelay:
         for node in root.iter("node"):
             attrs = node.attrib
             match = True
-            if text and text.lower() not in attrs.get("text", "").lower():
-                match = False
-            if content_desc and content_desc.lower() not in attrs.get("content-desc", "").lower():
-                match = False
+            exact = True  # Track if this is an exact match vs substring
+            if text:
+                node_text = attrs.get("text", "")
+                if text.lower() == node_text.lower():
+                    pass  # exact match
+                elif text.lower() in node_text.lower():
+                    exact = False  # substring match
+                else:
+                    match = False
+            if content_desc:
+                node_desc = attrs.get("content-desc", "")
+                if content_desc.lower() == node_desc.lower():
+                    pass
+                elif content_desc.lower() in node_desc.lower():
+                    exact = False
+                else:
+                    match = False
             if resource_id and resource_id.lower() not in attrs.get("resource-id", "").lower():
                 match = False
             if class_name and class_name not in attrs.get("class", ""):
@@ -2738,8 +2752,11 @@ class VWTokenRelay:
                 if m:
                     x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    results.append((cx, cy, bounds_str, attrs))
-        return results
+                    results.append((cx, cy, bounds_str, attrs, exact))
+        # Sort: exact matches first, then substring matches
+        results.sort(key=lambda r: (0 if r[4] else 1))
+        # Strip the exact flag from results for backward compat
+        return [(cx, cy, bounds, attrs) for cx, cy, bounds, attrs, _ in results]
 
     def _tap_element(self, xml_str, desc, text=None, content_desc=None,
                      resource_id=None, class_name=None, index=0):
@@ -2750,7 +2767,8 @@ class VWTokenRelay:
             cx, cy, bounds, attrs = elems[index]
             log.info("AUTO_LOGIN: tap_element(%d,%d) %s [%s] text='%s'",
                      cx, cy, desc, bounds, attrs.get("text", "")[:50])
-            subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)],
+            subprocess.run(["adb", "shell", "su", "-c",
+                            f"input tap {cx} {cy}"],
                            capture_output=True, timeout=10)
             return True
         else:
