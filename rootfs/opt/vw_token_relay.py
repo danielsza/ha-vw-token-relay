@@ -2190,7 +2190,8 @@ class VWTokenRelay:
             return False
 
     def _wake_screen(self):
-        """Wake the screen and dismiss lock screen. Best effort."""
+        """Wake the screen and dismiss lock screen. Best effort.
+        Moto G Pure display: 720x1600 pixels."""
         try:
             subprocess.run(
                 ["adb", "shell", "su", "-c", "input keyevent KEYCODE_WAKEUP"],
@@ -2199,19 +2200,31 @@ class VWTokenRelay:
             time.sleep(1)
         except Exception as e:
             log.warning("WAKE: screen wake failed (non-critical): %s", e)
+        # Dismiss keyguard first (works without PIN/pattern)
         try:
             subprocess.run(
-                ["adb", "shell", "su", "-c", "input swipe 540 1800 540 800 300"],
+                ["adb", "shell", "su", "-c", "wm dismiss-keyguard"],
+                capture_output=True, timeout=5,
+            )
+            time.sleep(1)
+        except Exception:
+            pass
+        # Swipe up to unlock — coords for 720x1600 Moto G Pure
+        try:
+            subprocess.run(
+                ["adb", "shell", "su", "-c", "input swipe 360 1200 360 400 300"],
                 capture_output=True, timeout=10,
             )
             time.sleep(1)
         except Exception as e:
             log.warning("WAKE: lock screen swipe failed (non-critical): %s", e)
+        # Press HOME to dismiss any lingering lock screen overlay
         try:
             subprocess.run(
-                ["adb", "shell", "wm", "dismiss-keyguard"],
+                ["adb", "shell", "su", "-c", "input keyevent KEYCODE_HOME"],
                 capture_output=True, timeout=5,
             )
+            time.sleep(1)
         except Exception:
             pass
 
@@ -3469,7 +3482,7 @@ class VWTokenRelay:
         try:
             result = subprocess.run(
                 ["sh", "/opt/update_pif.sh", "--reboot"],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=300,
             )
             for line in result.stdout.splitlines():
                 log.info(line)

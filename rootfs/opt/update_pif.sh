@@ -151,6 +151,15 @@ if [ "$OLD_FP" != "$NEW_FP" ]; then
                         # Kill DroidGuard again after reboot
                         sleep 10
                         adb shell "su -c 'killall com.google.android.gms.unstable'" 2>/dev/null || true
+                        # Unlock screen after reboot (720x1600 Moto G Pure)
+                        echo "PIF: Unlocking screen after reboot..."
+                        adb shell "su -c 'input keyevent KEYCODE_WAKEUP'" 2>/dev/null || true
+                        sleep 1
+                        adb shell "su -c 'wm dismiss-keyguard'" 2>/dev/null || true
+                        sleep 1
+                        adb shell "su -c 'input swipe 360 1200 360 400 300'" 2>/dev/null || true
+                        sleep 1
+                        adb shell "su -c 'input keyevent KEYCODE_HOME'" 2>/dev/null || true
                         break
                     fi
                 fi
