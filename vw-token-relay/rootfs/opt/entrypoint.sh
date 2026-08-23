@@ -29,21 +29,26 @@ if [ -f "${DATA_ANDROID}/adbkey" ] && [ ! -f "${SHARE_ANDROID}/adbkey" ]; then
     cp "${DATA_ANDROID}/adbkey.pub" "${SHARE_ANDROID}/adbkey.pub" 2>/dev/null || true
 fi
 
-# Restore: if key exists in /share but not /data (post-uninstall reinstall)
-if [ -f "${SHARE_ANDROID}/adbkey" ] && [ ! -f "${DATA_ANDROID}/adbkey" ]; then
-    echo "Restoring ADB key from /share (survived uninstall)..."
-    cp "${SHARE_ANDROID}/adbkey" "${DATA_ANDROID}/adbkey"
-    cp "${SHARE_ANDROID}/adbkey.pub" "${DATA_ANDROID}/adbkey.pub" 2>/dev/null || true
-fi
-
-# Symlink ~/.android → /data/.android (ADB's working copy)
+# Symlink ~/.android → /data/.android FIRST (ADB's working copy)
 rm -rf /root/.android 2>/dev/null || true
 ln -sf "${DATA_ANDROID}" /root/.android
 
+# Restore: if key exists in /share but not /data (post-uninstall reinstall or slug change)
+if [ ! -f "${DATA_ANDROID}/adbkey" ] && [ -f "${SHARE_ANDROID}/adbkey" ]; then
+    echo "Restoring ADB key from /share backup (survived uninstall/slug change)..."
+    cp "${SHARE_ANDROID}/adbkey" "${DATA_ANDROID}/adbkey"
+    cp "${SHARE_ANDROID}/adbkey.pub" "${DATA_ANDROID}/adbkey.pub" 2>/dev/null || true
+    chmod 600 "${DATA_ANDROID}/adbkey" 2>/dev/null || true
+fi
+
 if [ -f "${DATA_ANDROID}/adbkey" ]; then
-    echo "Reusing persisted ADB key (backed up to /share/.vw-relay/)"
+    echo "ADB key ready (fingerprint: $(awk '{print $NF}' "${DATA_ANDROID}/adbkey.pub" 2>/dev/null || echo 'n/a'))"
+    # Ensure backup copy is current
+    cp "${DATA_ANDROID}/adbkey" "${SHARE_ANDROID}/adbkey" 2>/dev/null || true
+    cp "${DATA_ANDROID}/adbkey.pub" "${SHARE_ANDROID}/adbkey.pub" 2>/dev/null || true
 else
-    echo "No ADB key found — will be generated on first ADB use"
+    echo "No ADB key found (share=${SHARE_ANDROID}/adbkey exists=$([ -f "${SHARE_ANDROID}/adbkey" ] && echo yes || echo no))"
+    echo "Key will be generated on first ADB use and backed up to /share/.vw-relay/"
 fi
 
 # After ADB generates a key, back it up to /share (runs in background)
