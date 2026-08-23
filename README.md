@@ -6,6 +6,8 @@ Captures Play Integrity tokens and OAuth credentials from the VW myVW app via Fr
 
 VW's North American API requires every request to carry a Play Integrity–attested token. This is already enforced in the US and is expected to roll out to Canada. The official myVW app passes Google's device attestation check; a headless Python connector cannot. This add-on bridges the gap: a rooted Android phone runs the real myVW app, Frida hooks intercept the attested tokens in real-time, and MQTT delivers them to CarConnectivity or Home Assistant automations. Without this (or a similar relay), the [VW NA connector](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na) cannot authenticate.
 
+**Note:** This has been tested on the Canadian endpoint where PI is not yet enforced. The relay captures and forwards PI tokens, but we cannot yet confirm they pass validation on the US endpoint. US testing is needed.
+
 ## Architecture
 
 ```
