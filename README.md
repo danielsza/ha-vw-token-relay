@@ -1,11 +1,15 @@
 # VW Token Relay — Home Assistant Add-on
 
-Captures VW myVW app OAuth tokens via Frida over USB and relays them via MQTT for CarConnectivity Play Integrity bypass.
+Captures VW myVW app OAuth tokens via Frida over USB and relays them via MQTT for [CarConnectivity](https://github.com/tillsteinbach/CarConnectivity) Play Integrity bypass.
+
+## Why this exists
+
+VW's North American API (US/CA) requires every request to carry a Play Integrity–attested token. The official myVW app passes Google's device attestation check; a headless Python connector cannot. This add-on bridges the gap: a rooted Android phone runs the real myVW app, Frida hooks intercept the attested tokens in real-time, and MQTT delivers them to CarConnectivity or Home Assistant automations. Without this (or a similar relay), the [VW NA connector](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na) cannot authenticate.
 
 ## Architecture
 
 ```
-Phone (VW app + Frida) --USB/ADB--> This add-on --MQTT--> Home Assistant / CarConnectivity
+Phone (VW app + Frida) ──USB/ADB──▸ This add-on ──MQTT──▸ Home Assistant / CarConnectivity
 ```
 
 A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `BridgeInterceptor` to capture OAuth tokens in real-time. Tokens are published to MQTT, where CarConnectivity or HA automations consume them.
@@ -33,9 +37,20 @@ A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `Bridge
 ### Vehicle Commands (via MQTT)
 - **Lock/Unlock:** `vw/cmd/lock` / `vw/cmd/unlock` — send vehicle UUID as payload
 - **Climate start/stop:** `vw/cmd/climate_start` / `vw/cmd/climate_stop`
-- **Remote start (ICE):** `vw/cmd/ui_remote_start` / `vw/cmd/ui_remote_start_stop` — drives the app's UI to start/stop the engine. Handles SPIN entry, device pairing, and result detection automatically.
+- **Remote start (ICE):** `vw/cmd/ui_remote_start` / `vw/cmd/ui_remote_start_stop` — drives the app's UI to start/stop the engine (see below)
 - **Vehicle status:** `vw/cmd/vehicle_status` — queries vehicle data
 - **Wake app:** `vw/cmd/wake_app` — force token refresh
+
+### Remote Start (ICE/hybrid vehicles)
+
+Two approaches were tested:
+
+| Approach | How it works | Status |
+|----------|-------------|--------|
+| **Native API** | Connector calls `/rst/v1` directly using a PI-attested token from the relay. Two-challenge SPIN flow → roToken → POST/DELETE. | Implemented in [connector PR #92](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na/pull/92) |
+| **UI-driven** | Relay drives the VW app's own Remote Start button via uiautomator. Handles SPIN entry, device pairing, and result detection. | Implemented in relay add-on |
+
+The native API path is preferred — it's faster and more reliable. The UI-driven path is a fallback that works without connector changes.
 
 ### Vehicle Data (published to MQTT)
 - `vw/{vehicle_id}/power` — fuel/charge level, range
@@ -58,6 +73,15 @@ A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `Bridge
 ### Error Notifications
 - Publishes errors to `vw/error`, `vw/pif_health`, `vw/pif_update`, `vw/auto_login`
 - Designed to pair with HA automations for iOS/Android push notifications
+
+## Quickstart
+
+1. Root your Android phone and pass Play Integrity (see Phone Setup Guide below)
+2. Connect the phone via USB to your Home Assistant host
+3. Install this add-on from the [add-on repository](https://github.com/danielsza/carconnectivity-addon)
+4. Configure MQTT credentials and VW account details
+5. Start the add-on — tokens should appear on `vw/token_relay` within 2 minutes
+6. Point your CarConnectivity config at the MQTT token source
 
 ## Configuration
 
@@ -90,9 +114,36 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 9. **Keep screen on** — `adb shell settings put global stay_on_while_plugged_in 3`
 10. **Verify PI** — test with SPIC or YASNAC; should show DEVICE_INTEGRITY
 
+## Reference Setup (known-good)
+
+| Component | Version / Detail |
+|-----------|-----------------|
+| Phone | Motorola Moto G Pure (720×1600, arm64) |
+| Android | 11 (stock) |
+| Magisk | 28.1+ with Zygisk enabled |
+| PIF module | chiteroman Play Integrity Fix (autopif variant) |
+| Shamiko | Latest (root-hide for GMS + VW app) |
+| Frida server | 16.5.9-android-arm64 |
+| myVW package | `com.vw.carnet.releaseca` (Canada) |
+| PI verdict | DEVICE_INTEGRITY (verified with SPIC) |
+| HA host | Mac mini (USB connection to phone) |
+| MQTT broker | Mosquitto (HA add-on) |
+
 ## Tested Vehicles
 
-- 2025 VW ID. Buzz (MEB/EV, TSP=WCT) — lock, unlock, climate, charging, status
-- 2024 VW Atlas (MQB/ICE, TSP=ATC) — lock, unlock, climate, remote start, status
+| Vehicle | Platform | TSP | Features tested |
+|---------|----------|-----|----------------|
+| 2025 VW ID. Buzz 1st Edition | MEB/EV | WCT | lock, unlock, climate, charging, status |
+| 2024 VW Atlas | MQB/ICE | ATC | lock, unlock, climate, remote start, status |
 
-## Tested on Canadian endpoint (`b-h-s.spr.ca00.p.con-veh.net`). Should work on US endpoint with base URL change.
+## Region Notes
+
+Tested on Canadian endpoint (`b-h-s.spr.ca00.p.con-veh.net`). The US endpoint uses the same API — change the base URL to `b-h-s.spr.us00.p.con-veh.net`. No code changes needed.
+
+## Troubleshooting
+
+- **"No tokens received"** — check that Frida server is running on the phone (`adb shell su -c "ps | grep frida"`), the VW app is logged in, and USB debugging is enabled.
+- **Tokens go stale after a few hours** — PIF fingerprint may have been revoked. The add-on auto-recovers, but if `vw/pif_health` stays `critical`, manually update the PIF module's fingerprint list.
+- **Remote start fails with "device pairing required"** — first-time remote start requires pairing the phone with VW's server. Use `vw/cmd/ui_remote_start` to trigger the pairing flow through the app UI.
+- **"Media Storage keeps stopping" dialog** — common on Moto G Pure. The relay auto-dismisses this, but if it persists, clear Media Storage data in Android settings.
+- **Screen stays locked after reboot** — the add-on unlocks the screen automatically (wake → dismiss-keyguard → swipe → home). If this fails, ensure the phone has no PIN/pattern lock set.
