@@ -47,10 +47,10 @@ Two approaches were tested:
 
 | Approach | How it works | Status |
 |----------|-------------|--------|
-| **Native API** | Connector calls `/rst/v1` directly using a PI-attested token from the relay. Two-challenge SPIN flow → roToken → POST/DELETE. | Implemented in [connector PR #92](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na/pull/92) |
-| **UI-driven** | Relay drives the VW app's own Remote Start button via uiautomator. Handles SPIN entry, device pairing, and result detection. | Implemented in relay add-on |
+| **Native API** | Two-challenge SPIN flow → roToken → POST/DELETE to `/rst/v1`. | Blocked — `/climateControl/check` returns 403 without a server-side captcha that only the VW app's native `SpinService.createCaptcha()` can create. Dead end for pure API. |
+| **UI-driven** | Relay drives the VW app's own Remote Start button via uiautomator. Handles SPIN entry, device pairing, and result detection. | **Working** — this is the only viable approach. |
 
-The native API path is preferred — it's faster and more reliable. The UI-driven path is a fallback that works without connector changes.
+The UI-driven path is the only way to do remote start. The relay navigates the VW app's UI automatically: vehicle dashboard → "Remote start" → "Start/Stop" → enter SPIN → confirm.
 
 ### Vehicle Data (published to MQTT)
 - `vw/{vehicle_id}/power` — fuel/charge level, range
