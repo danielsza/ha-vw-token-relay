@@ -3588,9 +3588,6 @@ class VWTokenRelay:
                 log.debug("Token key normalized: %s → %s", camel, snake)
 
         # ── Extract code_verifier and play_integrity_token from request body ──
-        log.info("Token response requestBody present=%s len=%s preview=%r",
-                 request_body_str is not None, len(request_body_str) if request_body_str else 0,
-                 request_body_str[:200] if request_body_str else None)
         if request_body_str:
             try:
                 # Request body is URL-encoded: grant_type=...&code_verifier=...&play_integrity_token=...
