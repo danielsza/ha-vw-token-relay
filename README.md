@@ -119,7 +119,7 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 | Component | Version / Detail |
 |-----------|-----------------|
 | Phone | Motorola Moto G Pure (720×1600, arm64) |
-| Android | 11 (stock) |
+| Android | 12 (upgraded from stock 11 — PI did not pass on 11) |
 | Magisk | 28.1+ with Zygisk enabled |
 | PIF module | chiteroman Play Integrity Fix (autopif variant) |
 | Shamiko | Latest (root-hide for GMS + VW app) |
