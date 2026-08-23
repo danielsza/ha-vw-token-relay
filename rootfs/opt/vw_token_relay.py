@@ -138,15 +138,44 @@ Java.perform(function () {
         try {
             var body = req.body();
             if (body === null) return null;
+
+            // Strategy 1: okio.Buffer (if resolved)
             if (BufferClass) {
-                var buffer = BufferClass.$new();
-                body.writeTo(buffer);
-                return buffer.readUtf8();
+                try {
+                    var buffer = BufferClass.$new();
+                    body.writeTo(buffer);
+                    return buffer.readUtf8();
+                } catch(e1) {}
             }
+
+            // Strategy 2: FormBody — use its own API to reconstruct the body
+            // Works even when okio is obfuscated; the body object's actual class
+            // is FormBody with size()/encodedName()/encodedValue() methods.
+            try {
+                var ActualClass = Java.use(body.getClass().getName());
+                var typed = Java.cast(body, ActualClass);
+                var sz = typed.size();
+                var parts = [];
+                for (var i = 0; i < sz; i++) {
+                    parts.push(typed.encodedName(i) + '=' + typed.encodedValue(i));
+                }
+                if (parts.length > 0) return parts.join('&');
+            } catch(e2) {}
+
+            // Strategy 3: find okio.Buffer via the body's own classloader
+            try {
+                var cl = body.getClass().getClassLoader();
+                var bufCls = cl.loadClass('okio.Buffer');
+                var DynBuffer = Java.use(bufCls.getName());
+                var buf = DynBuffer.$new();
+                body.writeTo(buf);
+                return buf.readUtf8();
+            } catch(e3) {}
+
             // Fallback: just report content type and length
             var ct = body.contentType();
-            var cl = body.contentLength();
-            return '(body: type=' + ct + ', len=' + cl + ', okio.Buffer not available)';
+            var cl2 = body.contentLength();
+            return '(body: type=' + ct + ', len=' + cl2 + ', buffer not available)';
         } catch (e) {
             return '(error reading body: ' + e + ')';
         }
