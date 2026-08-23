@@ -423,6 +423,7 @@ class VWTokenRelay:
         self.refresh_token = None
         self.id_token = None
         self.code_verifier = None  # PKCE verifier from OIDC token exchange
+        self.play_integrity_token = None  # PI token from OIDC token grant request
         self.vehicle_ids = []
         self.user_id = None
 
@@ -3557,15 +3558,22 @@ class VWTokenRelay:
                 body[snake] = body.pop(camel)
                 log.debug("Token key normalized: %s → %s", camel, snake)
 
-        # ── Extract code_verifier from request body (needed for direct IDP refresh) ──
+        # ── Extract code_verifier and play_integrity_token from request body ──
         if request_body_str:
             try:
-                # Request body is URL-encoded: grant_type=...&code_verifier=...
+                # Request body is URL-encoded: grant_type=...&code_verifier=...&play_integrity_token=...
                 from urllib.parse import parse_qs
                 req_params = parse_qs(request_body_str)
                 if "code_verifier" in req_params:
                     self.code_verifier = req_params["code_verifier"][0]
                     log.info("Captured code_verifier from token request (len=%d)", len(self.code_verifier))
+                if "play_integrity_token" in req_params:
+                    pi_token = req_params["play_integrity_token"][0]
+                    if pi_token and pi_token != "unavailable":
+                        self.play_integrity_token = pi_token
+                        log.info("Play Integrity token captured! (len=%d)", len(pi_token))
+                    else:
+                        log.debug("play_integrity_token present but value=%r", pi_token)
             except Exception:
                 pass
 
@@ -3592,6 +3600,9 @@ class VWTokenRelay:
         # (refresh_token grants don't return id_token, but we need it for RST)
         if "id_token" not in token_relay and self.id_token:
             token_relay["id_token"] = self.id_token
+        # Include Play Integrity token — the connector needs this for US endpoint
+        if self.play_integrity_token:
+            token_relay["play_integrity_token"] = self.play_integrity_token
         if token_relay.get("access_token"):
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/token_relay",
@@ -3846,6 +3857,8 @@ class VWTokenRelay:
                     relay_data["refresh_token"] = refresh
                 if id_tok:
                     relay_data["id_token"] = id_tok
+                if self.play_integrity_token:
+                    relay_data["play_integrity_token"] = self.play_integrity_token
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/token_relay",
                     json.dumps(relay_data),
