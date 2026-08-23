@@ -126,7 +126,7 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 | Frida server | 16.5.9-android-arm64 |
 | myVW package | `com.vw.carnet.releaseca` (Canada) |
 | PI verdict | DEVICE_INTEGRITY (verified with SPIC) |
-| HA host | Mac mini (USB connection to phone) |
+| HA host | HP mini PC (x86, USB connection to phone) |
 | MQTT broker | Mosquitto (HA add-on) |
 
 ## Tested Vehicles
