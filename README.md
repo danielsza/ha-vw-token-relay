@@ -12,7 +12,7 @@ VW's North American API requires every request to carry a Play Integrity–attes
 Phone (VW app + Frida) ──USB/ADB──▸ This add-on ──MQTT──▸ Home Assistant / CarConnectivity
 ```
 
-A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `BridgeInterceptor` to capture OAuth tokens in real-time. Tokens are published to MQTT, where CarConnectivity or HA automations consume them.
+A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `BridgeInterceptor` to capture Play Integrity and OAuth tokens in real-time. Tokens are published to MQTT, where CarConnectivity or HA automations consume them.
 
 ## Requirements
 
