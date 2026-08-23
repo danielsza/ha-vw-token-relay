@@ -1,6 +1,6 @@
 # VW Token Relay — Home Assistant Add-on
 
-Captures VW myVW app OAuth tokens via Frida over USB and relays them via MQTT for [CarConnectivity](https://github.com/tillsteinbach/CarConnectivity) Play Integrity bypass.
+Captures Play Integrity tokens and OAuth credentials from the VW myVW app via Frida over USB, and relays them via MQTT for [CarConnectivity](https://github.com/tillsteinbach/CarConnectivity).
 
 ## Why this exists
 
@@ -29,8 +29,8 @@ A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `Bridge
 ## Features
 
 ### Token Relay
-- Captures OAuth access, refresh, and ID tokens from the VW app via Frida hooks
-- Publishes tokens to MQTT (`vw/token_relay`) with retain for CarConnectivity consumption
+- Captures Play Integrity tokens, OAuth access, refresh, and ID tokens from the VW app via Frida hooks
+- Publishes all tokens to MQTT (`vw/token_relay`) with retain for CarConnectivity consumption
 - 20-minute keepalive cycle wakes the app to force token refresh
 - Auto-recovers from Frida crashes, ADB disconnects, and app restarts
 
