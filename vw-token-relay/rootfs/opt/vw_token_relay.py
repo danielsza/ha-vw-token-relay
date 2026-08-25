@@ -1827,8 +1827,9 @@ class VWTokenRelay:
             self._switch_vehicle(vid)
             time.sleep(3)
 
-            # Step 2: Dismiss system dialogs
+            # Step 2: Dismiss system dialogs and VW app interstitials
             self._dismiss_system_dialogs()
+            self._dismiss_vw_interstitials()
 
             # Step 3: Find and tap "Remote start" on the dashboard
             xml = self._dump_ui_xml()
@@ -2304,6 +2305,56 @@ class VWTokenRelay:
                 break
         if dismissed_any:
             log.info("DISMISS: Cleared %d system dialog(s)", attempt + 1)
+        return dismissed_any
+
+    def _dismiss_vw_interstitials(self, xml=None, max_attempts=3):
+        """Dismiss VW app interstitial pages (maintenance notices, announcements).
+
+        These are full-screen pages within the VW app that block the vehicle
+        dashboard. They typically have a back arrow at the top and text like
+        'Scheduled App Maintenance'. Pressing BACK dismisses them.
+
+        Returns True if an interstitial was found and dismissed."""
+        dismissed_any = False
+        interstitial_keywords = [
+            "maintenance", "scheduled app", "scheduled downtime",
+            "temporarily unavailable", "service interruption",
+            "we'll be right back", "under maintenance",
+            "app update required", "planned outage",
+        ]
+        for attempt in range(max_attempts):
+            if not xml:
+                xml = self._dump_ui_xml()
+            if not xml:
+                break
+
+            import xml.etree.ElementTree as ET
+            try:
+                root = ET.fromstring(xml)
+                found_interstitial = False
+                for node in root.iter("node"):
+                    txt = node.attrib.get("text", "").lower()
+                    if any(kw in txt for kw in interstitial_keywords):
+                        log.info("VW_INTERSTITIAL: Detected interstitial text: '%s'",
+                                 node.attrib.get("text", ""))
+                        found_interstitial = True
+                        break
+                if not found_interstitial:
+                    break
+            except Exception:
+                break
+
+            # Dismiss by pressing BACK — this exits the interstitial page
+            log.info("VW_INTERSTITIAL: Pressing BACK to dismiss (attempt %d)...",
+                     attempt + 1)
+            subprocess.run(["adb", "shell", "su", "-c", "input keyevent BACK"],
+                           capture_output=True, timeout=10)
+            dismissed_any = True
+            time.sleep(3)
+            xml = None  # Force fresh dump on next iteration
+
+        if dismissed_any:
+            log.info("VW_INTERSTITIAL: Dismissed interstitial page(s)")
         return dismissed_any
 
     def _get_foreground_activity(self):
@@ -2788,7 +2839,11 @@ class VWTokenRelay:
                     time.sleep(2)
                     dismissed_this_round = True
 
-                # 5. Generic dismiss buttons (OK, Close, Continue, Skip, etc.)
+                # 5. VW app interstitials (maintenance notices, announcements)
+                elif self._dismiss_vw_interstitials(xml=xml, max_attempts=1):
+                    dismissed_this_round = True
+
+                # 6. Generic dismiss buttons (OK, Close, Continue, Skip, etc.)
                 else:
                     for dismiss_text in ["Close app", "OK", "Close", "Dismiss",
                                          "Not Now", "Continue",
