@@ -1870,7 +1870,7 @@ class VWTokenRelay:
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(8)  # Wait for dashboard to load
+                    time.sleep(15)  # Wait for dashboard to fully load Remote Start card
                 else:
                     log.warning("UI_RST: Atlas not found in Garage — "
                                 "trying with current dashboard")
@@ -1895,21 +1895,30 @@ class VWTokenRelay:
                                 "engineRunningButton", "remoteStartStopButton"]
 
             for attempt in range(5):
-                # Dismiss any crash dialogs (they appear asynchronously)
+                # Close system dialogs + ensure VW app is still foreground
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
+                    capture_output=True, timeout=10)
+                time.sleep(1)
                 self._dismiss_system_dialogs()
+
+                # Verify VW app is still in foreground
+                fg = self._get_foreground_activity()
+                if VW_PACKAGE not in (fg or ""):
+                    log.info("UI_RST: VW app lost foreground (%s) — "
+                             "relaunching", (fg or "?")[:60])
+                    self._wake_screen()
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                        capture_output=True, timeout=10)
+                    time.sleep(5)
+                    self._dismiss_system_dialogs()
+
                 self._dismiss_vw_interstitials()
 
-                if attempt == 0:
-                    # Scroll to TOP to expand collapsing toolbar
-                    # (Remote start lives in the expanded header area)
-                    # Start swipe at y=800 to avoid triggering notification shade
-                    log.info("UI_RST: Scrolling to top of dashboard...")
-                    subprocess.run(
-                        ["adb", "shell", "su", "-c",
-                         "input swipe 360 800 360 1400 300"],
-                        capture_output=True, timeout=10)
-                    time.sleep(2)
-                elif attempt >= 2:
+                if attempt >= 2:
                     # Try scrolling down in case button is below fold
                     log.info("UI_RST: Scrolling down (attempt %d)...", attempt)
                     subprocess.run(
@@ -1950,18 +1959,22 @@ class VWTokenRelay:
                     break
 
                 # Search by content-desc
-                if stop:
-                    for desc in ["Stop engine", "Remote start", "Stop",
-                                 "Engine running"]:
-                        elems = self._find_ui_elements(xml, content_desc=desc)
-                        if elems:
-                            log.info("UI_RST: Found via content_desc='%s' "
-                                     "(attempt %d)", desc, attempt)
-                            break
+                desc_list = (
+                    ["Stop engine", "Engine running", "Remote start",
+                     "Stop", "Turn off"]
+                    if stop else ["Remote start"]
+                )
+                for desc in desc_list:
+                    elems = self._find_ui_elements(xml, content_desc=desc)
+                    if elems:
+                        log.info("UI_RST: Found via content_desc='%s' "
+                                 "(attempt %d)", desc, attempt)
+                        break
                 if elems:
                     break
 
                 log.info("UI_RST: Button not found (attempt %d/5)", attempt)
+                time.sleep(3)  # Give dashboard more time to load
 
             if not elems:
                 log.error("UI_RST: Cannot find Remote start/stop button "
