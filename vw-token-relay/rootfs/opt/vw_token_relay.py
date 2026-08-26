@@ -555,6 +555,10 @@ class VWTokenRelay:
             # UI-driven remote start — drives the VW app's own buttons
             threading.Thread(target=self._ui_remote_start_flow,
                              args=(payload, False), daemon=True).start()
+        elif cmd == "ui_remote_start_dry":
+            # Dry run — navigate to bottom sheet but don't tap Start
+            threading.Thread(target=self._ui_remote_start_flow,
+                             args=(payload, False, True), daemon=True).start()
         elif cmd == "ui_remote_start_stop":
             threading.Thread(target=self._ui_remote_start_flow,
                              args=(payload, True), daemon=True).start()
@@ -1808,7 +1812,8 @@ class VWTokenRelay:
         return result_text
 
     # ── UI-driven remote start (drives the VW app's own buttons) ────
-    def _ui_remote_start_flow(self, vehicle_id, stop=False):
+    def _ui_remote_start_flow(self, vehicle_id, stop=False,
+                               dry_run=False):
         """Automate remote start/stop by driving the VW app's UI.
 
         This bypasses the captcha/API issues entirely by using the app's own
@@ -1821,6 +1826,9 @@ class VWTokenRelay:
           4. Tap "Start" (or "Stop" if stop=True)
           5. Handle device pairing dialog if it appears
           6. Wait for confirmation
+
+        If dry_run=True, stops after step 3 (verifies bottom sheet opens
+        without tapping Start — does not consume a remote start attempt).
 
         Returns True if the flow completed, False on failure.
         """
@@ -2186,6 +2194,42 @@ class VWTokenRelay:
                          len(xml))
             except Exception:
                 pass
+
+            # ── DRY RUN STOP ──
+            # If dry_run, report what we see and stop before tapping
+            # Start/Stop — this does NOT consume a remote start attempt.
+            if dry_run:
+                # Check what's on screen
+                bs_start = self._find_ui_elements(xml, text="Start")
+                bs_stop = self._find_ui_elements(xml, text="Stop")
+                bs_second = self._find_ui_elements(
+                    xml, resource_id="secondCommandTextView")
+                bs_first = self._find_ui_elements(
+                    xml, resource_id="firstCommandTextView")
+                nav_check = self._find_ui_elements(
+                    xml, resource_id="navigation_nav_graph")
+                home_check = self._find_ui_elements(
+                    xml, resource_id="home_nav_graph")
+
+                result = {
+                    "status": "dry_run_complete",
+                    "bottom_sheet_start": bool(bs_start),
+                    "bottom_sheet_stop": bool(bs_stop),
+                    "secondCommandTextView": bool(bs_second),
+                    "firstCommandTextView": bool(bs_first),
+                    "on_nav_tab": bool(
+                        nav_check and nav_check[0][3].get(
+                            "selected") == "true"),
+                    "on_home_tab": bool(
+                        home_check and home_check[0][3].get(
+                            "selected") == "true"),
+                    "xml_length": len(xml),
+                }
+                log.info("UI_RST DRY RUN: %s", json.dumps(result))
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                    json.dumps(result), retain=False)
+                return True
 
             # Check if a device pairing dialog appeared instead
             pairing_elems = self._find_ui_elements(xml, text="Accept")
