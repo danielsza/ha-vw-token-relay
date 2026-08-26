@@ -1832,31 +1832,53 @@ class VWTokenRelay:
             json.dumps({"status": f"ui_{action.lower()}_initiated"}), retain=False)
 
         try:
-            # Step 0: Wake screen + keep screen on during operation
+            # Step 0: Wake screen + keep it on + clear Media Storage crashes
             self._wake_screen()
             subprocess.run(
-                ["adb", "shell", "su", "-c", "svc power stayon usb"],
+                ["adb", "shell", "su", "-c",
+                 "settings put system screen_off_timeout 300000"],
+                capture_output=True, timeout=10)
+            # Clear Media Storage crash state (prevents recurring dialog)
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
                 capture_output=True, timeout=10)
             time.sleep(1)
 
-            # Step 1: Navigate to vehicle dashboard
-            log.info("UI_RST: Navigating to vehicle...")
-            self._switch_vehicle(vid)
-            time.sleep(3)
+            # Step 1: Navigate to Atlas dashboard directly
+            # (Skip _switch_vehicle which waits 60s for token and causes
+            # screen timeout. We only need the UI on the dashboard.)
+            log.info("UI_RST: Navigating to vehicle dashboard...")
+            self._wake_screen()
+            subprocess.run(
+                ["adb", "shell", "am", "start", "-n",
+                 f"{VW_PACKAGE}/com.vw.myVW.activities.ForcedGarageActivity"],
+                capture_output=True, timeout=10)
+            time.sleep(5)
 
-            # Step 2: Re-wake screen & ensure VW app is in foreground
-            # (_switch_vehicle can take 30-60s, screen may have timed out)
+            # Dismiss dialogs on Garage screen
+            self._dismiss_system_dialogs()
+
+            # Find and tap Atlas in the Garage
+            xml = self._dump_ui_xml()
+            if xml:
+                atlas_elems = self._find_ui_elements(xml, text="Atlas")
+                if atlas_elems:
+                    cx, cy = atlas_elems[0][0], atlas_elems[0][1]
+                    log.info("UI_RST: Tapping Atlas at (%d,%d)", cx, cy)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input tap {cx} {cy}"],
+                        capture_output=True, timeout=10)
+                    time.sleep(8)  # Wait for dashboard to load
+                else:
+                    log.warning("UI_RST: Atlas not found in Garage — "
+                                "trying with current dashboard")
+
+            # Step 2: Ensure screen is still on and VW app is foreground
             self._wake_screen()
             time.sleep(1)
-            fg = self._get_foreground_activity()
-            if VW_PACKAGE not in (fg or ""):
-                log.info("UI_RST: VW app not in foreground (%s) — "
-                         "re-navigating to vehicle", fg[:60] if fg else "?")
-                # Re-run switch_vehicle which uses Garage + tap (not RoutingActivity)
-                self._switch_vehicle(vid)
-                time.sleep(3)
-                self._wake_screen()
-                time.sleep(1)
+            self._dismiss_system_dialogs()
 
             # Step 3: Find "Remote start" button on the dashboard
             # Strategy: dismiss crash dialogs, scroll to top (expand
@@ -1880,10 +1902,11 @@ class VWTokenRelay:
                 if attempt == 0:
                     # Scroll to TOP to expand collapsing toolbar
                     # (Remote start lives in the expanded header area)
+                    # Start swipe at y=800 to avoid triggering notification shade
                     log.info("UI_RST: Scrolling to top of dashboard...")
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
-                         "input swipe 360 400 360 1200 300"],
+                         "input swipe 360 800 360 1400 300"],
                         capture_output=True, timeout=10)
                     time.sleep(2)
                 elif attempt >= 2:
