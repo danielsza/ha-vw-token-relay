@@ -1851,14 +1851,44 @@ class VWTokenRelay:
                 log.error("UI_RST: Cannot get UI XML")
                 return False
 
+            # Always take a screencap + dump clickable elements for debugging
+            self._screencap()
+            self._log_dashboard_buttons(xml)
+
             # Try resource ID first (more reliable)
             elems = self._find_ui_elements(xml, resource_id="remoteStartButton")
+            if not elems and stop:
+                # When engine is running, VW app may change resource ID
+                for rid in ["stopEngineButton", "remoteStopButton",
+                            "engineRunningButton", "remoteStartStopButton"]:
+                    elems = self._find_ui_elements(xml, resource_id=rid)
+                    if elems:
+                        log.info("UI_RST: Found stop button via resource_id=%s", rid)
+                        break
             if not elems:
-                # Fall back to text
-                elems = self._find_ui_elements(xml, text="Remote start")
+                # Fall back to text — try multiple labels
+                search_texts = (
+                    ["Stop engine", "Stop", "Engine running",
+                     "Remote start", "Turn off"]
+                    if stop else ["Remote start"]
+                )
+                for txt in search_texts:
+                    elems = self._find_ui_elements(xml, text=txt)
+                    if elems:
+                        log.info("UI_RST: Found button via text='%s'", txt)
+                        break
+            if not elems and stop:
+                # Last resort: search content-desc
+                for desc in ["Stop engine", "Remote start", "Stop",
+                             "Engine running"]:
+                    elems = self._find_ui_elements(xml, content_desc=desc)
+                    if elems:
+                        log.info("UI_RST: Found button via content_desc='%s'", desc)
+                        break
             if not elems:
-                log.error("UI_RST: Cannot find Remote start button on dashboard")
-                self._screencap()
+                log.error("UI_RST: Cannot find Remote start/stop button on dashboard")
+                # Dump full XML to logs for debugging
+                log.error("UI_RST: Full UI XML dump:\n%s", xml[:8000])
                 return False
 
             cx, cy = elems[0][0], elems[0][1]
@@ -3206,6 +3236,32 @@ class VWTokenRelay:
         results.sort(key=lambda r: (0 if r[4] else 1))
         # Strip the exact flag from results for backward compat
         return [(cx, cy, bounds, attrs) for cx, cy, bounds, attrs, _ in results]
+
+    def _log_dashboard_buttons(self, xml_str):
+        """Log all clickable/visible elements on the dashboard for debugging."""
+        import xml.etree.ElementTree as ET
+        import re
+        if not xml_str:
+            return
+        try:
+            root = ET.fromstring(xml_str)
+        except ET.ParseError:
+            return
+        log.info("UI_RST: === Dashboard elements ===")
+        for node in root.iter("node"):
+            attrs = node.attrib
+            text = attrs.get("text", "")
+            desc = attrs.get("content-desc", "")
+            rid = attrs.get("resource-id", "")
+            clickable = attrs.get("clickable", "false")
+            bounds = attrs.get("bounds", "")
+            # Log elements that have text, content-desc, or are clickable
+            if text or desc or clickable == "true":
+                log.info("  [%s] text='%s' desc='%s' rid='%s' click=%s bounds=%s",
+                         attrs.get("class", "?"), text[:60], desc[:60],
+                         rid.split("/")[-1] if "/" in rid else rid,
+                         clickable, bounds)
+        log.info("UI_RST: === End dashboard elements ===")
 
     def _tap_element(self, xml_str, desc, text=None, content_desc=None,
                      resource_id=None, class_name=None, index=0):
