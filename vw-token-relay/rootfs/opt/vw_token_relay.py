@@ -1852,25 +1852,23 @@ class VWTokenRelay:
                 ["adb", "shell", "su", "-c",
                  "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
                 capture_output=True, timeout=10)
-            # Clear Media Storage data to prevent recurring crashes
-            subprocess.run(
-                ["adb", "shell", "su", "-c",
-                 "pm clear com.android.providers.media"],
-                capture_output=True, timeout=10)
             time.sleep(1)
 
-            # Step 1: Navigate to Atlas dashboard directly
-            # (Skip _switch_vehicle which waits 60s for token and causes
-            # screen timeout. We only need the UI on the dashboard.)
+            # Step 1: Force-stop VW app for clean start, then navigate
             log.info("UI_RST: Navigating to vehicle dashboard...")
+            subprocess.run(
+                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                capture_output=True, timeout=10)
+            time.sleep(2)
             self._wake_screen()
             subprocess.run(
                 ["adb", "shell", "am", "start", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.ForcedGarageActivity"],
                 capture_output=True, timeout=10)
-            time.sleep(5)
+            time.sleep(8)
 
             # Dismiss dialogs on Garage screen
+            self._wake_screen()
             self._dismiss_system_dialogs()
 
             # Find and tap Atlas in the Garage
@@ -1884,15 +1882,18 @@ class VWTokenRelay:
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(15)  # Wait for dashboard to fully load Remote Start card
+                    time.sleep(20)  # Long wait for dashboard to fully load
                 else:
                     log.warning("UI_RST: Atlas not found in Garage — "
                                 "trying with current dashboard")
 
-            # Step 2: Ensure screen is still on and VW app is foreground
+            # Step 2: Check foreground + take diagnostic screencap
             self._wake_screen()
             time.sleep(1)
             self._dismiss_system_dialogs()
+            fg_step2 = self._get_foreground_activity()
+            log.info("UI_RST: Step 2 foreground: %s", (fg_step2 or "?")[:80])
+            self._screencap()  # Diagnostic: see what's on screen before search
 
             # Step 3: Find "Remote start" button on the dashboard
             # Strategy: dismiss crash dialogs, scroll to top (expand
