@@ -2110,13 +2110,18 @@ class VWTokenRelay:
                 time.sleep(3)
 
             # The VW app marks ALL dashboard command buttons as
-            # enabled="false" but clickable="true". This is the app's
-            # normal pattern — the buttons still respond to taps.
-            # If enabled="false", wait briefly (15s) then proceed anyway.
-            if btn_attrs.get("enabled") == "false":
+            # enabled="false" but clickable="true". A raw input tap on a
+            # disabled View doesn't reach the onClick listener — Android
+            # discards it.  Use Frida to call performClick() directly,
+            # which bypasses the enabled check and triggers the listener.
+            button_enabled = btn_attrs.get("enabled") != "false"
+
+            if not button_enabled:
                 log.info("UI_RST: Button disabled (clickable=%s) — "
-                         "waiting 15s then tapping anyway...",
+                         "waiting up to 15s for enable...",
                          btn_attrs.get("clickable"))
+
+                # Brief wait in case the button enables itself
                 for wait_i in range(3):
                     time.sleep(5)
                     xml = self._dump_ui_xml()
@@ -2125,20 +2130,40 @@ class VWTokenRelay:
                     check = self._find_ui_elements(
                         xml, resource_id="remoteStartButton")
                     if check and check[0][3].get("enabled") == "true":
-                        elems = check
-                        cx, cy = elems[0][0], elems[0][1]
+                        cx, cy = check[0][0], check[0][1]
+                        button_enabled = True
                         log.info("UI_RST: Button enabled after %ds",
                                  (wait_i + 1) * 5)
                         break
-                else:
-                    log.warning("UI_RST: Button still disabled after "
-                                "15s — tapping anyway")
 
-            log.info("UI_RST: Tapping Remote start at (%d,%d)", cx, cy)
-            subprocess.run(["adb", "shell", "su", "-c",
-                            f"input tap {cx} {cy}"],
-                           capture_output=True, timeout=10)
-            time.sleep(5)  # Wait longer for bottom sheet
+            if button_enabled:
+                # Normal tap — button is enabled
+                log.info("UI_RST: Tapping Remote start at (%d,%d)",
+                         cx, cy)
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"input tap {cx} {cy}"],
+                    capture_output=True, timeout=10)
+                time.sleep(5)
+            else:
+                # Button still disabled — use Frida performClick
+                log.warning("UI_RST: Button still disabled — "
+                            "using Frida performClick to bypass")
+                frida_ok = self._frida_click_view("remoteStartButton")
+                if frida_ok:
+                    log.info("UI_RST: Frida click dispatched — "
+                             "waiting for bottom sheet...")
+                    time.sleep(5)
+                else:
+                    # Last resort: tap anyway (unlikely to work)
+                    log.warning("UI_RST: Frida click failed — "
+                                "falling back to input tap at (%d,%d)",
+                                cx, cy)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input tap {cx} {cy}"],
+                        capture_output=True, timeout=10)
+                    time.sleep(5)
 
             # Take a screenshot for debugging
             self._screencap()
@@ -2550,6 +2575,101 @@ class VWTokenRelay:
             log.warning("WAKE: lock screen swipe failed (non-critical): %s", e)
         # NOTE: Do NOT press KEYCODE_HOME here — it sends us to the
         # launcher and kicks the VW app out of foreground!
+
+    def _frida_click_view(self, resource_id):
+        """Use Frida to programmatically click a View by resource ID.
+
+        Bypasses Android's enabled="false" check by calling
+        performClick() directly on the View object from the UI thread.
+        Returns True if the click was dispatched successfully.
+        """
+        if not self.session:
+            log.warning("FRIDA_CLICK: No Frida session — cannot click %s",
+                        resource_id)
+            return False
+
+        script_code = """
+        Java.perform(function() {
+            try {
+                var ActivityThread = Java.use('android.app.ActivityThread');
+                var app = ActivityThread.currentApplication();
+                var pkg = app.getPackageName();
+
+                // Resolve the resource ID
+                var resId = app.getResources().getIdentifier(
+                    '""" + resource_id + """', 'id', pkg);
+                if (resId === 0) {
+                    send({type: 'error',
+                          msg: 'Resource ID not found: """ + resource_id + """'});
+                    return;
+                }
+
+                // Walk all activities on the heap to find the right one
+                var clicked = false;
+                Java.choose('android.app.Activity', {
+                    onMatch: function(act) {
+                        if (clicked) return;
+                        var view = act.findViewById(resId);
+                        if (view !== null) {
+                            Java.scheduleOnMainThread(function() {
+                                // Enable the view first so performClick
+                                // dispatches to the OnClickListener
+                                view.setEnabled(true);
+                                var result = view.performClick();
+                                send({type: 'success',
+                                      msg: 'performClick returned ' + result});
+                            });
+                            clicked = true;
+                        }
+                    },
+                    onComplete: function() {
+                        if (!clicked) {
+                            send({type: 'error',
+                                  msg: 'View not found in any Activity'});
+                        }
+                    }
+                });
+            } catch (e) {
+                send({type: 'error', msg: 'Exception: ' + e.message});
+            }
+        });
+        """
+
+        result = {"done": False, "success": False, "msg": "timeout"}
+        def _on_msg(message, _data):
+            if message.get("type") == "send":
+                payload = message["payload"]
+                result["done"] = True
+                result["success"] = payload.get("type") == "success"
+                result["msg"] = payload.get("msg", "")
+
+        try:
+            click_script = self.session.create_script(script_code)
+            click_script.on("message", _on_msg)
+            click_script.load()
+
+            # Wait up to 10s for callback
+            for _ in range(20):
+                if result["done"]:
+                    break
+                time.sleep(0.5)
+
+            try:
+                click_script.unload()
+            except Exception:
+                pass
+
+            if result["success"]:
+                log.info("FRIDA_CLICK: %s → %s", resource_id, result["msg"])
+                return True
+            else:
+                log.warning("FRIDA_CLICK: %s → %s", resource_id,
+                            result["msg"])
+                return False
+        except Exception as e:
+            log.error("FRIDA_CLICK: Exception clicking %s: %s",
+                      resource_id, e)
+            return False
 
     def _dismiss_system_dialogs(self, max_attempts=3):
         """Dismiss system crash dialogs (e.g. 'Media Storage keeps stopping').
