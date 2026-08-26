@@ -1858,11 +1858,17 @@ class VWTokenRelay:
             # Frida alive and app warm)
             log.info("UI_RST: Navigating to vehicle dashboard...")
             self._wake_screen()
-            subprocess.run(
-                ["adb", "shell", "am", "start", "-n",
+            # Use -W to wait for launch completion, -S to force restart
+            # of the activity (brings app to foreground reliably)
+            am_result = subprocess.run(
+                ["adb", "shell", "am", "start", "-W", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.ForcedGarageActivity"],
-                capture_output=True, timeout=10)
-            time.sleep(8)
+                capture_output=True, timeout=30, text=True)
+            log.info("UI_RST: am start result: rc=%d stdout=%s stderr=%s",
+                     am_result.returncode,
+                     (am_result.stdout or "")[:200],
+                     (am_result.stderr or "")[:200])
+            time.sleep(5)
 
             # Check foreground right after Garage launch
             self._wake_screen()
@@ -1939,13 +1945,15 @@ class VWTokenRelay:
                     log.info("UI_RST: VW app lost foreground (%s) — "
                              "full re-navigation", (fg or "?")[:60])
                     self._wake_screen()
-                    # Use ForcedGarageActivity (not RoutingActivity) for
-                    # reliable Atlas dashboard navigation
-                    subprocess.run(
-                        ["adb", "shell", "am", "start", "-n",
+                    # Use ForcedGarageActivity with -W (wait for launch)
+                    am_re = subprocess.run(
+                        ["adb", "shell", "am", "start", "-W", "-n",
                          f"{VW_PACKAGE}/com.vw.myVW.activities."
                          "ForcedGarageActivity"],
-                        capture_output=True, timeout=10)
+                        capture_output=True, timeout=30, text=True)
+                    log.info("UI_RST: Re-nav am start: rc=%d out=%s",
+                             am_re.returncode,
+                             (am_re.stdout or "")[:200])
                     time.sleep(5)
                     self._dismiss_system_dialogs()
                     xml2 = self._dump_ui_xml()
