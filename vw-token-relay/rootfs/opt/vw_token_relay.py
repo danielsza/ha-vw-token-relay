@@ -1835,7 +1835,7 @@ class VWTokenRelay:
             # Step 0: Wake screen + keep screen on during operation
             self._wake_screen()
             subprocess.run(
-                ["adb", "shell", "svc", "power", "stayon", "usb"],
+                ["adb", "shell", "su", "-c", "svc power stayon usb"],
                 capture_output=True, timeout=10)
             time.sleep(1)
 
@@ -1858,81 +1858,93 @@ class VWTokenRelay:
                 self._wake_screen()
                 time.sleep(1)
 
-            # Step 2b: Dismiss system dialogs and VW app interstitials
-            self._dismiss_system_dialogs()
-            self._dismiss_vw_interstitials()
+            # Step 3: Find "Remote start" button on the dashboard
+            # Strategy: dismiss crash dialogs, scroll to top (expand
+            # collapsing toolbar), then search with retries.
+            elems = None
+            search_texts = (
+                ["Stop engine", "Stop", "Engine running",
+                 "Remote start", "Turn off"]
+                if stop else ["Remote start"]
+            )
+            search_rids = ["remoteStartButton"]
+            if stop:
+                search_rids += ["stopEngineButton", "remoteStopButton",
+                                "engineRunningButton", "remoteStartStopButton"]
 
-            # Step 3: Find and tap "Remote start" on the dashboard
-            xml = self._dump_ui_xml()
-            if not xml:
-                log.error("UI_RST: Cannot get UI XML")
-                return False
+            for attempt in range(5):
+                # Dismiss any crash dialogs (they appear asynchronously)
+                self._dismiss_system_dialogs()
+                self._dismiss_vw_interstitials()
 
-            # Always take a screencap + dump clickable elements for debugging
-            self._screencap()
-            self._log_dashboard_buttons(xml)
-
-            # Try resource ID first (more reliable)
-            elems = self._find_ui_elements(xml, resource_id="remoteStartButton")
-            if not elems and stop:
-                # When engine is running, VW app may change resource ID
-                for rid in ["stopEngineButton", "remoteStopButton",
-                            "engineRunningButton", "remoteStartStopButton"]:
-                    elems = self._find_ui_elements(xml, resource_id=rid)
-                    if elems:
-                        log.info("UI_RST: Found stop button via resource_id=%s", rid)
-                        break
-            if not elems:
-                # Fall back to text — try multiple labels
-                search_texts = (
-                    ["Stop engine", "Stop", "Engine running",
-                     "Remote start", "Turn off"]
-                    if stop else ["Remote start"]
-                )
-                for txt in search_texts:
-                    elems = self._find_ui_elements(xml, text=txt)
-                    if elems:
-                        log.info("UI_RST: Found button via text='%s'", txt)
-                        break
-            if not elems and stop:
-                # Last resort: search content-desc
-                for desc in ["Stop engine", "Remote start", "Stop",
-                             "Engine running"]:
-                    elems = self._find_ui_elements(xml, content_desc=desc)
-                    if elems:
-                        log.info("UI_RST: Found button via content_desc='%s'", desc)
-                        break
-            if not elems:
-                # Try scrolling down to find the button (may be off-screen)
-                for scroll_attempt in range(3):
-                    log.info("UI_RST: Button not visible — scrolling down "
-                             "(attempt %d/3)", scroll_attempt + 1)
+                if attempt == 0:
+                    # Scroll to TOP to expand collapsing toolbar
+                    # (Remote start lives in the expanded header area)
+                    log.info("UI_RST: Scrolling to top of dashboard...")
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 360 400 360 1200 300"],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                elif attempt >= 2:
+                    # Try scrolling down in case button is below fold
+                    log.info("UI_RST: Scrolling down (attempt %d)...", attempt)
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
                          "input swipe 360 900 360 400 300"],
                         capture_output=True, timeout=10)
                     time.sleep(2)
-                    xml = self._dump_ui_xml()
-                    if not xml:
-                        break
-                    # Re-check all search patterns
-                    elems = self._find_ui_elements(xml, resource_id="remoteStartButton")
-                    if not elems:
-                        for txt in (["Stop engine", "Stop", "Engine running",
-                                     "Remote start", "Turn off"]
-                                    if stop else ["Remote start"]):
-                            elems = self._find_ui_elements(xml, text=txt)
-                            if elems:
-                                log.info("UI_RST: Found button after scroll "
-                                         "via text='%s'", txt)
-                                break
+
+                xml = self._dump_ui_xml()
+                if not xml:
+                    log.error("UI_RST: Cannot get UI XML (attempt %d)", attempt)
+                    time.sleep(2)
+                    continue
+
+                # On first attempt, take screencap + log elements for debugging
+                if attempt == 0:
+                    self._screencap()
+                    self._log_dashboard_buttons(xml)
+
+                # Search by resource ID
+                for rid in search_rids:
+                    elems = self._find_ui_elements(xml, resource_id=rid)
                     if elems:
+                        log.info("UI_RST: Found button via resource_id=%s "
+                                 "(attempt %d)", rid, attempt)
                         break
+                if elems:
+                    break
+
+                # Search by text
+                for txt in search_texts:
+                    elems = self._find_ui_elements(xml, text=txt)
+                    if elems:
+                        log.info("UI_RST: Found button via text='%s' "
+                                 "(attempt %d)", txt, attempt)
+                        break
+                if elems:
+                    break
+
+                # Search by content-desc
+                if stop:
+                    for desc in ["Stop engine", "Remote start", "Stop",
+                                 "Engine running"]:
+                        elems = self._find_ui_elements(xml, content_desc=desc)
+                        if elems:
+                            log.info("UI_RST: Found via content_desc='%s' "
+                                     "(attempt %d)", desc, attempt)
+                            break
+                if elems:
+                    break
+
+                log.info("UI_RST: Button not found (attempt %d/5)", attempt)
 
             if not elems:
-                log.error("UI_RST: Cannot find Remote start/stop button on dashboard")
-                # Dump full XML to logs for debugging
-                log.error("UI_RST: Full UI XML dump:\n%s", xml[:8000])
+                log.error("UI_RST: Cannot find Remote start/stop button "
+                          "after 5 attempts")
+                log.error("UI_RST: Full UI XML dump:\n%s",
+                          (xml or "")[:8000])
                 self._screencap()
                 return False
 
