@@ -1854,12 +1854,9 @@ class VWTokenRelay:
                 capture_output=True, timeout=10)
             time.sleep(1)
 
-            # Step 1: Force-stop VW app for clean start, then navigate
+            # Step 1: Navigate to Atlas dashboard (no force-stop — keep
+            # Frida alive and app warm)
             log.info("UI_RST: Navigating to vehicle dashboard...")
-            subprocess.run(
-                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
-                capture_output=True, timeout=10)
-            time.sleep(2)
             self._wake_screen()
             subprocess.run(
                 ["adb", "shell", "am", "start", "-n",
@@ -1867,13 +1864,17 @@ class VWTokenRelay:
                 capture_output=True, timeout=10)
             time.sleep(8)
 
-            # Dismiss dialogs on Garage screen
+            # Check foreground right after Garage launch
             self._wake_screen()
+            fg_garage = self._get_foreground_activity()
+            log.info("UI_RST: After Garage launch, foreground: %s",
+                     (fg_garage or "?")[:80])
             self._dismiss_system_dialogs()
 
             # Find and tap Atlas in the Garage
             xml = self._dump_ui_xml()
             if xml:
+                self._log_dashboard_buttons(xml)
                 atlas_elems = self._find_ui_elements(xml, text="Atlas")
                 if atlas_elems:
                     cx, cy = atlas_elems[0][0], atlas_elems[0][1]
@@ -1884,8 +1885,16 @@ class VWTokenRelay:
                         capture_output=True, timeout=10)
                     time.sleep(20)  # Long wait for dashboard to fully load
                 else:
-                    log.warning("UI_RST: Atlas not found in Garage — "
-                                "trying with current dashboard")
+                    log.warning("UI_RST: Atlas not found in Garage")
+                    # Try tapping at known Atlas position anyway
+                    log.info("UI_RST: Tapping known Atlas position (342,635)")
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input tap 342 635"],
+                        capture_output=True, timeout=10)
+                    time.sleep(20)
+            else:
+                log.error("UI_RST: No UI XML from Garage screen")
 
             # Step 2: Check foreground + take diagnostic screencap
             self._wake_screen()
@@ -1893,7 +1902,7 @@ class VWTokenRelay:
             self._dismiss_system_dialogs()
             fg_step2 = self._get_foreground_activity()
             log.info("UI_RST: Step 2 foreground: %s", (fg_step2 or "?")[:80])
-            self._screencap()  # Diagnostic: see what's on screen before search
+            self._screencap()  # Diagnostic: see what's on screen
 
             # Step 3: Find "Remote start" button on the dashboard
             # Strategy: dismiss crash dialogs, scroll to top (expand
