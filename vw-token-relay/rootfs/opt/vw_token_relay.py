@@ -2093,6 +2093,34 @@ class VWTokenRelay:
                 return False
 
             cx, cy = elems[0][0], elems[0][1]
+
+            # Wait for the button to become enabled (loads disabled while
+            # the dashboard is still fetching vehicle data from VW servers)
+            btn_attrs = elems[0][3]
+            if btn_attrs.get("enabled") == "false":
+                log.info("UI_RST: Button found but disabled — waiting "
+                         "for it to enable...")
+                for wait_i in range(12):  # up to 60s
+                    time.sleep(5)
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        continue
+                    check = self._find_ui_elements(
+                        xml, resource_id="remoteStartButton")
+                    if check and check[0][3].get("enabled") == "true":
+                        elems = check
+                        cx, cy = elems[0][0], elems[0][1]
+                        log.info("UI_RST: Button enabled after %ds",
+                                 (wait_i + 1) * 5)
+                        break
+                    log.info("UI_RST: Still disabled (wait %d/12)...",
+                             wait_i + 1)
+                else:
+                    log.error("UI_RST: Button never became enabled "
+                              "after 60s")
+                    self._screencap()
+                    return False
+
             log.info("UI_RST: Tapping Remote start at (%d,%d)", cx, cy)
             subprocess.run(["adb", "shell", "su", "-c",
                             f"input tap {cx} {cy}"],
