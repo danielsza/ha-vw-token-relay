@@ -1832,8 +1832,11 @@ class VWTokenRelay:
             json.dumps({"status": f"ui_{action.lower()}_initiated"}), retain=False)
 
         try:
-            # Step 0: Wake screen
+            # Step 0: Wake screen + keep screen on during operation
             self._wake_screen()
+            subprocess.run(
+                ["adb", "shell", "svc", "power", "stayon", "usb"],
+                capture_output=True, timeout=10)
             time.sleep(1)
 
             # Step 1: Navigate to vehicle dashboard
@@ -1847,13 +1850,13 @@ class VWTokenRelay:
             time.sleep(1)
             fg = self._get_foreground_activity()
             if VW_PACKAGE not in (fg or ""):
-                log.info("UI_RST: VW app not in foreground (%s) — relaunching",
-                         fg[:60] if fg else "?")
-                subprocess.run(
-                    ["adb", "shell", "am", "start", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                    capture_output=True, timeout=10)
-                time.sleep(5)
+                log.info("UI_RST: VW app not in foreground (%s) — "
+                         "re-navigating to vehicle", fg[:60] if fg else "?")
+                # Re-run switch_vehicle which uses Garage + tap (not RoutingActivity)
+                self._switch_vehicle(vid)
+                time.sleep(3)
+                self._wake_screen()
+                time.sleep(1)
 
             # Step 2b: Dismiss system dialogs and VW app interstitials
             self._dismiss_system_dialogs()
@@ -1900,9 +1903,37 @@ class VWTokenRelay:
                         log.info("UI_RST: Found button via content_desc='%s'", desc)
                         break
             if not elems:
+                # Try scrolling down to find the button (may be off-screen)
+                for scroll_attempt in range(3):
+                    log.info("UI_RST: Button not visible — scrolling down "
+                             "(attempt %d/3)", scroll_attempt + 1)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 360 900 360 400 300"],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        break
+                    # Re-check all search patterns
+                    elems = self._find_ui_elements(xml, resource_id="remoteStartButton")
+                    if not elems:
+                        for txt in (["Stop engine", "Stop", "Engine running",
+                                     "Remote start", "Turn off"]
+                                    if stop else ["Remote start"]):
+                            elems = self._find_ui_elements(xml, text=txt)
+                            if elems:
+                                log.info("UI_RST: Found button after scroll "
+                                         "via text='%s'", txt)
+                                break
+                    if elems:
+                        break
+
+            if not elems:
                 log.error("UI_RST: Cannot find Remote start/stop button on dashboard")
                 # Dump full XML to logs for debugging
                 log.error("UI_RST: Full UI XML dump:\n%s", xml[:8000])
+                self._screencap()
                 return False
 
             cx, cy = elems[0][0], elems[0][1]
