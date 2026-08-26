@@ -4036,6 +4036,50 @@ class VWTokenRelay:
             )
 
     # ── Frida connection ────────────────────────────────────────────
+    def _ensure_frida_server(self):
+        """Make sure frida-server is running on the phone. Restart via ADB if not."""
+        try:
+            check = subprocess.run(
+                ["adb", "shell", "su", "-c", "pidof frida-server"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if check.returncode == 0 and check.stdout.strip():
+                log.debug("FRIDA_SERVER: already running (pid %s)", check.stdout.strip())
+                return True
+        except Exception as e:
+            log.warning("FRIDA_SERVER: pidof check failed: %s", e)
+
+        log.info("FRIDA_SERVER: Not running — restarting via ADB...")
+        # Kill any stale process first
+        subprocess.run(
+            ["adb", "shell", "su", "-c", "killall frida-server"],
+            capture_output=True, timeout=10,
+        )
+        time.sleep(1)
+        # Start fresh
+        try:
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 "/data/local/tmp/frida-server -D &"],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(3)  # Give it a moment to bind
+            # Verify it started
+            verify = subprocess.run(
+                ["adb", "shell", "su", "-c", "pidof frida-server"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if verify.returncode == 0 and verify.stdout.strip():
+                log.info("FRIDA_SERVER: Restarted successfully (pid %s)",
+                         verify.stdout.strip())
+                return True
+            else:
+                log.error("FRIDA_SERVER: Failed to start")
+                return False
+        except Exception as e:
+            log.error("FRIDA_SERVER: Restart error: %s", e)
+            return False
+
     def _attach_frida(self):
         """Attach to the VW app via USB."""
         log.info("Looking for USB device...")
@@ -4082,19 +4126,34 @@ class VWTokenRelay:
         return True
 
     def _on_detached(self, reason, crash):
-        log.warning("Frida detached: %s", reason)
+        log.warning("Frida detached: reason=%s crash=%s", reason, crash)
         if not self._running:
             return
-        # Auto-reattach loop
-        for attempt in range(5):
-            log.info("Reattach attempt %d/5 in 10s...", attempt + 1)
-            time.sleep(10)
+
+        self.session = None
+        self.script = None
+
+        # Escalating backoff: 10,10,15,15,20,20,30,30,30,30,30,30 = ~270s total
+        delays = [10, 10, 15, 15, 20, 20, 30, 30, 30, 30, 30, 30]
+
+        for attempt, delay in enumerate(delays, 1):
+            log.info("Reattach attempt %d/%d in %ds...", attempt, len(delays), delay)
+            time.sleep(delay)
+            if not self._running:
+                return
             try:
+                # Ensure frida-server is running (critical after phone reboot)
+                self._ensure_frida_server()
                 if self._attach_frida():
+                    log.info("Frida reattached successfully on attempt %d", attempt)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/status", "connected", retain=True)
                     return
             except Exception as e:
-                log.error("Reattach failed: %s", e)
-        log.error("Gave up reattaching. Publish MQTT offline.")
+                log.error("Reattach attempt %d failed: %s", attempt, e)
+
+        log.error("Frida reattach exhausted (%d attempts). "
+                  "Keepalive loop will continue retrying.", len(delays))
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/status", "error", retain=True)
 
     # ── Auto re-login ──────────────────────────────────────────────
@@ -4138,6 +4197,24 @@ class VWTokenRelay:
 
         while self._running:
             time.sleep(1200)  # 20 minutes
+
+            # ── Frida health check (safety net) ──
+            if self.session is None or self.script is None:
+                log.warning("KEEPALIVE: Frida session/script is gone — "
+                            "attempting recovery...")
+                try:
+                    self._ensure_frida_server()
+                    if self._attach_frida():
+                        log.info("KEEPALIVE: Frida recovered successfully")
+                        self.mqttc.publish(
+                            f"{MQTT_TOPIC_PREFIX}/status",
+                            "connected", retain=True)
+                    else:
+                        log.error("KEEPALIVE: Frida recovery failed — "
+                                  "will retry next cycle")
+                except Exception as e:
+                    log.error("KEEPALIVE: Frida recovery error: %s", e)
+
             with self._lock:
                 needs_refresh = False
                 all_expired = True
