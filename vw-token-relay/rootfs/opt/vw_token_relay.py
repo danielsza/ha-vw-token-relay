@@ -2154,24 +2154,34 @@ class VWTokenRelay:
                     capture_output=True, timeout=10)
                 time.sleep(5)
             else:
-                # Button still disabled — use Frida performClick
-                log.warning("UI_RST: Button still disabled — "
-                            "using Frida performClick to bypass")
-                frida_ok = self._frida_click_view("remoteStartButton")
-                if frida_ok:
-                    log.info("UI_RST: Frida click dispatched — "
-                             "waiting for bottom sheet...")
+                # Button still disabled — try direct NavController
+                # navigation to the remote start destination, bypassing
+                # the button's disabled-state routing to Car Finder.
+                log.warning("UI_RST: Button disabled — trying "
+                            "NavController direct navigation")
+                nav_ok = self._frida_navigate_to("remote")
+                if nav_ok:
+                    log.info("UI_RST: NavController navigation dispatched"
+                             " — waiting for screen...")
                     time.sleep(5)
                 else:
-                    # Last resort: tap anyway (unlikely to work)
-                    log.warning("UI_RST: Frida click failed — "
-                                "falling back to input tap at (%d,%d)",
-                                cx, cy)
-                    subprocess.run(
-                        ["adb", "shell", "su", "-c",
-                         f"input tap {cx} {cy}"],
-                        capture_output=True, timeout=10)
-                    time.sleep(5)
+                    # Fallback: Frida performClick (may go to Car Finder)
+                    log.warning("UI_RST: NavController failed — "
+                                "trying Frida performClick")
+                    frida_ok = self._frida_click_view("remoteStartButton")
+                    if frida_ok:
+                        log.info("UI_RST: Frida click dispatched — "
+                                 "waiting for bottom sheet...")
+                        time.sleep(5)
+                    else:
+                        log.warning("UI_RST: All Frida methods failed — "
+                                    "falling back to input tap at (%d,%d)",
+                                    cx, cy)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input tap {cx} {cy}"],
+                            capture_output=True, timeout=10)
+                        time.sleep(5)
 
             # Take a screenshot for debugging
             self._screencap()
@@ -2713,6 +2723,157 @@ class VWTokenRelay:
         except Exception as e:
             log.error("FRIDA_CLICK: Exception clicking %s: %s",
                       resource_id, e)
+            return False
+
+    def _frida_navigate_to(self, dest_name_hint):
+        """Use Frida to navigate via NavController to a destination.
+
+        Enumerates the NavController's graph destinations and navigates
+        to the first one whose label or class name contains dest_name_hint
+        (case-insensitive). This bypasses any button enabled/disabled state.
+
+        Returns True if navigation was dispatched, False on error.
+        """
+        if not self.session:
+            log.warning("FRIDA_NAV: No Frida session")
+            return False
+
+        hint_lower = dest_name_hint.lower()
+        script_code = """
+        Java.perform(function() {
+            try {
+                var ActivityThread = Java.use('android.app.ActivityThread');
+                var app = ActivityThread.currentApplication();
+                var pkg = app.getPackageName();
+
+                // Find mainNavHostFragment resource ID
+                var hostId = app.getResources().getIdentifier(
+                    'mainNavHostFragment', 'id', pkg);
+
+                Java.choose('androidx.fragment.app.FragmentActivity', {
+                    onMatch: function(activity) {
+                        try {
+                            var fm = activity.getSupportFragmentManager();
+                            var navHostFrag = fm.findFragmentById(hostId);
+                            if (!navHostFrag) {
+                                send({type: 'error',
+                                      msg: 'NavHostFragment not found'});
+                                return;
+                            }
+
+                            var NavHostFragment = Java.use(
+                                'androidx.navigation.fragment.NavHostFragment');
+                            var navController = NavHostFragment
+                                .findNavController(navHostFrag);
+                            var graph = navController.getGraph();
+
+                            // Enumerate all destinations
+                            var iter = graph.iterator();
+                            var destinations = [];
+                            var targetId = 0;
+                            var targetLabel = '';
+
+                            while (iter.hasNext()) {
+                                var dest = iter.next();
+                                var label = dest.getLabel();
+                                var id = dest.getId();
+                                var cls = dest.getClass().getName();
+                                var labelStr = label ? label.toString() : '';
+                                destinations.push({
+                                    id: id,
+                                    label: labelStr,
+                                    cls: cls
+                                });
+
+                                // Check if this matches our hint
+                                var combined = (labelStr + ' ' + cls)
+                                    .toLowerCase();
+                                if (combined.indexOf('""" + hint_lower + """') >= 0
+                                    && targetId === 0) {
+                                    targetId = id;
+                                    targetLabel = labelStr || cls;
+                                }
+                            }
+
+                            send({type: 'destinations',
+                                  msg: JSON.stringify(destinations)});
+
+                            if (targetId !== 0) {
+                                Java.scheduleOnMainThread(function() {
+                                    try {
+                                        navController.navigate(targetId);
+                                        send({type: 'success',
+                                              msg: 'Navigated to ' +
+                                                   targetLabel +
+                                                   ' (id=' + targetId + ')'});
+                                    } catch(e) {
+                                        send({type: 'error',
+                                              msg: 'navigate() failed: ' +
+                                                   e.message});
+                                    }
+                                });
+                            } else {
+                                send({type: 'not_found',
+                                      msg: 'No destination matching hint'});
+                            }
+                        } catch(e) {
+                            send({type: 'error',
+                                  msg: 'Activity processing error: ' +
+                                       e.message});
+                        }
+                    },
+                    onComplete: function() {}
+                });
+            } catch(e) {
+                send({type: 'error', msg: 'Exception: ' + e.message});
+            }
+        });
+        """
+
+        results = {"done": False, "success": False, "msg": "timeout",
+                    "destinations": None}
+
+        def _on_msg(message, _data):
+            if message.get("type") != "send":
+                return
+            payload = message["payload"]
+            ptype = payload.get("type", "")
+            if ptype == "destinations":
+                results["destinations"] = payload.get("msg", "")
+                log.info("FRIDA_NAV: destinations: %s",
+                         results["destinations"][:500])
+            elif ptype == "success":
+                results["done"] = True
+                results["success"] = True
+                results["msg"] = payload.get("msg", "")
+            elif ptype in ("error", "not_found"):
+                results["done"] = True
+                results["success"] = False
+                results["msg"] = payload.get("msg", "")
+
+        try:
+            nav_script = self.session.create_script(script_code)
+            nav_script.on("message", _on_msg)
+            nav_script.load()
+
+            for _ in range(30):  # 15s
+                if results["done"]:
+                    break
+                time.sleep(0.5)
+
+            try:
+                nav_script.unload()
+            except Exception:
+                pass
+
+            if results["success"]:
+                log.info("FRIDA_NAV: %s", results["msg"])
+                return True
+            else:
+                log.warning("FRIDA_NAV: %s", results["msg"])
+                return False
+        except Exception as e:
+            log.error("FRIDA_NAV: Exception: %s", e)
             return False
 
     def _dismiss_system_dialogs(self, max_attempts=3):
