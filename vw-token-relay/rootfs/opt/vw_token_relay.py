@@ -867,6 +867,20 @@ class VWTokenRelay:
                     time.sleep(30)
                     continue
                 if e.code in (401, 403) and allow_pif_fix:
+                    # Only escalate to PIF fix if this looks like a PI/token issue,
+                    # NOT a legitimate authorization error (wrong vehicle scope, etc.)
+                    skip_pif_reasons = [
+                        "USER_NOT_AUTHORIZED",
+                        "VEHICLE_NOT_FOUND",
+                        "SUBSCRIPTION_EXPIRED",
+                        "FEATURE_NOT_AVAILABLE",
+                        "NOT_AUTHORIZED",
+                    ]
+                    if any(reason in err for reason in skip_pif_reasons):
+                        log.info("API %d is authorization-level (not PI) — skipping PIF fix. Body: %s",
+                                 e.code, err[:200])
+                        return None, {"error": f"http_{e.code}", "url": url, "body": err[:500],
+                                      "code": e.code, "msg": "Authorization error (not PI-related)"}
                     # Level 2: PIF fix for persistent auth failure
                     log.warning("API %d persists after wake — attempting PIF fix + reboot...", e.code)
                     result = self._pif_fix_and_retry(method, url, body, vid, timeout)
