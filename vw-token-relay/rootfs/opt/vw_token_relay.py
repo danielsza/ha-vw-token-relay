@@ -1990,8 +1990,26 @@ class VWTokenRelay:
 
                 self._dismiss_vw_interstitials()
 
-                if attempt >= 2:
-                    # Try scrolling down in case button is below fold
+                # Scroll UP to expand the collapsing AppBar toolbar.
+                # The Remote Start button is in homeCommandsView which
+                # gets compressed to 36px when the toolbar is collapsed.
+                # Swipe DOWN on screen = scroll content UP = expand toolbar.
+                log.info("UI_RST: Scrolling up to expand toolbar "
+                         "(attempt %d)...", attempt)
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input swipe 360 300 360 1000 500"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+                # Do it twice for good measure (slow phone)
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input swipe 360 300 360 1000 500"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+
+                if attempt >= 3:
+                    # On later attempts, try scrolling down instead
                     log.info("UI_RST: Scrolling down (attempt %d)...", attempt)
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
