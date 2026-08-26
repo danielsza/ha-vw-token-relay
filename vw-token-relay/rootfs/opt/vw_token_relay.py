@@ -549,6 +549,11 @@ class VWTokenRelay:
             self._api_climate(payload, start=False)
         elif cmd == "remote_start":
             threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
+        elif cmd == "remote_start_dry":
+            # API dry run — runs Steps 0-4 (challenge, session, captcha, check)
+            # but stops BEFORE Step 5 (POST /rst). Safe — does NOT consume a
+            # remote start attempt.  Reports whether the API path works.
+            threading.Thread(target=self._api_remote_start, args=(payload, True), daemon=True).start()
         elif cmd == "remote_start_stop":
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
         elif cmd == "ui_remote_start":
@@ -1287,7 +1292,7 @@ class VWTokenRelay:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/pairing",
                 json.dumps({"error": "no_pairing_found"}), retain=False)
 
-    def _api_remote_start(self, vehicle_id):
+    def _api_remote_start(self, vehicle_id, dry_run=False):
         """Execute remote start for an ICE vehicle.
 
         Flow (reverse-engineered from myVW APK):
@@ -1301,6 +1306,10 @@ class VWTokenRelay:
           7. POST /rst/v1/vehicle/{vid}
              body: {pairingId, rstPinHash, encryptedPayload, roToken, dataToSign}
           8. Poll /history/v1/vehicle/{vid}/correlationId/{cid}/ro/ for result
+
+        If dry_run=True, stops after Step 4 and reports results without
+        sending the actual remote start command (Step 5).  Safe to call
+        — does NOT consume a remote start attempt.
         """
         vid = vehicle_id.strip()
 
@@ -1311,7 +1320,7 @@ class VWTokenRelay:
             log.warning("RST: Another remote start is already in progress — ignoring")
             return
         try:
-            self._api_remote_start_inner(vid)
+            self._api_remote_start_inner(vid, dry_run=dry_run)
         finally:
             self._rst_lock.release()
 
@@ -1335,7 +1344,7 @@ class VWTokenRelay:
         except Exception as e:
             return None, {"error": "exception", "msg": str(e)}
 
-    def _api_remote_start_inner(self, vid):
+    def _api_remote_start_inner(self, vid, dry_run=False):
         """Inner RST logic — 5-step two-challenge flow for ATC/ICE vehicles.
 
         Flow (from DEV_NOTES_REMOTE_START.md):
@@ -1345,8 +1354,11 @@ class VWTokenRelay:
           3. GET challenge2 (challenges are single-use!)
           4. POST /ss/.../climateControl/check with {spinHash} using carnetVehicleToken → roToken
           5. POST /rst/v1/vehicle/{vid} with {roToken} using carnetVehicleToken
+
+        If dry_run=True, stops after Step 4 and publishes diagnostic results.
         """
-        log.info("═══ REMOTE START ═══ vehicle=%s", vid)
+        mode = "DRY RUN" if dry_run else "REMOTE START"
+        log.info("═══ %s ═══ vehicle=%s", mode, vid)
 
         if not self.vw_spin:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
@@ -1570,10 +1582,33 @@ class VWTokenRelay:
                     break
 
         if not ro_token:
+            if dry_run:
+                log.info("═══ DRY RUN COMPLETE ═══ No roToken obtained — API may be blocked by maintenance")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                    json.dumps({
+                        "dry_run": True,
+                        "status": "no_roToken",
+                        "msg": "Steps 0-4 completed but no roToken — API may be blocked by maintenance",
+                        "has_atc_token": bool(atc_token),
+                    }), retain=False)
+                return
             # Proceed anyway with empty roToken — the server response will
             # tell us whether it's truly required or not.
             log.warning("RST: No roToken obtained — proceeding with empty roToken to test server response...")
             ro_token = ""
+
+        if dry_run:
+            log.info("═══ DRY RUN COMPLETE ═══ Got roToken (%d chars) — API path works!", len(ro_token))
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                json.dumps({
+                    "dry_run": True,
+                    "status": "ready",
+                    "msg": "Steps 0-4 succeeded — roToken obtained. API path works. Safe to run full remote_start.",
+                    "has_atc_token": True,
+                    "has_ro_token": True,
+                    "ro_token_len": len(ro_token),
+                }), retain=False)
+            return
 
         # ── Step 5: POST /rst/v1/vehicle/{vid} ──
         # MUST use carnetVehicleToken as Bearer
