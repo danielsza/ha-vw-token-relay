@@ -1841,7 +1841,21 @@ class VWTokenRelay:
             self._switch_vehicle(vid)
             time.sleep(3)
 
-            # Step 2: Dismiss system dialogs and VW app interstitials
+            # Step 2: Re-wake screen & ensure VW app is in foreground
+            # (_switch_vehicle can take 30-60s, screen may have timed out)
+            self._wake_screen()
+            time.sleep(1)
+            fg = self._get_foreground_activity()
+            if VW_PACKAGE not in (fg or ""):
+                log.info("UI_RST: VW app not in foreground (%s) — relaunching",
+                         fg[:60] if fg else "?")
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=10)
+                time.sleep(5)
+
+            # Step 2b: Dismiss system dialogs and VW app interstitials
             self._dismiss_system_dialogs()
             self._dismiss_vw_interstitials()
 
