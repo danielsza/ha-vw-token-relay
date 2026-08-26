@@ -2093,14 +2093,31 @@ class VWTokenRelay:
                 return False
 
             cx, cy = elems[0][0], elems[0][1]
-
-            # Wait for the button to become enabled (loads disabled while
-            # the dashboard is still fetching vehicle data from VW servers)
             btn_attrs = elems[0][3]
+
+            # Dismiss the "Scheduled App Maintenance" carousel banner
+            # if present — it may be blocking button enablement.
+            maint_close = self._find_ui_elements(
+                xml, resource_id="closeButton")
+            if maint_close:
+                mcx, mcy = maint_close[0][0], maint_close[0][1]
+                log.info("UI_RST: Dismissing maintenance banner "
+                         "at (%d,%d)", mcx, mcy)
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"input tap {mcx} {mcy}"],
+                    capture_output=True, timeout=10)
+                time.sleep(3)
+
+            # The VW app marks ALL dashboard command buttons as
+            # enabled="false" but clickable="true". This is the app's
+            # normal pattern — the buttons still respond to taps.
+            # If enabled="false", wait briefly (15s) then proceed anyway.
             if btn_attrs.get("enabled") == "false":
-                log.info("UI_RST: Button found but disabled — waiting "
-                         "for it to enable...")
-                for wait_i in range(12):  # up to 60s
+                log.info("UI_RST: Button disabled (clickable=%s) — "
+                         "waiting 15s then tapping anyway...",
+                         btn_attrs.get("clickable"))
+                for wait_i in range(3):
                     time.sleep(5)
                     xml = self._dump_ui_xml()
                     if not xml:
@@ -2113,19 +2130,18 @@ class VWTokenRelay:
                         log.info("UI_RST: Button enabled after %ds",
                                  (wait_i + 1) * 5)
                         break
-                    log.info("UI_RST: Still disabled (wait %d/12)...",
-                             wait_i + 1)
                 else:
-                    log.error("UI_RST: Button never became enabled "
-                              "after 60s")
-                    self._screencap()
-                    return False
+                    log.warning("UI_RST: Button still disabled after "
+                                "15s — tapping anyway")
 
             log.info("UI_RST: Tapping Remote start at (%d,%d)", cx, cy)
             subprocess.run(["adb", "shell", "su", "-c",
                             f"input tap {cx} {cy}"],
                            capture_output=True, timeout=10)
-            time.sleep(3)
+            time.sleep(5)  # Wait longer for bottom sheet
+
+            # Take a screenshot for debugging
+            self._screencap()
 
             # Step 4: Dismiss any system dialog that appeared
             self._dismiss_system_dialogs()
@@ -2133,8 +2149,18 @@ class VWTokenRelay:
             # Step 5: Look for the bottom sheet with Start/Stop buttons
             xml = self._dump_ui_xml()
             if not xml:
-                log.error("UI_RST: Cannot get UI XML after tapping Remote start")
+                log.error("UI_RST: Cannot get UI XML after tapping "
+                          "Remote start")
                 return False
+
+            # Save post-tap XML for debugging
+            try:
+                with open("/share/debug_post_tap_xml.txt", "w") as f:
+                    f.write(xml)
+                log.info("UI_RST: Saved post-tap XML (%d bytes)",
+                         len(xml))
+            except Exception:
+                pass
 
             # Check if a device pairing dialog appeared instead
             pairing_elems = self._find_ui_elements(xml, text="Accept")
