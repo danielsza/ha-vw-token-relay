@@ -1923,6 +1923,46 @@ class VWTokenRelay:
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
+            # Step 1.5: Ensure we're on the Home tab (not Navigation/
+            # Car Finder). The VW app remembers the last-viewed tab —
+            # if a previous run left us on the Navigation tab, the
+            # dashboard buttons won't be visible.
+            xml = self._dump_ui_xml()
+            if xml:
+                nav_tab = self._find_ui_elements(
+                    xml, resource_id="navigation_nav_graph")
+                home_tab = self._find_ui_elements(
+                    xml, resource_id="home_nav_graph")
+                if nav_tab and nav_tab[0][3].get("selected") == "true":
+                    log.info("UI_RST: On Navigation tab — switching "
+                             "to Home tab")
+                    if home_tab:
+                        hx, hy = home_tab[0][0], home_tab[0][1]
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input tap {hx} {hy}"],
+                            capture_output=True, timeout=10)
+                        time.sleep(3)
+                    else:
+                        # Fallback: tap known Home tab position
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input tap 72 1460"],
+                            capture_output=True, timeout=10)
+                        time.sleep(3)
+                elif home_tab and home_tab[0][3].get(
+                        "selected") == "true":
+                    log.info("UI_RST: Already on Home tab")
+                else:
+                    # Not sure which tab — tap Home anyway
+                    log.info("UI_RST: Unknown tab state — tapping "
+                             "Home tab at (72,1460)")
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input tap 72 1460"],
+                        capture_output=True, timeout=10)
+                    time.sleep(3)
+
             # Step 2: Check foreground + take diagnostic screencap
             self._wake_screen()
             time.sleep(1)
