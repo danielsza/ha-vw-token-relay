@@ -1836,12 +1836,26 @@ class VWTokenRelay:
             self._wake_screen()
             subprocess.run(
                 ["adb", "shell", "su", "-c",
+                 "svc power stayon usb"],
+                capture_output=True, timeout=10)
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
                  "settings put system screen_off_timeout 300000"],
+                capture_output=True, timeout=10)
+            # Dismiss keyguard (lock screen) if present
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 "wm dismiss-keyguard"],
                 capture_output=True, timeout=10)
             # Clear Media Storage crash state (prevents recurring dialog)
             subprocess.run(
                 ["adb", "shell", "su", "-c",
                  "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
+                capture_output=True, timeout=10)
+            # Clear Media Storage data to prevent recurring crashes
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 "pm clear com.android.providers.media"],
                 capture_output=True, timeout=10)
             time.sleep(1)
 
@@ -1895,7 +1909,13 @@ class VWTokenRelay:
                                 "engineRunningButton", "remoteStartStopButton"]
 
             for attempt in range(5):
-                # Close system dialogs + ensure VW app is still foreground
+                # Wake screen + dismiss keyguard before every attempt
+                self._wake_screen()
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "wm dismiss-keyguard"],
+                    capture_output=True, timeout=10)
+                # Close system dialogs
                 subprocess.run(
                     ["adb", "shell", "su", "-c",
                      "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
@@ -1907,13 +1927,30 @@ class VWTokenRelay:
                 fg = self._get_foreground_activity()
                 if VW_PACKAGE not in (fg or ""):
                     log.info("UI_RST: VW app lost foreground (%s) — "
-                             "relaunching", (fg or "?")[:60])
+                             "full re-navigation", (fg or "?")[:60])
                     self._wake_screen()
+                    # Use ForcedGarageActivity (not RoutingActivity) for
+                    # reliable Atlas dashboard navigation
                     subprocess.run(
                         ["adb", "shell", "am", "start", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                         f"{VW_PACKAGE}/com.vw.myVW.activities."
+                         "ForcedGarageActivity"],
                         capture_output=True, timeout=10)
                     time.sleep(5)
+                    self._dismiss_system_dialogs()
+                    xml2 = self._dump_ui_xml()
+                    if xml2:
+                        atlas2 = self._find_ui_elements(xml2, text="Atlas")
+                        if atlas2:
+                            cx2, cy2 = atlas2[0][0], atlas2[0][1]
+                            log.info("UI_RST: Re-tapping Atlas at (%d,%d)",
+                                     cx2, cy2)
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {cx2} {cy2}"],
+                                capture_output=True, timeout=10)
+                            time.sleep(15)
+                    self._wake_screen()
                     self._dismiss_system_dialogs()
 
                 self._dismiss_vw_interstitials()
