@@ -1988,9 +1988,11 @@ class VWTokenRelay:
                     time.sleep(2)
                     continue
 
-                # On first attempt, take screencap + log elements for debugging
+                # On first attempt, take screencap + log full XML for debugging
                 if attempt == 0:
                     self._screencap()
+                    log.info("UI_RST: Raw XML (first 4000 chars):\n%s",
+                             xml[:4000])
                     self._log_dashboard_buttons(xml)
 
                 # Search by resource ID
