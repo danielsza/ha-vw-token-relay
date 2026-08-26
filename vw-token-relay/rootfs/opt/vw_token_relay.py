@@ -2441,15 +2441,8 @@ class VWTokenRelay:
             time.sleep(1)
         except Exception as e:
             log.warning("WAKE: lock screen swipe failed (non-critical): %s", e)
-        # Press HOME to dismiss any lingering lock screen overlay
-        try:
-            subprocess.run(
-                ["adb", "shell", "su", "-c", "input keyevent KEYCODE_HOME"],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(1)
-        except Exception:
-            pass
+        # NOTE: Do NOT press KEYCODE_HOME here — it sends us to the
+        # launcher and kicks the VW app out of foreground!
 
     def _dismiss_system_dialogs(self, max_attempts=3):
         """Dismiss system crash dialogs (e.g. 'Media Storage keeps stopping').
