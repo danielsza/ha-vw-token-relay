@@ -1847,11 +1847,24 @@ class VWTokenRelay:
                 ["adb", "shell", "su", "-c",
                  "wm dismiss-keyguard"],
                 capture_output=True, timeout=10)
-            # Clear Media Storage crash state (prevents recurring dialog)
-            subprocess.run(
-                ["adb", "shell", "su", "-c",
-                 "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
-                capture_output=True, timeout=10)
+            # Clear Media Storage crash state permanently (user-requested)
+            try:
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "pm clear com.android.providers.media"],
+                    capture_output=True, timeout=15)
+                log.info("UI_RST: Cleared Media Storage data/cache")
+            except Exception as e:
+                log.warning("UI_RST: pm clear Media Storage failed: %s", e)
+            # Dismiss any crash/system dialogs
+            try:
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
+                    capture_output=True, timeout=10)
+            except subprocess.TimeoutExpired:
+                log.warning("UI_RST: CLOSE_SYSTEM_DIALOGS timed out "
+                            "(non-critical)")
             time.sleep(1)
 
             # Step 1: Navigate to Atlas dashboard (no force-stop — keep
@@ -1889,7 +1902,7 @@ class VWTokenRelay:
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(20)  # Long wait for dashboard to fully load
+                    time.sleep(30)  # Long wait for dashboard to fully load
                 else:
                     log.warning("UI_RST: Atlas not found in Garage")
                     # Try tapping at known Atlas position anyway
@@ -1898,7 +1911,7 @@ class VWTokenRelay:
                         ["adb", "shell", "su", "-c",
                          "input tap 342 635"],
                         capture_output=True, timeout=10)
-                    time.sleep(20)
+                    time.sleep(30)
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
@@ -1931,11 +1944,15 @@ class VWTokenRelay:
                     ["adb", "shell", "su", "-c",
                      "wm dismiss-keyguard"],
                     capture_output=True, timeout=10)
-                # Close system dialogs
-                subprocess.run(
-                    ["adb", "shell", "su", "-c",
-                     "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
-                    capture_output=True, timeout=10)
+                # Close system dialogs (best-effort, can timeout on slow phone)
+                try:
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS"],
+                        capture_output=True, timeout=10)
+                except subprocess.TimeoutExpired:
+                    log.warning("UI_RST: CLOSE_SYSTEM_DIALOGS timed out "
+                                "(non-critical)")
                 time.sleep(1)
                 self._dismiss_system_dialogs()
 
@@ -1988,11 +2005,27 @@ class VWTokenRelay:
                     time.sleep(2)
                     continue
 
-                # On first attempt, take screencap + log full XML for debugging
+                # On every attempt, save XML for debugging
+                try:
+                    with open(f"/share/debug_xml_attempt{attempt}.txt",
+                              "w") as f:
+                        f.write(xml)
+                    log.info("UI_RST: Saved XML (%d bytes) to "
+                             "/share/debug_xml_attempt%d.txt",
+                             len(xml), attempt)
+                except Exception:
+                    pass
+
+                # Take screencap + copy with attempt number for debugging
+                self._screencap()
+                try:
+                    import shutil
+                    shutil.copy2("/share/vw_screen.png",
+                                 f"/share/debug_screen_attempt{attempt}.png")
+                except Exception:
+                    pass
+
                 if attempt == 0:
-                    self._screencap()
-                    log.info("UI_RST: Raw XML (first 4000 chars):\n%s",
-                             xml[:4000])
                     self._log_dashboard_buttons(xml)
 
                 # Search by resource ID
