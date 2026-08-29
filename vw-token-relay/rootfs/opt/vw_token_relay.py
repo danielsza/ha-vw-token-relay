@@ -1962,17 +1962,31 @@ class VWTokenRelay:
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
-            # Step 1.5: Ensure we're on the Home tab (not Navigation/
+            # Step 1.5a: Dismiss any VW alert dialogs (e.g. "Vehicle
+            # Location Unknown") that may have appeared after tapping
+            # Atlas. These block the dashboard and hide all buttons
+            # from uiautomator.
+            self._dismiss_vw_alert_dialogs()
+            self._dismiss_system_dialogs()
+
+            # Step 1.5b: Ensure we're on the Home tab (not Navigation/
             # Car Finder). The VW app remembers the last-viewed tab —
             # if a previous run left us on the Navigation tab, the
             # dashboard buttons won't be visible.
+            # NOTE: The active tab has clickable="false" (can't click
+            # what's already selected). The selected= attribute is
+            # always "false" for all nav items, so we use clickable.
             xml = self._dump_ui_xml()
             if xml:
                 nav_tab = self._find_ui_elements(
                     xml, resource_id="navigation_nav_graph")
                 home_tab = self._find_ui_elements(
                     xml, resource_id="home_nav_graph")
-                if nav_tab and nav_tab[0][3].get("selected") == "true":
+                nav_is_active = (nav_tab and
+                                 nav_tab[0][3].get("clickable") == "false")
+                home_is_active = (home_tab and
+                                  home_tab[0][3].get("clickable") == "false")
+                if nav_is_active:
                     log.info("UI_RST: On Navigation tab — switching "
                              "to Home tab")
                     if home_tab:
@@ -1981,16 +1995,17 @@ class VWTokenRelay:
                             ["adb", "shell", "su", "-c",
                              f"input tap {hx} {hy}"],
                             capture_output=True, timeout=10)
-                        time.sleep(3)
+                        time.sleep(5)
                     else:
                         # Fallback: tap known Home tab position
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
                              "input tap 72 1460"],
                             capture_output=True, timeout=10)
-                        time.sleep(3)
-                elif home_tab and home_tab[0][3].get(
-                        "selected") == "true":
+                        time.sleep(5)
+                    # After switching tabs, dismiss any new dialogs
+                    self._dismiss_vw_alert_dialogs()
+                elif home_is_active:
                     log.info("UI_RST: Already on Home tab")
                 else:
                     # Not sure which tab — tap Home anyway
@@ -2000,7 +2015,8 @@ class VWTokenRelay:
                         ["adb", "shell", "su", "-c",
                          "input tap 72 1460"],
                         capture_output=True, timeout=10)
-                    time.sleep(3)
+                    time.sleep(5)
+                    self._dismiss_vw_alert_dialogs()
 
             # Step 2: Check foreground + take diagnostic screencap
             self._wake_screen()
@@ -2076,6 +2092,7 @@ class VWTokenRelay:
                     self._dismiss_system_dialogs()
 
                 self._dismiss_vw_interstitials()
+                self._dismiss_vw_alert_dialogs()
 
                 # Scroll UP to expand the collapsing AppBar toolbar.
                 # The Remote Start button is in homeCommandsView which
@@ -3001,6 +3018,85 @@ class VWTokenRelay:
                 break
         if dismissed_any:
             log.info("DISMISS: Cleared %d system dialog(s)", attempt + 1)
+        return dismissed_any
+
+    def _dismiss_vw_alert_dialogs(self, xml=None, max_attempts=5):
+        """Dismiss VW app AlertDialogs that block the dashboard.
+
+        Known dialogs:
+          - "Vehicle Location Unknown" with Dismiss button
+          - "Accept pairing" prompts
+          - Any AlertDialog with OK/Dismiss/Close buttons
+
+        These appear as overlays (alertTitle + button3/button1) and prevent
+        uiautomator from seeing the dashboard elements underneath.
+        Returns True if any dialog was dismissed."""
+        dismissed_any = False
+        for attempt in range(max_attempts):
+            if not xml:
+                xml = self._dump_ui_xml()
+            if not xml:
+                break
+
+            import xml.etree.ElementTree as ET
+            try:
+                root = ET.fromstring(xml)
+            except Exception:
+                break
+
+            # Look for AlertDialog indicators: alertTitle resource-id
+            has_alert = False
+            alert_title = ""
+            for node in root.iter("node"):
+                rid = node.attrib.get("resource-id", "")
+                if "alertTitle" in rid:
+                    has_alert = True
+                    alert_title = node.attrib.get("text", "")
+                    break
+
+            if not has_alert:
+                break
+
+            log.info("VW_DIALOG: Found alert dialog: '%s' (attempt %d)",
+                     alert_title, attempt + 1)
+
+            # Try to find dismiss/ok/close buttons (button3, button1, button2)
+            dismiss_btn = None
+            for btn_rid in ["button3", "button1", "button2"]:
+                elems = self._find_ui_elements(xml, resource_id=btn_rid)
+                if elems:
+                    dismiss_btn = elems[0]
+                    break
+            if not dismiss_btn:
+                # Try by text
+                for btn_text in ["Dismiss", "OK", "Close", "Cancel",
+                                 "Got it", "Accept"]:
+                    elems = self._find_ui_elements(xml, text=btn_text)
+                    if elems:
+                        dismiss_btn = elems[0]
+                        break
+
+            if dismiss_btn:
+                cx, cy = dismiss_btn[0], dismiss_btn[1]
+                log.info("VW_DIALOG: Tapping dismiss button at (%d,%d)", cx, cy)
+                subprocess.run(["adb", "shell", "su", "-c",
+                                f"input tap {cx} {cy}"],
+                               capture_output=True, timeout=10)
+                dismissed_any = True
+                time.sleep(2)
+            else:
+                # No dismiss button found — try BACK key
+                log.info("VW_DIALOG: No dismiss button — pressing BACK")
+                subprocess.run(["adb", "shell", "su", "-c",
+                                "input keyevent BACK"],
+                               capture_output=True, timeout=10)
+                dismissed_any = True
+                time.sleep(2)
+
+            xml = None  # Force fresh dump next iteration
+
+        if dismissed_any:
+            log.info("VW_DIALOG: Dismissed %d alert dialog(s)", attempt + 1)
         return dismissed_any
 
     def _dismiss_vw_interstitials(self, xml=None, max_attempts=3):
