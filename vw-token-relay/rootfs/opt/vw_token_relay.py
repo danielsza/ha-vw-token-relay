@@ -1301,7 +1301,7 @@ class VWTokenRelay:
           3. Compute rstPinHash = SHA512(challenge + "." + spin).hex().upper()
           4. POST /ss/v1/user/{uid}/vehicle/{vid}/operation/remoteStart/check
              body: {"spinHash": rstPinHash} → get roToken
-          5. Build encryptedPayload (timestamps + XOR + AES/ECB + XOR + base64)
+          5. Build encryptedPayload (timestamps + SPIN hash + captcha + CRC + XTEA-ECB)
           6. Sign encryptedPayload via Frida RPC (Android KeyStore ECDSA)
           7. POST /rst/v1/vehicle/{vid}
              body: {pairingId, rstPinHash, encryptedPayload, roToken, dataToSign}
@@ -1627,8 +1627,12 @@ class VWTokenRelay:
                      pairing_seed[:4])
 
             # Build encrypted payload with XTEA cipher
+            # CRITICAL: Must use the SAME spin hash that was sent to the /check
+            # endpoint (spin_hash_check), NOT spin_hash2 which is from a
+            # different challenge.  The app uses one hash for both /check and
+            # the payload — mismatch causes PAIRING_ERROR_ON_REMOTE_START.
             encrypted_bytes = self._build_encrypted_payload(
-                pairing_seed, spin_hash2, captcha_index, captcha_value)
+                pairing_seed, spin_hash_check, captcha_index, captcha_value)
             log.info("RST: XTEA encryptedPayload built (%d bytes)", len(encrypted_bytes))
 
             # Sign: pairingId UTF-8 bytes + encrypted bytes (concatenated raw)
@@ -1638,7 +1642,7 @@ class VWTokenRelay:
             if signature:
                 log.info("RST: ECDSA signature obtained (%d chars)", len(signature))
                 rst_payload["pairingId"] = pairing_id
-                rst_payload["rstSpinHash"] = spin_hash2[:16]  # first 16 chars ONLY
+                rst_payload["rstSpinHash"] = spin_hash_check[:16]  # first 16 chars — MUST match /check hash
                 rst_payload["encryptedPayload"] = encrypted_bytes.hex().upper()  # HEX not base64
                 rst_payload["encryptedPayloadSignature"] = signature
                 log.info("RST: Full pairing body built (5 fields, rstSpinHash=%s...)",
@@ -1646,7 +1650,7 @@ class VWTokenRelay:
             else:
                 log.warning("RST: KeyStore signing failed — trying without signature")
                 rst_payload["pairingId"] = pairing_id
-                rst_payload["rstSpinHash"] = spin_hash2[:16]
+                rst_payload["rstSpinHash"] = spin_hash_check[:16]
                 rst_payload["encryptedPayload"] = encrypted_bytes.hex().upper()
                 log.info("RST: Partial pairing body (no signature, 4 fields)")
         else:
