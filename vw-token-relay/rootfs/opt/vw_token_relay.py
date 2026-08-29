@@ -4755,6 +4755,18 @@ class VWTokenRelay:
             if token and token != getattr(self, '_last_relayed_token', None):
                 self._last_relayed_token = token
                 relay_data = {"access_token": token, "token_type": "bearer"}
+                # Compute expires_in from JWT exp claim so CC connector
+                # knows the token is still valid (not stale expires_in
+                # from original OAuth grant)
+                try:
+                    jwt_parts = token.split(".")
+                    jwt_b64 = jwt_parts[1] + "=" * (4 - len(jwt_parts[1]) % 4)
+                    jwt_claims = json.loads(base64.urlsafe_b64decode(jwt_b64))
+                    exp = jwt_claims.get("exp")
+                    if exp:
+                        relay_data["expires_in"] = int(exp - time.time())
+                except Exception:
+                    pass
                 if refresh:
                     relay_data["refresh_token"] = refresh
                 if id_tok:
