@@ -2553,14 +2553,14 @@ class VWTokenRelay:
 
     def _navigate_to_vehicle(self, target_vid=None):
         """Navigate the VW app to trigger vehicle-scoped API calls.
-        If target_vid is specified, tries multiple strategies to reach it.
-        React Native views are invisible to uiautomator, so we use
-        blind taps/swipes at known positions on Moto G Pure (720x1600).
+        Uses uiautomator to inspect the actual screen before tapping.
 
-        Key insight: The VW myVW app uses a bottom navigation bar. The
-        home tab shows ONE vehicle at a time. Vehicle switching is via
-        a picker/dropdown or a separate "garage" tab — NOT a swipeable
-        carousel on the home screen."""
+        Handles three main screens:
+          - ForcedGarageActivity: vehicle list — tap a vehicle card
+          - MainActivity (Home tab): vehicle dashboard — already good
+          - MainActivity (Nav tab): wrong tab — switch to Home
+
+        Always dismisses alert dialogs and interstitials first."""
         if not self._adb_check():
             log.error("NAV: Cannot navigate — ADB not connected")
             return False
@@ -2574,7 +2574,8 @@ class VWTokenRelay:
             """Make sure VW app is in foreground."""
             fg = self._get_foreground_activity()
             if VW_PACKAGE not in (fg or ''):
-                log.info("NAV: App not in FG (%s) — relaunching", fg[:40] if fg else 'none')
+                log.info("NAV: App not in FG (%s) — relaunching",
+                         fg[:40] if fg else 'none')
                 try:
                     subprocess.run(
                         ["adb", "shell", "am", "start", "-n",
@@ -2588,105 +2589,120 @@ class VWTokenRelay:
         try:
             _ensure_app_fg()
 
-            # ── Strategy 0: Tap the default vehicle card area ──
-            log.info("NAV: S0 — tap default card area (360,600)")
-            self._adb_tap(360, 600, label="S0-default")
-            time.sleep(4)
+            # Determine which screen we're on
+            fg = self._get_foreground_activity() or ""
+            on_garage = "ForcedGarageActivity" in fg
+            on_main = "MainActivity" in fg
 
-            if not target_vid:
-                return True
-            if _check_target():
-                log.info("NAV: Got target token from default tap")
-                return True
+            # Dump UI to inspect what's on screen
+            xml = self._dump_ui_xml()
 
-            # ── Strategy 1: Vehicle picker/dropdown at top of screen ──
-            # Many car apps have the vehicle name at the top that opens a picker.
-            log.info("NAV: S1 — tap vehicle picker areas at top of screen")
-            _ensure_app_fg()
-            # Tap top center (vehicle name area)
-            self._adb_tap(360, 150, label="S1-top-center")
-            time.sleep(3)
-            # If a dropdown appeared, tap the second item
-            self._adb_tap(360, 300, label="S1-dropdown-item2")
-            time.sleep(5)
-            if _check_target():
-                log.info("NAV: S1 — got target from top picker")
-                return True
-            # Try tapping a third position in case the dropdown has headers
-            self._adb_tap(360, 400, label="S1-dropdown-item3")
-            time.sleep(5)
-            if _check_target():
-                log.info("NAV: S1 — got target from picker item 3")
-                return True
+            # Dismiss any blocking dialogs first
+            if xml:
+                self._dismiss_vw_alert_dialogs(xml=xml)
+                self._dismiss_vw_interstitials(xml=xml)
+                # Re-dump after dismissals in case the UI changed
+                xml = self._dump_ui_xml()
 
-            # ── Strategy 2: Bottom navigation tabs ──
-            # VW app has a bottom nav bar. Try each tab to find "Garage".
-            # On 720x1600, bottom nav is around Y=1540-1560.
-            # Common 4-tab positions: x=90, 270, 450, 630
-            # Common 5-tab positions: x=72, 216, 360, 504, 648
-            log.info("NAV: S2 — tap bottom navigation tabs")
-            _ensure_app_fg()
-            # Try each bottom tab position
-            for tab_x in [90, 270, 450, 630]:
-                self._adb_tap(tab_x, 1550, label=f"S2-btab-{tab_x}")
-                time.sleep(3)
-                # After switching tab, look for vehicle list items
-                # Tap various Y positions to find Atlas card
-                for card_y in [400, 600, 800, 1000]:
-                    self._adb_tap(360, card_y, label=f"S2-card-y{card_y}")
-                    time.sleep(4)
-                    if _check_target():
-                        log.info("NAV: S2 — got target from tab x=%d, card y=%d", tab_x, card_y)
-                        return True
-
-            # ── Strategy 3: Hamburger menu (top-left) ──
-            log.info("NAV: S3 — try hamburger menu (top-left)")
-            _ensure_app_fg()
-            self._adb_tap(50, 80, label="S3-hamburger")
-            time.sleep(3)
-            # Look for vehicle entries in side menu
-            for menu_y in [300, 400, 500, 600, 700]:
-                self._adb_tap(300, menu_y, label=f"S3-menu-y{menu_y}")
-                time.sleep(3)
-                if _check_target():
-                    log.info("NAV: S3 — got target from menu y=%d", menu_y)
+            # ── Garage screen: tap a vehicle card ──
+            if on_garage and xml:
+                log.info("NAV: On Garage — looking for vehicle cards")
+                cards = self._find_ui_elements(
+                    xml, resource_id="vehicleNameTextView")
+                if cards:
+                    # If target_vid specified, try to find matching card
+                    # Otherwise tap the first card
+                    tap_card = cards[0]
+                    if target_vid and len(cards) > 1:
+                        # Check VIN text elements near each card
+                        vins = self._find_ui_elements(
+                            xml, resource_id="vehicleVinTextView")
+                        for i, vin_elem in enumerate(vins):
+                            vin_text = vin_elem[3].get("text", "")
+                            if target_vid[:8] in vin_text or \
+                               (i < len(cards) and "Atlas" in cards[i][3].get("text", "")):
+                                tap_card = cards[i] if i < len(cards) else cards[0]
+                                break
+                    cx, cy = tap_card[0], tap_card[1]
+                    card_name = tap_card[3].get("text", "?")
+                    log.info("NAV: Tapping vehicle card '%s' at (%d,%d)",
+                             card_name, cx, cy)
+                    self._adb_tap(cx, cy, label=f"NAV-garage-{card_name}")
+                    time.sleep(5)
+                    if target_vid and _check_target():
+                        log.info("NAV: Got target token from garage card")
                     return True
-                # If we entered a sub-screen, check for vehicle items
-                for sub_y in [400, 600, 800]:
-                    self._adb_tap(360, sub_y, label=f"S3-sub-y{sub_y}")
+                else:
+                    log.warning("NAV: On Garage but no vehicle cards found")
+
+            # ── Main dashboard: ensure Home tab is active ──
+            if on_main and xml:
+                log.info("NAV: On MainActivity — checking tab state")
+                # Find bottom nav items by content-desc
+                home_tab = self._find_ui_elements(
+                    xml, content_desc="Home")
+                nav_tab = self._find_ui_elements(
+                    xml, content_desc="Navigation")
+
+                # Active tab has clickable="false"
+                home_active = (home_tab and
+                               home_tab[0][3].get("clickable") == "false")
+                nav_active = (nav_tab and
+                              nav_tab[0][3].get("clickable") == "false")
+
+                if home_active:
+                    log.info("NAV: Home tab already active — good")
+                    return True
+                elif nav_active and home_tab:
+                    # Switch from Nav to Home
+                    cx, cy = home_tab[0][0], home_tab[0][1]
+                    log.info("NAV: Nav tab active — switching to Home at (%d,%d)",
+                             cx, cy)
+                    self._adb_tap(cx, cy, label="NAV-switch-home")
                     time.sleep(3)
-                    if _check_target():
-                        log.info("NAV: S3 — got target from sub-menu y=%d", sub_y)
-                        return True
+                    # Dismiss any dialogs that appear after tab switch
+                    xml2 = self._dump_ui_xml()
+                    if xml2:
+                        self._dismiss_vw_alert_dialogs(xml=xml2)
+                    return True
+                elif home_tab:
+                    # Unknown tab state — tap Home anyway
+                    cx, cy = home_tab[0][0], home_tab[0][1]
+                    log.info("NAV: Unknown tab state — tapping Home at (%d,%d)",
+                             cx, cy)
+                    self._adb_tap(cx, cy, label="NAV-tap-home")
+                    time.sleep(3)
+                    return True
+                else:
+                    # No bottom nav found — might be a sub-screen.
+                    # The app is still on MainActivity making API calls,
+                    # which is fine for token capture.
+                    log.info("NAV: On MainActivity but no bottom nav found "
+                             "— app may be in a sub-view, still capturing tokens")
+                    return True
 
-            # ── Strategy 4: Top-right menu/kebab ──
-            log.info("NAV: S4 — try top-right menu")
-            _ensure_app_fg()
-            self._adb_tap(670, 80, label="S4-kebab")
-            time.sleep(3)
-            for menu_y in [200, 300, 400, 500]:
-                self._adb_tap(500, menu_y, label=f"S4-menu-y{menu_y}")
+            # ── Fallback: unknown screen ──
+            if not xml:
+                log.warning("NAV: Could not dump UI — blind tap as last resort")
+                self._adb_tap(360, 600, label="NAV-blind-fallback")
+                time.sleep(4)
+                return True
+
+            # If we're on some other VW activity, press back to try
+            # getting to a known screen
+            if VW_PACKAGE in fg and not on_garage and not on_main:
+                log.info("NAV: On unknown VW activity (%s) — pressing BACK",
+                         fg.split("/")[-1][:30] if "/" in fg else fg[-30:])
+                subprocess.run(
+                    ["adb", "shell", "su", "-c", "input keyevent BACK"],
+                    capture_output=True, timeout=10)
                 time.sleep(3)
-                if _check_target():
-                    log.info("NAV: S4 — got target from top-right menu y=%d", menu_y)
-                    return True
+                # Retry once after back
+                fg2 = self._get_foreground_activity() or ""
+                if "ForcedGarageActivity" in fg2 or "MainActivity" in fg2:
+                    return self._navigate_to_vehicle(target_vid=target_vid)
 
-            # ── Strategy 5: Swipe left on detail screen ──
-            log.info("NAV: S5 — swipe left on main screen")
-            _ensure_app_fg()
-            self._adb_tap(360, 600, label="S5-enter-detail")
-            time.sleep(3)
-            for i in range(3):
-                self._adb_swipe(600, 800, 100, 800, 400, f"S5-swipe-left-{i+1}")
-                time.sleep(5)
-                if _check_target():
-                    log.info("NAV: S5 — got target after swipe %d", i + 1)
-                    return True
-
-            log.warning("NAV: All strategies exhausted — no target vehicle token")
-            # Take screenshot for debugging (goes to /config/www/vw_screen.png)
-            _ensure_app_fg()
-            time.sleep(2)
+            log.warning("NAV: Could not navigate to vehicle dashboard")
             self._screencap()
             return False
 
