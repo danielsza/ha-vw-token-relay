@@ -5065,13 +5065,13 @@ class VWTokenRelay:
 
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop(self):
-        """Every 10 minutes, check token freshness.  When stale, recover
+        """Every 5 minutes, check token freshness.  When stale, recover
         aggressively: wake → force-restart → re-login with short waits
         between retries so total recovery stays under ~5 min."""
         no_token_count = 0
 
         while self._running:
-            time.sleep(600)  # 10 minutes
+            time.sleep(300)  # 5 minutes
 
             # ── Frida health check (safety net) ──
             if self.session is None or self.script is None:
