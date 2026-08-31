@@ -5055,12 +5055,12 @@ class VWTokenRelay:
 
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop(self):
-        """Every 20 minutes, wake the app to force a token refresh.
-        If tokens haven't refreshed after waking, attempt re-login."""
+        """Every 5 minutes, check token freshness and recover if stale.
+        If tokens haven't refreshed after waking, force-restart the app."""
         no_token_count = 0
 
         while self._running:
-            time.sleep(1200)  # 20 minutes
+            time.sleep(300)  # 5 minutes
 
             # ── Frida health check (safety net) ──
             if self.session is None or self.script is None:
@@ -5111,39 +5111,38 @@ class VWTokenRelay:
                 if still_expired and has_any_token:
                     no_token_count += 1
                     log.warning("No fresh tokens after wake (attempt %d)", no_token_count)
-                    if no_token_count >= 2:
-                        # Force-restart the app — it's alive but not
-                        # making API calls (expired internal auth).
-                        log.warning("Force-restarting VW app to recover "
-                                    "token flow (attempt %d)", no_token_count)
-                        subprocess.run(
-                            ["adb", "shell", "am", "force-stop", VW_PACKAGE],
-                            capture_output=True, timeout=10)
-                        time.sleep(2)
-                        subprocess.run(
-                            ["adb", "shell", "am", "start", "-n",
-                             f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                            capture_output=True, timeout=10)
-                        time.sleep(10)
-                        self._navigate_to_vehicle()
-                        time.sleep(20)  # Wait for fresh API calls
-                        # Check again
-                        with self._lock:
-                            recovered = False
-                            for vid, t in self.tokens.items():
-                                if datetime.now() < t["expiry"] - timedelta(minutes=5):
-                                    recovered = True
-                            if self.global_expiry and datetime.now() < self.global_expiry - timedelta(minutes=5):
+                    # Force-restart immediately — the app is alive but
+                    # not making API calls (expired internal auth).
+                    log.warning("Force-restarting VW app to recover "
+                                "token flow (attempt %d)", no_token_count)
+                    subprocess.run(
+                        ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                        capture_output=True, timeout=10)
+                    time.sleep(10)
+                    self._navigate_to_vehicle()
+                    time.sleep(20)  # Wait for fresh API calls
+                    # Check again
+                    with self._lock:
+                        recovered = False
+                        for vid, t in self.tokens.items():
+                            if datetime.now() < t["expiry"] - timedelta(minutes=5):
                                 recovered = True
-                        if recovered:
-                            log.info("Token flow recovered after force-restart")
-                            no_token_count = 0
-                        elif no_token_count >= 4:
-                            log.info("Persistent auth failure — attempting auto re-login")
-                            self._auto_relogin()
-                            no_token_count = 0
-                            time.sleep(15)
-                            self._wake_app()  # Re-trigger after login
+                        if self.global_expiry and datetime.now() < self.global_expiry - timedelta(minutes=5):
+                            recovered = True
+                    if recovered:
+                        log.info("Token flow recovered after force-restart")
+                        no_token_count = 0
+                    elif no_token_count >= 3:
+                        log.info("Persistent auth failure — attempting auto re-login")
+                        self._auto_relogin()
+                        no_token_count = 0
+                        time.sleep(15)
+                        self._wake_app()  # Re-trigger after login
                 else:
                     no_token_count = 0
 
