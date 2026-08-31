@@ -2674,11 +2674,43 @@ class VWTokenRelay:
                     time.sleep(3)
                     return True
                 else:
-                    # No bottom nav found — might be a sub-screen.
-                    # The app is still on MainActivity making API calls,
-                    # which is fine for token capture.
-                    log.info("NAV: On MainActivity but no bottom nav found "
-                             "— app may be in a sub-view, still capturing tokens")
+                    # No bottom nav found — app is likely in a sub-screen
+                    # (settings, pairing, full-screen dialog) that blocks
+                    # normal dashboard API calls. Press BACK to escape.
+                    log.warning("NAV: On MainActivity but no bottom nav found "
+                                "— pressing BACK to escape sub-view")
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c", "input keyevent BACK"],
+                        capture_output=True, timeout=10)
+                    time.sleep(3)
+                    # Check if we now have the bottom nav
+                    xml2 = self._dump_ui_xml()
+                    if xml2:
+                        self._dismiss_vw_alert_dialogs(xml=xml2)
+                        home2 = self._find_ui_elements(xml2, content_desc="Home")
+                        if home2:
+                            home2_active = home2[0][3].get("clickable") == "false"
+                            if not home2_active:
+                                cx, cy = home2[0][0], home2[0][1]
+                                log.info("NAV: Found Home tab after BACK — "
+                                         "tapping at (%d,%d)", cx, cy)
+                                self._adb_tap(cx, cy, label="NAV-home-after-back")
+                                time.sleep(3)
+                            else:
+                                log.info("NAV: Home tab active after BACK — good")
+                            return True
+                    # Still no nav — force restart the app
+                    log.warning("NAV: Still no bottom nav after BACK — "
+                                "force-restarting app")
+                    subprocess.run(
+                        ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                        capture_output=True, timeout=10)
+                    time.sleep(8)
                     return True
 
             # ── Fallback: unknown screen ──
