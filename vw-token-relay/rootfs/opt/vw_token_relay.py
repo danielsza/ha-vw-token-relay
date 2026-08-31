@@ -5053,14 +5053,25 @@ class VWTokenRelay:
             log.error("Auto re-login error: %s", e)
             return False
 
+    def _tokens_are_fresh(self):
+        """Return True if at least one token is valid for >5 min."""
+        with self._lock:
+            for vid, t in self.tokens.items():
+                if datetime.now() < t["expiry"] - timedelta(minutes=5):
+                    return True
+            if self.global_expiry and datetime.now() < self.global_expiry - timedelta(minutes=5):
+                return True
+        return False
+
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop(self):
-        """Every 5 minutes, check token freshness and recover if stale.
-        If tokens haven't refreshed after waking, force-restart the app."""
+        """Every 10 minutes, check token freshness.  When stale, recover
+        aggressively: wake → force-restart → re-login with short waits
+        between retries so total recovery stays under ~5 min."""
         no_token_count = 0
 
         while self._running:
-            time.sleep(300)  # 5 minutes
+            time.sleep(600)  # 10 minutes
 
             # ── Frida health check (safety net) ──
             if self.session is None or self.script is None:
@@ -5095,56 +5106,56 @@ class VWTokenRelay:
                 has_any_token = bool(self.tokens) or self.global_token
 
             if needs_refresh or not has_any_token:
+                # ── Step 1: wake the running app (~30s) ──
                 log.info("Tokens expiring/missing, waking app for refresh...")
                 self._wake_app()
-                time.sleep(30)  # Wait for app to make API calls
+                time.sleep(30)
 
-                # Check if we got fresh tokens
-                with self._lock:
-                    still_expired = True
-                    for vid, t in self.tokens.items():
-                        if datetime.now() < t["expiry"] - timedelta(minutes=5):
-                            still_expired = False
-                    if self.global_expiry and datetime.now() < self.global_expiry - timedelta(minutes=5):
-                        still_expired = False
-
-                if still_expired and has_any_token:
-                    no_token_count += 1
-                    log.warning("No fresh tokens after wake (attempt %d)", no_token_count)
-                    # Force-restart immediately — the app is alive but
-                    # not making API calls (expired internal auth).
-                    log.warning("Force-restarting VW app to recover "
-                                "token flow (attempt %d)", no_token_count)
-                    subprocess.run(
-                        ["adb", "shell", "am", "force-stop", VW_PACKAGE],
-                        capture_output=True, timeout=10)
-                    time.sleep(2)
-                    subprocess.run(
-                        ["adb", "shell", "am", "start", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                        capture_output=True, timeout=10)
-                    time.sleep(10)
-                    self._navigate_to_vehicle()
-                    time.sleep(20)  # Wait for fresh API calls
-                    # Check again
-                    with self._lock:
-                        recovered = False
-                        for vid, t in self.tokens.items():
-                            if datetime.now() < t["expiry"] - timedelta(minutes=5):
-                                recovered = True
-                        if self.global_expiry and datetime.now() < self.global_expiry - timedelta(minutes=5):
-                            recovered = True
-                    if recovered:
-                        log.info("Token flow recovered after force-restart")
-                        no_token_count = 0
-                    elif no_token_count >= 3:
-                        log.info("Persistent auth failure — attempting auto re-login")
-                        self._auto_relogin()
-                        no_token_count = 0
-                        time.sleep(15)
-                        self._wake_app()  # Re-trigger after login
-                else:
+                if self._tokens_are_fresh():
                     no_token_count = 0
+                    continue
+
+                # ── Step 2: force-restart the app (~35s) ──
+                no_token_count += 1
+                log.warning("No fresh tokens after wake — force-restarting "
+                            "VW app (attempt %d)", no_token_count)
+                subprocess.run(
+                    ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=10)
+                time.sleep(10)
+                self._navigate_to_vehicle()
+                time.sleep(20)
+
+                if self._tokens_are_fresh():
+                    log.info("Token flow recovered after force-restart")
+                    no_token_count = 0
+                    continue
+
+                # ── Step 3: wait 2 min, try once more (~2.5 min) ──
+                log.warning("Still no tokens — waiting 2 min then retrying")
+                time.sleep(120)
+                self._wake_app()
+                time.sleep(30)
+
+                if self._tokens_are_fresh():
+                    log.info("Token flow recovered on retry")
+                    no_token_count = 0
+                    continue
+
+                # ── Step 4: full re-login as last resort ──
+                log.warning("Persistent auth failure — attempting "
+                            "auto re-login (attempt %d)", no_token_count)
+                self._auto_relogin()
+                no_token_count = 0
+                time.sleep(15)
+                self._wake_app()
+            else:
+                no_token_count = 0
 
             # ── Proactive token validation ──
             # Make a lightweight test API call to verify the token actually works
