@@ -445,6 +445,11 @@ class VWTokenRelay:
         self._pif_reboot_cooldown = None  # prevent reboot loops
         self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
 
+        # Phone health tracking
+        self._phone_down_since = None     # when phone was first detected as down
+        self._phone_down_notified = False # whether we already sent "phone down" alert
+        self._phone_recovery_in_progress = False  # prevent concurrent recovery attempts
+
         # Token state — keyed by vehicle ID
         self.tokens = {}       # {vehicle_id: {"token": str, "expiry": datetime}}
         self.global_token = None  # most recent non-vehicle-scoped token
@@ -918,7 +923,7 @@ class VWTokenRelay:
         """
         cooldown_ok = (
             self._pif_reboot_cooldown is None
-            or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 7200
+            or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 1800  # 30min cooldown
         )
         if not cooldown_ok:
             log.info("PIF fix skipped — still in reboot cooldown")
@@ -4427,6 +4432,189 @@ class VWTokenRelay:
                 json.dumps({"status": "error", "msg": str(e)}),
             )
 
+    # ── Phone health monitoring ──────────────────────────────────────
+    def _check_phone_health(self):
+        """Check if the phone is reachable, booted, and not in rescue mode.
+        Returns a dict with health info, or None if phone unreachable."""
+        try:
+            result = subprocess.run(
+                ["adb", "shell",
+                 "getprop sys.boot_completed; "
+                 "getprop sys.rescue_boot_count; "
+                 "service list 2>/dev/null | wc -l; "
+                 "ip addr show wlan0 2>&1 | grep -c 'inet '"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                return None
+            lines = result.stdout.strip().splitlines()
+            if len(lines) < 4:
+                return None
+            return {
+                "boot_completed": lines[0].strip() == "1",
+                "rescue_boot_count": int(lines[1].strip() or "0"),
+                "service_count": int(lines[2].strip() or "0"),
+                "has_wifi": int(lines[3].strip() or "0") > 0,
+            }
+        except (subprocess.TimeoutExpired, Exception) as e:
+            log.debug("Phone health check failed: %s", e)
+            return None
+
+    def _is_phone_in_trouble(self, health):
+        """Determine if the phone needs intervention."""
+        if health is None:
+            return True, "unreachable"
+        if health["rescue_boot_count"] > 0 and health["service_count"] < 100:
+            return True, "rescue_mode"
+        if not health["boot_completed"]:
+            return True, "not_booted"
+        if health["service_count"] < 100:
+            return True, "low_services"
+        return False, "ok"
+
+    def _auto_recover_phone(self, reason):
+        """Attempt automatic recovery when phone is stuck in rescue/boot-loop."""
+        if self._phone_recovery_in_progress:
+            log.info("PHONE RECOVERY: Already in progress, skipping")
+            return
+
+        self._phone_recovery_in_progress = True
+        log.warning("PHONE RECOVERY: Starting auto-recovery (reason: %s)", reason)
+
+        try:
+            if reason in ("rescue_mode", "low_services", "not_booted"):
+                # Step 1: Disable zygisk in Magisk DB to break the boot loop
+                log.info("PHONE RECOVERY: Disabling zygisk in Magisk DB...")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "magisk --sqlite \"UPDATE settings SET value=0 WHERE key='zygisk'\""],
+                    capture_output=True, text=True, timeout=15,
+                )
+
+                # Step 2: Clean bootloop markers
+                log.info("PHONE RECOVERY: Cleaning bootloop markers...")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "rm -f /data/adb/@bootloop /data/adb/bootloop0 "
+                     "/data/adb/zygisk /data/adb/zygisk."],
+                    capture_output=True, text=True, timeout=15,
+                )
+
+                # Step 3: Reboot using sysrq (most reliable in rescue mode)
+                log.info("PHONE RECOVERY: Rebooting phone via sysrq...")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "echo b > /proc/sysrq-trigger"],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+                # Step 4: Wait for phone to come back
+                log.info("PHONE RECOVERY: Waiting for phone to reboot...")
+                try:
+                    subprocess.run(
+                        ["adb", "wait-for-device"],
+                        capture_output=True, timeout=120,
+                    )
+                    time.sleep(30)  # let boot finish
+                except subprocess.TimeoutExpired:
+                    log.error("PHONE RECOVERY: Phone did not come back after reboot")
+                    self._phone_recovery_in_progress = False
+                    return
+
+                # Step 5: Check if phone booted cleanly
+                health = self._check_phone_health()
+                in_trouble, new_reason = self._is_phone_in_trouble(health)
+
+                if in_trouble:
+                    log.error("PHONE RECOVERY: Phone still in trouble after zygisk disable (%s)", new_reason)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/phone_health",
+                        json.dumps({"status": "recovery_failed", "reason": new_reason}),
+                        retain=True,
+                    )
+                    self._phone_recovery_in_progress = False
+                    return
+
+                # Step 6: Phone booted cleanly — re-enable zygisk
+                log.info("PHONE RECOVERY: Phone booted cleanly! Re-enabling zygisk...")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "magisk --sqlite \"UPDATE settings SET value=1 WHERE key='zygisk'\""],
+                    capture_output=True, text=True, timeout=15,
+                )
+
+                # Step 7: Check if modules are still installed
+                mod_result = subprocess.run(
+                    ["adb", "shell", "su", "-c", "ls /data/adb/modules/"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                modules = mod_result.stdout.strip().splitlines() if mod_result.returncode == 0 else []
+                expected = {"rezygisk", "playintegrityfix", "tricky_store"}
+                installed = set(modules)
+                missing = expected - installed
+
+                if missing:
+                    log.warning("PHONE RECOVERY: Missing modules after recovery: %s "
+                                "(need manual reinstall)", missing)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/phone_health",
+                        json.dumps({
+                            "status": "recovered_partial",
+                            "missing_modules": list(missing),
+                            "message": "Phone booted but some Magisk modules need reinstall. Rebooting with what we have.",
+                        }),
+                        retain=True,
+                    )
+                else:
+                    log.info("PHONE RECOVERY: All modules present")
+
+                # Step 8: Final reboot with zygisk re-enabled
+                log.info("PHONE RECOVERY: Final reboot with zygisk enabled...")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c", "setprop sys.powerctl reboot"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                try:
+                    subprocess.run(["adb", "wait-for-device"], capture_output=True, timeout=120)
+                    time.sleep(45)  # let boot + modules initialize
+                except subprocess.TimeoutExpired:
+                    pass
+
+                # Verify final state
+                health = self._check_phone_health()
+                in_trouble, final_reason = self._is_phone_in_trouble(health)
+                if not in_trouble:
+                    log.info("PHONE RECOVERY: SUCCESS — phone fully recovered")
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/phone_health",
+                        json.dumps({"status": "recovered", "service_count": health["service_count"]}),
+                        retain=True,
+                    )
+                    self._phone_down_since = None
+                    self._phone_down_notified = False
+                    # Re-attach Frida
+                    try:
+                        self._ensure_frida_server()
+                        self._attach_frida()
+                    except Exception as e:
+                        log.warning("PHONE RECOVERY: Frida re-attach failed: %s", e)
+                else:
+                    log.error("PHONE RECOVERY: Phone still in trouble after full recovery attempt: %s", final_reason)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/phone_health",
+                        json.dumps({"status": "recovery_failed", "reason": final_reason}),
+                        retain=True,
+                    )
+
+            elif reason == "unreachable":
+                # Phone completely gone — not much we can do except notify
+                log.warning("PHONE RECOVERY: Phone unreachable — cannot auto-recover")
+
+        except Exception as e:
+            log.error("PHONE RECOVERY: Error during recovery: %s", e)
+        finally:
+            self._phone_recovery_in_progress = False
+
     def _update_pif(self):
         """Run the Play Integrity fingerprint updater script."""
         log.info("Running PIF fingerprint updater...")
@@ -5073,6 +5261,70 @@ class VWTokenRelay:
         while self._running:
             time.sleep(300)  # 5 minutes
 
+            # ── Phone health check (early detection) ──
+            phone_health = self._check_phone_health()
+            in_trouble, trouble_reason = self._is_phone_in_trouble(phone_health)
+
+            if in_trouble:
+                if self._phone_down_since is None:
+                    self._phone_down_since = datetime.now()
+                    log.warning("PHONE HEALTH: Phone issue detected: %s", trouble_reason)
+
+                down_minutes = (datetime.now() - self._phone_down_since).total_seconds() / 60
+
+                # Publish phone health status
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/phone_health",
+                    json.dumps({
+                        "status": "down",
+                        "reason": trouble_reason,
+                        "down_minutes": round(down_minutes, 1),
+                        "service_count": phone_health["service_count"] if phone_health else 0,
+                    }),
+                    retain=True,
+                )
+
+                # After 10 minutes down, attempt auto-recovery
+                if down_minutes >= 10 and trouble_reason in ("rescue_mode", "low_services", "not_booted"):
+                    if not self._phone_recovery_in_progress:
+                        log.warning("PHONE HEALTH: Phone down %.0f min — starting auto-recovery", down_minutes)
+                        threading.Thread(
+                            target=self._auto_recover_phone,
+                            args=(trouble_reason,),
+                            daemon=True,
+                        ).start()
+
+                # After 15 minutes down, notify user (regardless of recovery attempt)
+                if down_minutes >= 15 and not self._phone_down_notified:
+                    self._phone_down_notified = True
+                    log.error("PHONE HEALTH: Phone down %.0f min — notifying user", down_minutes)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/phone_health",
+                        json.dumps({
+                            "status": "critical",
+                            "reason": trouble_reason,
+                            "down_minutes": round(down_minutes, 1),
+                            "message": f"Phone {trouble_reason} for {round(down_minutes)} min. Auto-recovery {'in progress' if self._phone_recovery_in_progress else 'attempted'}.",
+                        }),
+                        retain=True,
+                    )
+
+                # Skip the rest of keepalive if phone is down
+                if trouble_reason != "ok":
+                    continue
+            else:
+                # Phone is healthy — clear down state
+                if self._phone_down_since is not None:
+                    down_dur = (datetime.now() - self._phone_down_since).total_seconds() / 60
+                    log.info("PHONE HEALTH: Phone recovered after %.0f min", down_dur)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/phone_health",
+                        json.dumps({"status": "healthy", "service_count": phone_health["service_count"]}),
+                        retain=True,
+                    )
+                self._phone_down_since = None
+                self._phone_down_notified = False
+
             # ── Frida health check (safety net) ──
             if self.session is None or self.script is None:
                 log.warning("KEEPALIVE: Frida session/script is gone — "
@@ -5194,7 +5446,7 @@ class VWTokenRelay:
                 token_age_min = (datetime.now() - self._last_token_time).total_seconds() / 60
                 cooldown_ok = (
                     self._pif_reboot_cooldown is None
-                    or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 7200  # 2hr cooldown
+                    or (datetime.now() - self._pif_reboot_cooldown).total_seconds() > 1800  # 30min cooldown
                 )
                 if token_age_min <= 45:
                     # Token is fresh — reset fix counter
@@ -5203,7 +5455,7 @@ class VWTokenRelay:
                     self._pif_fix_attempts = 0
                 elif token_age_min > 45 and cooldown_ok:
                     self._pif_fix_attempts += 1
-                    if self._pif_fix_attempts <= 2:
+                    if self._pif_fix_attempts <= 1:
                         pif_status = "degraded"
                         log.warning("PIF HEALTH: No fresh token in %.0f min — auto-fix attempt #%d",
                                     token_age_min, self._pif_fix_attempts)
