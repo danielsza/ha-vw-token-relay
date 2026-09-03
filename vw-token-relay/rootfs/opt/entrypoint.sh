@@ -244,7 +244,30 @@ VNCEOF
     # Verify the file exists
     VNC_DEFAULTS_CHECK=$(adb shell "su -c 'ls -la /storage/emulated/0/Android/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null || echo "MISSING")
     echo "VNC: defaults.json → ${VNC_DEFAULTS_CHECK}"
-    rm -f "${VNC_DEFAULTS}"
+
+    # Also write settings directly into SharedPreferences (bypasses FUSE issues)
+    VNC_PREFS_DIR="/data/data/${VNC_PKG}/shared_prefs"
+    adb shell "su -c 'mkdir -p ${VNC_PREFS_DIR}'" 2>/dev/null
+    cat > /tmp/vnc_prefs.xml << 'PREFSEOF'
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <int name="settings_port" value="5900" />
+    <string name="settings_access_key">vwrelay_vnc_local</string>
+    <boolean name="settings_start_on_boot" value="true" />
+    <int name="settings_start_on_boot_delay" value="5" />
+    <boolean name="settings_view_only" value="false" />
+    <boolean name="settings_file_transfer" value="false" />
+    <float name="settings_scaling" value="0.5" />
+</map>
+PREFSEOF
+    adb push /tmp/vnc_prefs.xml /data/local/tmp/vnc_prefs.xml 2>/dev/null
+    adb shell "su -c 'cp /data/local/tmp/vnc_prefs.xml ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
+    if [ -n "${VNC_APP_UID}" ]; then
+        adb shell "su -c 'chown ${VNC_APP_UID}:${VNC_APP_UID} ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
+        adb shell "su -c 'chmod 660 ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
+    fi
+    echo "VNC: SharedPreferences written as fallback"
+    rm -f "${VNC_DEFAULTS}" /tmp/vnc_prefs.xml
 
     # 3) Grant ALL permissions the app might need (before first launch)
     echo "VNC: Granting permissions..."
@@ -310,40 +333,69 @@ start_vnc_server() {
 
 accept_media_projection() {
     # On Android 10+, MediaProjection shows a consent dialog.
-    # Auto-accept it via uiautomator on the rooted phone.
+    # Multiple strategies to detect and accept it.
     echo "VNC: Checking for MediaProjection consent dialog..."
     sleep 5
-    for attempt in 1 2 3 4 5; do
-        DUMP=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
-        echo "VNC: UI dump attempt ${attempt} (${#DUMP} chars)"
-        if echo "${DUMP}" | grep -qi "start now\|Start recording\|allow\|start capturing\|droidVNC\|screen capture\|will start capturing"; then
-            echo "VNC: Found consent dialog — accepting..."
-            # Try "Start now" button first
-            BOUNDS=""
-            for BTN_TEXT in "Start now" "START NOW" "start now" "Allow" "ALLOW" "allow" "Start" "OK" "ok"; do
-                BOUNDS=$(echo "${DUMP}" | grep -oi "text=\"${BTN_TEXT}\"[^/]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | head -1 | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"')
-                [ -n "${BOUNDS}" ] && break
-            done
-            if [ -n "${BOUNDS}" ]; then
-                X1=$(echo "${BOUNDS}" | sed 's/bounds="\[\([0-9]*\),.*/\1/')
-                Y1=$(echo "${BOUNDS}" | sed 's/bounds="\[[0-9]*,\([0-9]*\)\].*/\1/')
-                X2=$(echo "${BOUNDS}" | sed 's/.*\]\[\([0-9]*\),.*/\1/')
-                Y2=$(echo "${BOUNDS}" | sed 's/.*\]\[[0-9]*,\([0-9]*\)\].*/\1/')
-                CX=$(( (X1 + X2) / 2 ))
-                CY=$(( (Y1 + Y2) / 2 ))
-                adb shell "input tap ${CX} ${CY}" 2>/dev/null
-                echo "VNC: Tapped consent button at ${CX},${CY}"
-            else
-                echo "VNC: Dialog found but no button bounds — trying generic tap"
-                adb shell "input tap 540 1200" 2>/dev/null
-            fi
-            sleep 3
+
+    for attempt in 1 2 3 4 5 6 7 8; do
+        # Strategy 1: Check dumpsys window for the consent dialog
+        FOCUS=$(adb shell "dumpsys window windows" 2>/dev/null | grep -i "mCurrentFocus\|mFocusedApp" | head -2)
+        echo "VNC: Attempt ${attempt} — focus: ${FOCUS}"
+
+        if echo "${FOCUS}" | grep -qi "MediaProjection\|GrantPermission\|permission\|AlertDialog\|chooser"; then
+            echo "VNC: Consent dialog detected via window focus — accepting..."
+            # Try Enter key first (most reliable for dialogs)
+            adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+            sleep 0.5
+            adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+            sleep 0.5
+            adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+            sleep 2
+            echo "VNC: Sent Enter key to accept dialog"
             return 0
         fi
-        echo "VNC: No consent dialog on attempt ${attempt}"
+
+        # Strategy 2: Try uiautomator dump
+        DUMP=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
+        if [ ${#DUMP} -gt 100 ]; then
+            echo "VNC: UI dump: ${#DUMP} chars"
+            if echo "${DUMP}" | grep -qi "start now\|Start recording\|allow\|start capturing\|screen capture\|will start capturing"; then
+                echo "VNC: Found consent dialog in UI dump — tapping..."
+                # Try to find and tap the accept button
+                BOUNDS=""
+                for BTN_TEXT in "Start now" "START NOW" "start now" "Allow" "ALLOW" "Start" "OK"; do
+                    BOUNDS=$(echo "${DUMP}" | grep -oi "text=\"${BTN_TEXT}\"[^/]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | head -1 | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"')
+                    [ -n "${BOUNDS}" ] && break
+                done
+                if [ -n "${BOUNDS}" ]; then
+                    X1=$(echo "${BOUNDS}" | sed 's/bounds="\[\([0-9]*\),.*/\1/')
+                    Y1=$(echo "${BOUNDS}" | sed 's/bounds="\[[0-9]*,\([0-9]*\)\].*/\1/')
+                    X2=$(echo "${BOUNDS}" | sed 's/.*\]\[\([0-9]*\),.*/\1/')
+                    Y2=$(echo "${BOUNDS}" | sed 's/.*\]\[[0-9]*,\([0-9]*\)\].*/\1/')
+                    CX=$(( (X1 + X2) / 2 ))
+                    CY=$(( (Y1 + Y2) / 2 ))
+                    adb shell "input tap ${CX} ${CY}" 2>/dev/null
+                    echo "VNC: Tapped at ${CX},${CY}"
+                else
+                    adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+                fi
+                sleep 3
+                return 0
+            fi
+        else
+            echo "VNC: UI dump too short (${#DUMP} chars) — trying blind accept"
+            # If uiautomator consistently fails, try blind keypress
+            if [ "${attempt}" -ge 3 ]; then
+                adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+                sleep 1
+                # Also try tap at common "Start now" button position on Moto G Pure (720x1440)
+                adb shell "input tap 540 1200" 2>/dev/null
+                sleep 1
+            fi
+        fi
         sleep 3
     done
-    echo "VNC: No MediaProjection dialog found after 5 attempts"
+    echo "VNC: No MediaProjection dialog detected after 8 attempts"
 }
 
 verify_vnc_listening() {
