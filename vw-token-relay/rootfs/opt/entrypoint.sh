@@ -231,22 +231,31 @@ except Exception as e:
 
     # 2) Enable accessibility service FIRST — required for fallback screen capture
     #    and to avoid InputRequestActivity blocking VNC start
-    echo "VNC: Enabling accessibility input service..."
-    CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
-    if ! echo "${CURRENT_A11Y}" | grep -q "droidvnc_ng"; then
-        if [ -n "${CURRENT_A11Y}" ] && [ "${CURRENT_A11Y}" != "null" ]; then
-            NEW_A11Y="${CURRENT_A11Y}:${VNC_PKG}/.InputService"
-        else
-            NEW_A11Y="${VNC_PKG}/.InputService"
-        fi
-        adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
-    fi
-    adb shell settings put secure accessibility_enabled 1 2>/dev/null
+    echo "VNC: Setting up accessibility input service..."
 
-    # Launch app briefly to trigger accessibility service binding
+    # Force re-registration: toggle off then on to recover from stuck "Binding" state
+    # (previous pm clear can leave the service registered but unable to connect)
+    echo "VNC: Toggling accessibility service for clean bind..."
+    adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
+    adb shell settings put secure accessibility_enabled 0 2>/dev/null
+    sleep 2
+
+    # Now re-enable
+    CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
+    if [ -z "${CURRENT_A11Y}" ] || [ "${CURRENT_A11Y}" = "null" ]; then
+        NEW_A11Y="${VNC_PKG}/.InputService"
+    else
+        NEW_A11Y="${CURRENT_A11Y}:${VNC_PKG}/.InputService"
+    fi
+    adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
+    adb shell settings put secure accessibility_enabled 1 2>/dev/null
+    sleep 3
+
+    # Launch app so Android has the service process to bind to
     echo "VNC: Launching app to trigger accessibility binding..."
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
-    sleep 3
+    sleep 5
+
     # Press Home if InputRequestActivity appeared
     FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
     if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
@@ -256,16 +265,23 @@ except Exception as e:
     fi
 
     # Wait for InputService to bind — check with dumpsys
-    echo "VNC: Waiting for accessibility service to bind..."
-    for i in 1 2 3 4 5 6; do
-        A11Y_STATUS=$(adb shell "dumpsys accessibility" 2>/dev/null | grep -i "droidvnc_ng" | head -3)
-        if echo "${A11Y_STATUS}" | grep -qi "isConnected=true\|Connected"; then
-            echo "VNC: InputService connected"
+    echo "VNC: Waiting for accessibility service to connect..."
+    VNC_A11Y_CONNECTED=false
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        A11Y_BOUND=$(adb shell "dumpsys accessibility" 2>/dev/null | grep -A5 "droidvnc_ng")
+        if echo "${A11Y_BOUND}" | grep -qi "mIsConnected=true"; then
+            echo "VNC: InputService connected!"
+            VNC_A11Y_CONNECTED=true
             break
         fi
-        echo "VNC: Waiting... (${i}/6) ${A11Y_STATUS}"
+        echo "VNC: Waiting for bind... (${i}/10)"
         sleep 3
     done
+    if [ "${VNC_A11Y_CONNECTED}" = "false" ]; then
+        echo "VNC: WARNING — InputService did not connect after 30s"
+        echo "VNC: Accessibility state:"
+        adb shell "dumpsys accessibility" 2>/dev/null | grep -A10 "droidvnc_ng" | head -15
+    fi
 
     # 3) Grant ALL permissions
     echo "VNC: Granting permissions..."
