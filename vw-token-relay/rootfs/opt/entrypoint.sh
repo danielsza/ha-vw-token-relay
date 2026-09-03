@@ -209,26 +209,14 @@ setup_vnc() {
     # 6) Wake screen
     wake_screen
 
-    # 7) Start VNC server — choose mode based on accessibility state
-    if [ "${VNC_A11Y_CONNECTED}" = "true" ]; then
-        echo "VNC: Using fallback screen capture (accessibility connected)"
-        VNC_USE_FALLBACK=true
-    else
-        echo "VNC: Using MediaProjection mode (accessibility NOT connected)"
-        VNC_USE_FALLBACK=false
-    fi
+    # 7) Start VNC server — always use fallback screen capture to skip
+    #    MediaProjection consent (Step 4). If accessibility isn't truly connected,
+    #    screen capture will fail but the VNC TCP server should still start.
+    VNC_USE_FALLBACK=true
+    echo "VNC: Using fallback screen capture mode (a11y=${VNC_A11Y_CONNECTED})"
     start_vnc_server
 
-    # 8) Accept MediaProjection consent dialog if it appears (for MediaProjection mode)
-    #    The multi-step flow should now proceed past InputRequestActivity.
-    #    Next blocking point could be the MediaProjection consent dialog.
-    if [ "${VNC_USE_FALLBACK}" = "false" ]; then
-        echo "VNC: Granting MediaProjection via root..."
-        adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
-        accept_media_projection
-    fi
-
-    # 9) Wait for VNC to finish its permission flow and start listening
+    # 8) Wait for VNC to finish its multi-step permission flow
     sleep 5
 
     # 10) Verify VNC is actually listening on phone
@@ -447,48 +435,98 @@ start_vnc_server() {
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
     sleep 5
 
-    # Start the foreground service — this triggers Step 1 of droidVNC-NG's
-    # multi-step permission flow: persist intent → request input (a11y)
+    # Start the foreground service — triggers Step 1 of droidVNC-NG's
+    # multi-step permission flow: persist intent → InputRequest (Step 2) →
+    # WriteStorage/Notification (Step 3) → MediaProjection (Step 4) → VNC starts
     VNC_START_CMD="am start-foreground-service"
     VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
     VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
     VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
     VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
     VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
-    if [ "${VNC_USE_FALLBACK}" = "true" ]; then
-        echo "VNC: Starting with FALLBACK_SCREEN_CAPTURE (accessibility mode)..."
-        VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
-    else
-        echo "VNC: Starting with MediaProjection mode..."
-    fi
+    VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
-    echo "VNC: Sending ACTION_START..."
+    echo "VNC: Sending ACTION_START (fallback capture mode)..."
     adb shell "${VNC_START_CMD}" 2>&1
     sleep 3
 
-    # droidVNC-NG has a multi-step permission flow:
-    #   ACTION_START → InputRequestActivity (Step 2) → storage/notification (Step 3) → MediaProjection (Step 4) → VNC starts
-    # If InputRequestActivity appears (because InputService.isConnected() returns false),
-    # the flow blocks. Pressing Home just hides it without calling postResult().
-    # Fix: dismiss the activity AND manually send ACTION_HANDLE_INPUT_RESULT to bypass the block.
-    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-        echo "VNC: InputRequestActivity blocking — bypassing with direct intent..."
-        # Dismiss the blocking activity
-        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-        sleep 1
-        # Send the result intent directly to MainService (same as what postResult() does)
-        # This tells MainService "accessibility check done, proceed to next step"
-        adb shell "am start-foreground-service \
-            -n ${VNC_PKG}/.MainService \
-            -a action_handle_a11y_result \
-            --ez result_a11y true \
-            --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-        echo "VNC: Sent ACTION_HANDLE_INPUT_RESULT — flow should continue to Steps 3-5"
-        sleep 5
-    fi
+    # droidVNC-NG has a multi-step permission flow. Each step launches an Activity
+    # that blocks until the user acts. On a headless phone, we bypass each step by
+    # detecting the blocking activity and sending the result intent directly.
+    #
+    # Flow: ACTION_START (Step 1) → InputRequestActivity (Step 2) →
+    #        WriteStorageRequestActivity (Step 3, Android <13) → VNC starts
+    #        (Step 4 MediaProjection is SKIPPED because EXTRA_FALLBACK_SCREEN_CAPTURE=true)
+    vnc_bypass_permission_flow
+}
+
+vnc_bypass_permission_flow() {
+    echo "VNC: Checking for blocking permission activities..."
+
+    for round in 1 2 3 4 5 6; do
+        FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+        echo "VNC: Round ${round} foreground: ${FOREGROUND}"
+
+        if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
+            echo "VNC: Bypassing InputRequestActivity (Step 2 — accessibility)..."
+            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+            sleep 1
+            # Send ACTION_HANDLE_INPUT_RESULT directly to MainService
+            adb shell "am start-foreground-service \
+                -n ${VNC_PKG}/.MainService \
+                -a action_handle_a11y_result \
+                --ez result_a11y true \
+                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+            echo "VNC: Sent input result — proceeding to Step 3"
+            sleep 3
+            continue
+
+        elif echo "${FOREGROUND}" | grep -q "WriteStorageRequestActivity"; then
+            echo "VNC: Bypassing WriteStorageRequestActivity (Step 3 — storage)..."
+            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+            sleep 1
+            # Send ACTION_HANDLE_WRITE_STORAGE_RESULT directly
+            adb shell "am start-foreground-service \
+                -n ${VNC_PKG}/.MainService \
+                -a action_handle_write_storage_result \
+                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+            echo "VNC: Sent storage result — proceeding to VNC start"
+            sleep 3
+            continue
+
+        elif echo "${FOREGROUND}" | grep -q "NotificationRequestActivity"; then
+            echo "VNC: Bypassing NotificationRequestActivity (Step 3 — notification)..."
+            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+            sleep 1
+            adb shell "am start-foreground-service \
+                -n ${VNC_PKG}/.MainService \
+                -a action_handle_notification_result \
+                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+            echo "VNC: Sent notification result"
+            sleep 3
+            continue
+
+        elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
+            echo "VNC: Bypassing MediaProjectionRequestActivity (Step 4 — should not happen with fallback)..."
+            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+            sleep 1
+            # This shouldn't happen with EXTRA_FALLBACK_SCREEN_CAPTURE=true,
+            # but if it does, send result code 0 (no projection — use fallback)
+            adb shell "am start-foreground-service \
+                -n ${VNC_PKG}/.MainService \
+                -a action_handle_media_projection_result \
+                --ei result_code_media_projection_request 0 \
+                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+            sleep 3
+            continue
+        fi
+
+        # No blocking activity — flow has progressed past permission checks
+        echo "VNC: No blocking activity detected — permission flow complete"
+        break
+    done
 }
 
 accept_media_projection() {
