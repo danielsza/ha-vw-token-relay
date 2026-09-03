@@ -1,5 +1,5 @@
 name: "VW Token Relay"
-version: "1.10.85"
+version: "1.10.86"
 slug: "vw-token-relay"
 description: "Captures VW app OAuth tokens via Frida over USB and relays them via MQTT for CarConnectivity Play Integrity bypass."
 panel_icon: "mdi:cellphone-link"
@@ -11,6 +11,10 @@ usb: true
 full_access: true
 ingress: true
 ingress_port: 8099
+ports:
+  "5900/tcp": 5900
+ports_description:
+  "5900/tcp": "VNC Server (droidVNC-NG on phone)"
 options:
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
@@ -23,6 +27,8 @@ options:
   vw_password: ""
   vw_spin: ""
   log_level: "info"
+  vnc_enabled: true
+  vnc_password: ""
 schema:
   mqtt_host: str
   mqtt_port: int
@@ -35,3 +41,5 @@ schema:
   vw_password: password?
   vw_spin: str?
   log_level: list(info|debug|warning|error)
+  vnc_enabled: bool
+  vnc_password: str?

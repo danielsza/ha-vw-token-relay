@@ -13,6 +13,8 @@ VW_USERNAME=$(jq -r '.vw_username // empty' "$OPTIONS")
 VW_PASSWORD=$(jq -r '.vw_password // empty' "$OPTIONS")
 VW_SPIN=$(jq -r '.vw_spin // empty' "$OPTIONS")
 LOG_LEVEL=$(jq -r '.log_level' "$OPTIONS")
+VNC_ENABLED=$(jq -r '.vnc_enabled // true' "$OPTIONS")
+VNC_PASSWORD=$(jq -r '.vnc_password // empty' "$OPTIONS")
 
 # ── Persist ADB keys across ALL addon lifecycle events ──
 # /data/.android/ survives restarts/rebuilds but is WIPED on uninstall.
@@ -129,6 +131,7 @@ echo "  MQTT: ${MQTT_HOST}:${MQTT_PORT}"
 echo "  Topic: ${MQTT_TOPIC}"
 echo "  VW Package: ${VW_PACKAGE}"
 echo "  Log Level: ${LOG_LEVEL}"
+echo "  VNC: ${VNC_ENABLED} (port 5900)"
 echo "============================================="
 
 # Export config for the relay script to pick up
@@ -146,6 +149,154 @@ CMD="${CMD} --mqtt-port ${MQTT_PORT}"
 [ -n "${VW_USERNAME}" ] && CMD="${CMD} --vw-email ${VW_USERNAME}"
 [ -n "${VW_PASSWORD}" ] && CMD="${CMD} --vw-password ${VW_PASSWORD}"
 [ -n "${VW_SPIN}" ] && CMD="${CMD} --vw-spin ${VW_SPIN}"
+
+# ── VNC Server (droidVNC-NG) ──
+VNC_PKG="net.christianbeier.droidvnc_ng"
+VNC_APK_CACHE="/share/.vw-relay/droidvnc-ng.apk"
+VNC_ACCESS_KEY="vwrelay_vnc_local"
+
+setup_vnc() {
+    if [ "${VNC_ENABLED}" != "true" ]; then
+        echo "VNC: Disabled in config"
+        return 0
+    fi
+
+    echo "VNC: Setting up droidVNC-NG..."
+
+    # 1) Install APK if not already on phone
+    if adb shell pm list packages 2>/dev/null | grep -q "${VNC_PKG}"; then
+        echo "VNC: droidVNC-NG already installed"
+    else
+        echo "VNC: Installing droidVNC-NG..."
+        # Download if not cached
+        if [ ! -f "${VNC_APK_CACHE}" ]; then
+            mkdir -p "$(dirname "${VNC_APK_CACHE}")"
+            echo "VNC: Downloading latest release from GitHub..."
+            /opt/venv/bin/python3 -c "
+import urllib.request, json, sys
+try:
+    data = json.loads(urllib.request.urlopen(
+        'https://api.github.com/repos/bk138/droidVNC-NG/releases/latest',
+        timeout=30).read())
+    apks = [a for a in data['assets'] if a['name'].endswith('.apk')]
+    if not apks:
+        sys.exit('No APK in release assets')
+    urllib.request.urlretrieve(apks[0]['browser_download_url'], '${VNC_APK_CACHE}')
+    print('VNC: Downloaded ' + apks[0]['name'])
+except Exception as e:
+    sys.exit('VNC: Download failed: ' + str(e))
+" 2>&1
+            if [ $? -ne 0 ]; then
+                echo "VNC: APK download failed"
+                rm -f "${VNC_APK_CACHE}"
+                return 1
+            fi
+        fi
+        adb install "${VNC_APK_CACHE}" 2>&1
+        if [ $? -ne 0 ]; then
+            echo "VNC: Install failed"
+            rm -f "${VNC_APK_CACHE}"
+            return 1
+        fi
+        echo "VNC: Installed successfully"
+    fi
+
+    # 2) Push defaults.json preseed (sets access key, port, password, auto-start)
+    echo "VNC: Writing preseed config..."
+    VNC_DEFAULTS="/tmp/vnc_defaults.json"
+    VNC_PASS_JSON=""
+    if [ -n "${VNC_PASSWORD}" ]; then
+        VNC_PASS_JSON="\"password\": \"${VNC_PASSWORD}\","
+    fi
+    cat > "${VNC_DEFAULTS}" << VNCEOF
+{
+    "port": 5900,
+    ${VNC_PASS_JSON}
+    "accessKey": "${VNC_ACCESS_KEY}",
+    "startOnBoot": true,
+    "startOnBootDelay": 5,
+    "viewOnly": false,
+    "fileTransfer": false,
+    "scaling": 0.5
+}
+VNCEOF
+    # Create app's external files dir and push defaults
+    adb shell "su -c 'mkdir -p /sdcard/Android/data/${VNC_PKG}/files'" 2>/dev/null
+    adb push "${VNC_DEFAULTS}" /data/local/tmp/vnc_defaults.json 2>/dev/null
+    adb shell "su -c 'cp /data/local/tmp/vnc_defaults.json /sdcard/Android/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
+    rm -f "${VNC_DEFAULTS}"
+
+    # 3) Grant screen capture permission (bypasses MediaProjection dialog)
+    echo "VNC: Granting screen capture permission..."
+    adb shell cmd appops set "${VNC_PKG}" PROJECT_MEDIA allow 2>/dev/null
+
+    # 4) Enable accessibility service for input injection
+    echo "VNC: Enabling input service..."
+    CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
+    if ! echo "${CURRENT_A11Y}" | grep -q "droidvnc_ng"; then
+        if [ -n "${CURRENT_A11Y}" ] && [ "${CURRENT_A11Y}" != "null" ]; then
+            NEW_A11Y="${CURRENT_A11Y}:${VNC_PKG}/.InputService"
+        else
+            NEW_A11Y="${VNC_PKG}/.InputService"
+        fi
+        adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
+    fi
+
+    # 5) Start VNC server via intent
+    start_vnc_server
+
+    # 6) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
+    setup_vnc_forwarding
+}
+
+start_vnc_server() {
+    echo "VNC: Starting server..."
+    VNC_START_CMD="am start-foreground-service"
+    VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
+    VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
+    VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
+    VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
+    VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
+    if [ -n "${VNC_PASSWORD}" ]; then
+        VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
+    fi
+    adb shell "${VNC_START_CMD}" 2>&1
+}
+
+setup_vnc_forwarding() {
+    # ADB forward binds to localhost only; socat bridges to 0.0.0.0
+    echo "VNC: Setting up port forwarding..."
+    adb forward tcp:15900 tcp:5900 2>/dev/null
+
+    # Kill any existing socat for VNC
+    pkill -f "socat.*TCP-LISTEN:5900" 2>/dev/null || true
+    sleep 1
+
+    # Bridge: external:5900 → localhost:15900 (ADB forward) → phone:5900
+    socat TCP-LISTEN:5900,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:15900 &
+    echo "VNC: Port forwarding active — connect to port 5900"
+}
+
+ensure_vnc() {
+    if [ "${VNC_ENABLED}" != "true" ]; then
+        return 0
+    fi
+
+    # Check if socat bridge is still running
+    if ! pgrep -f "socat.*TCP-LISTEN:5900" > /dev/null 2>&1; then
+        echo "VNC: socat bridge died — restarting forwarding..."
+        setup_vnc_forwarding
+    fi
+
+    # Check if VNC service is running on phone
+    if ! adb shell "dumpsys activity services ${VNC_PKG}" 2>/dev/null | grep -q "ServiceRecord"; then
+        echo "VNC: Service not running — restarting..."
+        start_vnc_server
+        sleep 2
+        # Re-establish ADB forward (may have been lost)
+        adb forward tcp:15900 tcp:5900 2>/dev/null
+    fi
+}
 
 wake_screen() {
     # Wake screen and dismiss lock screen (no PIN assumed)
@@ -216,6 +367,9 @@ ensure_phone_ready() {
 
     # Keep screen on while plugged in (developer setting)
     adb shell "settings put global stay_on_while_plugged_in 3" 2>/dev/null || true
+
+    # Set up VNC server (droidVNC-NG) if enabled
+    setup_vnc
 }
 
 # ── Watchdog loop: auto-restart on crash/disconnect ──

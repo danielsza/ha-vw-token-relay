@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     adb \
     jq \
+    socat \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
         frida==16.5.9 \

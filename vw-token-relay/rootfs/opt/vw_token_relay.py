@@ -789,6 +789,40 @@ class VWTokenRelay:
                                                           "search": search}))
                 except Exception as e:
                     log.error("UI_TAP: Failed: %s", e)
+        elif cmd == "vnc_restart":
+            # Restart droidVNC-NG on phone
+            try:
+                log.info("VNC: Restarting droidVNC-NG...")
+                VNC_PKG = "net.christianbeier.droidvnc_ng"
+                VNC_KEY = "vwrelay_vnc_local"
+                subprocess.run(
+                    ["adb", "shell", "am", "start-foreground-service",
+                     "-n", f"{VNC_PKG}/.MainService",
+                     "-a", f"{VNC_PKG}.ACTION_START",
+                     "--es", f"{VNC_PKG}.EXTRA_ACCESS_KEY", VNC_KEY,
+                     "--ei", f"{VNC_PKG}.EXTRA_PORT", "5900",
+                     "--ef", f"{VNC_PKG}.EXTRA_SCALING", "0.5"],
+                    capture_output=True, timeout=10)
+                # Re-establish port forwarding
+                subprocess.run(["adb", "forward", "tcp:15900", "tcp:5900"],
+                               capture_output=True, timeout=5)
+                log.info("VNC: Restarted successfully")
+            except Exception as e:
+                log.error("VNC: Restart failed: %s", e)
+        elif cmd == "vnc_stop":
+            try:
+                log.info("VNC: Stopping droidVNC-NG...")
+                VNC_PKG = "net.christianbeier.droidvnc_ng"
+                VNC_KEY = "vwrelay_vnc_local"
+                subprocess.run(
+                    ["adb", "shell", "am", "start-foreground-service",
+                     "-n", f"{VNC_PKG}/.MainService",
+                     "-a", f"{VNC_PKG}.ACTION_STOP",
+                     "--es", f"{VNC_PKG}.EXTRA_ACCESS_KEY", VNC_KEY],
+                    capture_output=True, timeout=10)
+                log.info("VNC: Stopped")
+            except Exception as e:
+                log.error("VNC: Stop failed: %s", e)
         else:
             log.warning("Unknown command: %s", cmd)
 
