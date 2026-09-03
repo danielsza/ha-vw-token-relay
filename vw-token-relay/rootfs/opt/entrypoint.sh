@@ -164,30 +164,90 @@ setup_vnc() {
     echo "VNC: Setting up droidVNC-NG..."
 
     # 1) Install or update APK — check version, force update if < 2.1.0
-    VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
-    echo "VNC: Installed version: ${VNC_INSTALLED_VER:-not installed}"
+    vnc_install_if_needed
 
-    VNC_NEED_INSTALL=false
-    if [ -z "${VNC_INSTALLED_VER}" ]; then
-        VNC_NEED_INSTALL=true
-    else
-        # Need at least 2.1.0 for EXTRA_FALLBACK_SCREEN_CAPTURE
-        VNC_MAJOR=$(echo "${VNC_INSTALLED_VER}" | cut -d. -f1)
-        VNC_MINOR=$(echo "${VNC_INSTALLED_VER}" | cut -d. -f2)
-        if [ "${VNC_MAJOR}" -lt 2 ] 2>/dev/null || { [ "${VNC_MAJOR}" -eq 2 ] && [ "${VNC_MINOR}" -lt 1 ]; } 2>/dev/null; then
-            echo "VNC: Version ${VNC_INSTALLED_VER} too old — need >= 2.1.0 for fallback capture"
-            VNC_NEED_INSTALL=true
-            # Delete cached APK to force re-download
-            rm -f "${VNC_APK_CACHE}"
+    # 2) Set up accessibility service and wait for it to connect
+    VNC_A11Y_CONNECTED=false
+    vnc_setup_accessibility
+
+    # 3) If accessibility didn't connect, nuclear option: full uninstall + reinstall
+    if [ "${VNC_A11Y_CONNECTED}" = "false" ]; then
+        echo "VNC: ═══ RECOVERY: Full uninstall/reinstall to fix damaged accessibility binding ═══"
+        adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
+        sleep 1
+        # Disable accessibility before uninstall
+        adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
+        adb shell settings put secure accessibility_enabled 0 2>/dev/null
+        sleep 1
+        # Full uninstall
+        echo "VNC: Uninstalling ${VNC_PKG}..."
+        adb shell "pm uninstall ${VNC_PKG}" 2>&1
+        sleep 3
+        # Reinstall from cache
+        if [ -f "${VNC_APK_CACHE}" ]; then
+            echo "VNC: Reinstalling from cache..."
+            adb install "${VNC_APK_CACHE}" 2>&1
+            sleep 2
+        else
+            echo "VNC: No cached APK — downloading..."
+            vnc_download_apk || return 1
+            adb install "${VNC_APK_CACHE}" 2>&1
+            sleep 2
         fi
+        VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
+        echo "VNC: Reinstalled version: ${VNC_INSTALLED_VER}"
+        # Retry accessibility setup on clean install
+        vnc_setup_accessibility
     fi
 
-    if [ "${VNC_NEED_INSTALL}" = "true" ]; then
-        echo "VNC: Installing/updating droidVNC-NG..."
-        if [ ! -f "${VNC_APK_CACHE}" ]; then
-            mkdir -p "$(dirname "${VNC_APK_CACHE}")"
-            echo "VNC: Downloading latest release from GitHub..."
-            /opt/venv/bin/python3 -c "
+    # 4) Grant ALL permissions
+    vnc_grant_permissions
+
+    # 5) Deploy config via SharedPreferences
+    vnc_deploy_config
+
+    # 6) Wake screen
+    wake_screen
+
+    # 7) Start VNC server — choose mode based on accessibility state
+    if [ "${VNC_A11Y_CONNECTED}" = "true" ]; then
+        echo "VNC: Using fallback screen capture (accessibility connected)"
+        VNC_USE_FALLBACK=true
+    else
+        echo "VNC: Using MediaProjection mode (accessibility NOT connected)"
+        VNC_USE_FALLBACK=false
+    fi
+    start_vnc_server
+
+    # 8) Check for InputRequestActivity or other blocking dialogs
+    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+    echo "VNC: Post-start foreground: ${FOREGROUND}"
+    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
+        echo "VNC: InputRequestActivity still shown — dismissing..."
+        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+        sleep 2
+        start_vnc_server
+    fi
+
+    # 9) Accept MediaProjection consent dialog if it appears
+    if [ "${VNC_USE_FALLBACK}" = "false" ]; then
+        # MediaProjection mode — try root grant first, then dialog accept
+        echo "VNC: Granting MediaProjection via root..."
+        adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
+        accept_media_projection
+    fi
+
+    # 10) Verify VNC is actually listening on phone
+    verify_vnc_listening
+
+    # 11) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
+    setup_vnc_forwarding
+}
+
+vnc_download_apk() {
+    mkdir -p "$(dirname "${VNC_APK_CACHE}")"
+    echo "VNC: Downloading latest release from GitHub..."
+    /opt/venv/bin/python3 -c "
 import urllib.request, json, sys
 try:
     data = json.loads(urllib.request.urlopen(
@@ -201,13 +261,36 @@ try:
 except Exception as e:
     sys.exit('VNC: Download failed: ' + str(e))
 " 2>&1
-            if [ $? -ne 0 ]; then
-                echo "VNC: APK download failed"
-                rm -f "${VNC_APK_CACHE}"
-                return 1
-            fi
+    if [ $? -ne 0 ]; then
+        echo "VNC: APK download failed"
+        rm -f "${VNC_APK_CACHE}"
+        return 1
+    fi
+    return 0
+}
+
+vnc_install_if_needed() {
+    VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
+    echo "VNC: Installed version: ${VNC_INSTALLED_VER:-not installed}"
+
+    VNC_NEED_INSTALL=false
+    if [ -z "${VNC_INSTALLED_VER}" ]; then
+        VNC_NEED_INSTALL=true
+    else
+        VNC_MAJOR=$(echo "${VNC_INSTALLED_VER}" | cut -d. -f1)
+        VNC_MINOR=$(echo "${VNC_INSTALLED_VER}" | cut -d. -f2)
+        if [ "${VNC_MAJOR}" -lt 2 ] 2>/dev/null || { [ "${VNC_MAJOR}" -eq 2 ] && [ "${VNC_MINOR}" -lt 1 ]; } 2>/dev/null; then
+            echo "VNC: Version ${VNC_INSTALLED_VER} too old — need >= 2.1.0"
+            VNC_NEED_INSTALL=true
+            rm -f "${VNC_APK_CACHE}"
         fi
-        # Uninstall old version first if present (cleans up broken storage state)
+    fi
+
+    if [ "${VNC_NEED_INSTALL}" = "true" ]; then
+        echo "VNC: Installing/updating droidVNC-NG..."
+        if [ ! -f "${VNC_APK_CACHE}" ]; then
+            vnc_download_apk || return 1
+        fi
         if [ -n "${VNC_INSTALLED_VER}" ]; then
             echo "VNC: Removing old version..."
             adb shell "pm uninstall ${VNC_PKG}" 2>/dev/null || true
@@ -222,32 +305,23 @@ except Exception as e:
         VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
         echo "VNC: Installed version: ${VNC_INSTALLED_VER}"
     else
-        # Just force-stop, don't pm clear — it wipes accessibility binding
-        # and the FUSE error is a system bug that pm clear can't fix
         echo "VNC: Stopping app for clean restart..."
         adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
         sleep 1
     fi
+}
 
-    # 2) Enable accessibility service FIRST — required for fallback screen capture
-    #    and to avoid InputRequestActivity blocking VNC start
+vnc_setup_accessibility() {
     echo "VNC: Setting up accessibility input service..."
 
-    # Force re-registration: toggle off then on to recover from stuck "Binding" state
-    # (previous pm clear can leave the service registered but unable to connect)
-    echo "VNC: Toggling accessibility service for clean bind..."
+    # Toggle off then on
+    echo "VNC: Toggling accessibility service off/on..."
     adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
     adb shell settings put secure accessibility_enabled 0 2>/dev/null
     sleep 2
 
-    # Now re-enable
-    CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
-    if [ -z "${CURRENT_A11Y}" ] || [ "${CURRENT_A11Y}" = "null" ]; then
-        NEW_A11Y="${VNC_PKG}/.InputService"
-    else
-        NEW_A11Y="${CURRENT_A11Y}:${VNC_PKG}/.InputService"
-    fi
-    adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
+    # Re-enable
+    adb shell settings put secure enabled_accessibility_services "${VNC_PKG}/.InputService" 2>/dev/null
     adb shell settings put secure accessibility_enabled 1 2>/dev/null
     sleep 3
 
@@ -264,26 +338,25 @@ except Exception as e:
         sleep 1
     fi
 
-    # Wait for InputService to bind — check with dumpsys
+    # Wait for InputService to connect (10 attempts, 30s)
     echo "VNC: Waiting for accessibility service to connect..."
-    VNC_A11Y_CONNECTED=false
     for i in 1 2 3 4 5 6 7 8 9 10; do
         A11Y_BOUND=$(adb shell "dumpsys accessibility" 2>/dev/null | grep -A5 "droidvnc_ng")
         if echo "${A11Y_BOUND}" | grep -qi "mIsConnected=true"; then
             echo "VNC: InputService connected!"
             VNC_A11Y_CONNECTED=true
-            break
+            return 0
         fi
         echo "VNC: Waiting for bind... (${i}/10)"
         sleep 3
     done
-    if [ "${VNC_A11Y_CONNECTED}" = "false" ]; then
-        echo "VNC: WARNING — InputService did not connect after 30s"
-        echo "VNC: Accessibility state:"
-        adb shell "dumpsys accessibility" 2>/dev/null | grep -A10 "droidvnc_ng" | head -15
-    fi
 
-    # 3) Grant ALL permissions
+    echo "VNC: WARNING — InputService did not connect after 30s"
+    echo "VNC: Accessibility state:"
+    adb shell "dumpsys accessibility" 2>/dev/null | grep -A10 "droidvnc_ng" | head -15
+}
+
+vnc_grant_permissions() {
     echo "VNC: Granting permissions..."
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.WRITE_EXTERNAL_STORAGE'" 2>/dev/null || true
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.READ_EXTERNAL_STORAGE'" 2>/dev/null || true
@@ -294,8 +367,9 @@ except Exception as e:
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'" 2>/dev/null || true
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.SYSTEM_ALERT_WINDOW'" 2>/dev/null || true
     adb shell "su -c 'appops set ${VNC_PKG} SYSTEM_ALERT_WINDOW allow'" 2>/dev/null || true
+}
 
-    # 4) Deploy config via SharedPreferences (primary — bypasses broken FUSE)
+vnc_deploy_config() {
     echo "VNC: Writing config via SharedPreferences..."
     VNC_APP_UID=$(adb shell "su -c 'stat -c %u /data/data/${VNC_PKG}'" 2>/dev/null || echo "")
     echo "VNC: App UID=${VNC_APP_UID}"
@@ -352,31 +426,6 @@ VNCEOF
         adb shell "su -c 'chown ${VNC_APP_UID}:${VNC_APP_UID} /data/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
     fi
     rm -f "${VNC_DEFAULTS}" /tmp/vnc_prefs.xml
-
-    # 5) Wake screen
-    wake_screen
-
-    # 6) Start VNC server via intent
-    start_vnc_server
-
-    # 7) Check for InputRequestActivity or other blocking dialogs
-    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-    echo "VNC: Post-start foreground: ${FOREGROUND}"
-    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-        echo "VNC: InputRequestActivity still shown — dismissing..."
-        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-        sleep 2
-        start_vnc_server
-    fi
-
-    # 8) Accept MediaProjection consent dialog if it appears
-    accept_media_projection
-
-    # 9) Verify VNC is actually listening on phone
-    verify_vnc_listening
-
-    # 10) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
-    setup_vnc_forwarding
 }
 
 start_vnc_server() {
@@ -385,21 +434,24 @@ start_vnc_server() {
     adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
     sleep 2
 
-    # Launch main activity so the app initializes and can request MediaProjection
+    # Launch main activity so the app initializes
     echo "VNC: Launching main activity..."
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
     sleep 5
 
-    # Now start the foreground service via intent
-    # EXTRA_FALLBACK_SCREEN_CAPTURE=true bypasses MediaProjection consent dialog
-    echo "VNC: Starting foreground service (fallback screen capture mode)..."
+    # Start the foreground service
     VNC_START_CMD="am start-foreground-service"
     VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
     VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
     VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
     VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
     VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
-    VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
+    if [ "${VNC_USE_FALLBACK}" = "true" ]; then
+        echo "VNC: Starting with FALLBACK_SCREEN_CAPTURE (accessibility mode)..."
+        VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
+    else
+        echo "VNC: Starting with MediaProjection mode..."
+    fi
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
@@ -476,49 +528,58 @@ accept_media_projection() {
 
 verify_vnc_listening() {
     echo "VNC: Verifying server is listening on phone..."
-    sleep 3
+    sleep 5
     # Check if port 5900 is open on the phone
     LISTENING=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep 5900 || \
                 adb shell "su -c 'netstat -tlnp'" 2>/dev/null | grep 5900 || echo "")
     if [ -n "${LISTENING}" ]; then
-        echo "VNC: Confirmed — phone listening on port 5900"
+        echo "VNC: ✓ Confirmed — phone listening on port 5900"
         echo "VNC: ${LISTENING}"
         return 0
     fi
 
-    echo "VNC: WARNING — port 5900 not open on phone!"
-    # Show recent logcat from the VNC app
-    echo "VNC: Checking droidVNC-NG logcat..."
+    echo "VNC: ✗ Port 5900 NOT open on phone!"
+
+    # Full diagnostic dump
+    echo "VNC: ═══ DIAGNOSTICS ═══"
     VNC_PID=$(adb shell pidof "${VNC_PKG}" 2>/dev/null || echo "")
     if [ -n "${VNC_PID}" ]; then
         echo "VNC: App running as PID ${VNC_PID}"
-        adb shell "logcat -d -t 30 --pid=${VNC_PID}" 2>&1 | grep -i "vnc\|media\|project\|screen\|error\|fail\|serv" | tail -15
+        echo "VNC: --- Full logcat (last 50 lines) ---"
+        adb shell "logcat -d -t 50 --pid=${VNC_PID}" 2>&1 | tail -50
     else
-        echo "VNC: App NOT running — checking crash logs..."
-        adb shell "logcat -d -t 30 -s Defaults,MainService,InputService" 2>&1 | tail -10
+        echo "VNC: App NOT running (crashed?)"
+        echo "VNC: --- Recent crash/VNC logs ---"
+        adb shell "logcat -d -t 100" 2>&1 | grep -i "droidvnc\|MainService\|InputService\|AndroidRuntime\|FATAL\|NullPointer\|died\|crash" | tail -30
     fi
+    echo "VNC: --- Service state ---"
+    adb shell "dumpsys activity services ${VNC_PKG}" 2>/dev/null | head -20
+    echo "VNC: --- All listening ports ---"
+    adb shell "su -c 'ss -tlnp'" 2>/dev/null | head -15
+    echo "VNC: ═══ END DIAGNOSTICS ═══"
 
-    # Retry: re-grant everything and restart
-    echo "VNC: Retrying with full permission reset..."
+    # Retry: re-grant and restart
+    echo "VNC: Retrying..."
     adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
-    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE'" 2>/dev/null || true
-    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'" 2>/dev/null || true
-    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.SYSTEM_ALERT_WINDOW'" 2>/dev/null || true
-
-    # Restart the service
     adb shell "am force-stop ${VNC_PKG}" 2>/dev/null || true
     sleep 2
     start_vnc_server
-    accept_media_projection
-    sleep 3
+
+    if [ "${VNC_USE_FALLBACK}" = "false" ]; then
+        accept_media_projection
+    fi
+    sleep 5
 
     LISTENING2=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep 5900 || echo "")
     if [ -n "${LISTENING2}" ]; then
-        echo "VNC: Confirmed after retry — phone listening on port 5900"
+        echo "VNC: ✓ Confirmed after retry — phone listening on port 5900"
     else
-        echo "VNC: Still not listening after retry"
-        echo "VNC: All listening ports:"
-        adb shell "su -c 'ss -tlnp'" 2>/dev/null | head -10
+        echo "VNC: ✗ Still not listening after retry"
+        VNC_PID2=$(adb shell pidof "${VNC_PKG}" 2>/dev/null || echo "")
+        if [ -n "${VNC_PID2}" ]; then
+            echo "VNC: Post-retry logcat (PID ${VNC_PID2}):"
+            adb shell "logcat -d -t 30 --pid=${VNC_PID2}" 2>&1 | tail -30
+        fi
     fi
 }
 
