@@ -245,12 +245,22 @@ VNCEOF
     # 5) Start VNC server via intent
     start_vnc_server
 
-    # 6) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
+    # 6) Accept MediaProjection consent dialog if it appears
+    accept_media_projection
+
+    # 7) Verify VNC is actually listening on phone
+    verify_vnc_listening
+
+    # 8) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
     setup_vnc_forwarding
 }
 
 start_vnc_server() {
     echo "VNC: Starting server..."
+    # First launch the main activity so MediaProjection can be requested
+    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
+    sleep 3
+
     VNC_START_CMD="am start-foreground-service"
     VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
     VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
@@ -261,6 +271,80 @@ start_vnc_server() {
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
     adb shell "${VNC_START_CMD}" 2>&1
+}
+
+accept_media_projection() {
+    # On Android 10+, MediaProjection shows a consent dialog.
+    # Auto-accept it via uiautomator on the rooted phone.
+    echo "VNC: Checking for MediaProjection consent dialog..."
+    sleep 3
+    # Look for "Start now" or "Allow" button in the system dialog
+    for attempt in 1 2 3; do
+        DUMP=$(adb shell uiautomator dump /dev/tty 2>/dev/null || echo "")
+        if echo "${DUMP}" | grep -qi "start now\|Start recording\|allow\|start capturing"; then
+            echo "VNC: Found MediaProjection consent dialog — accepting..."
+            # Try clicking "Start now" button
+            BOUNDS=$(echo "${DUMP}" | grep -oi 'text="[Ss]tart [Nn]ow"[^/]*bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"' | head -1 | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"')
+            if [ -z "${BOUNDS}" ]; then
+                # Try "Allow" button
+                BOUNDS=$(echo "${DUMP}" | grep -oi 'text="[Aa]llow"[^/]*bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"' | head -1 | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"')
+            fi
+            if [ -n "${BOUNDS}" ]; then
+                # Extract center coordinates from bounds="[x1,y1][x2,y2]"
+                X1=$(echo "${BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\].*/\1/')
+                Y1=$(echo "${BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
+                X2=$(echo "${BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\1/')
+                Y2=$(echo "${BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
+                CX=$(( (X1 + X2) / 2 ))
+                CY=$(( (Y1 + Y2) / 2 ))
+                adb shell "input tap ${CX} ${CY}" 2>/dev/null
+                echo "VNC: Tapped consent button at ${CX},${CY}"
+                sleep 2
+                break
+            else
+                echo "VNC: Dialog found but couldn't extract button coordinates — trying generic tap"
+                # Tap center-right of screen (typical "Allow"/"Start now" position)
+                adb shell "input tap 540 1200" 2>/dev/null
+                sleep 2
+                break
+            fi
+        fi
+        sleep 2
+    done
+}
+
+verify_vnc_listening() {
+    echo "VNC: Verifying server is listening on phone..."
+    sleep 2
+    # Check if port 5900 is open on the phone
+    LISTENING=$(adb shell "su -c 'ss -tlnp | grep 5900'" 2>/dev/null || \
+                adb shell "su -c 'netstat -tlnp | grep 5900'" 2>/dev/null || echo "")
+    if [ -n "${LISTENING}" ]; then
+        echo "VNC: Confirmed — phone listening on port 5900"
+        echo "VNC: ${LISTENING}"
+    else
+        echo "VNC: WARNING — port 5900 not open on phone!"
+        echo "VNC: Checking droidVNC-NG logcat..."
+        adb shell "logcat -d -t 20 --pid=\$(pidof ${VNC_PKG} 2>/dev/null || echo 0)" 2>&1 | tail -10
+        # Try one more time with root
+        echo "VNC: Retrying with explicit MediaProjection grant..."
+        adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
+        adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE'" 2>/dev/null
+        adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'" 2>/dev/null || true
+        # Restart the service
+        adb shell "am stopservice -n ${VNC_PKG}/.MainService" 2>/dev/null || true
+        sleep 2
+        start_vnc_server
+        sleep 3
+        accept_media_projection
+        sleep 2
+        LISTENING2=$(adb shell "su -c 'ss -tlnp | grep 5900'" 2>/dev/null || echo "")
+        if [ -n "${LISTENING2}" ]; then
+            echo "VNC: Confirmed after retry — phone listening on port 5900"
+        else
+            echo "VNC: Still not listening — droidVNC-NG may need manual start on first use"
+        fi
+    fi
 }
 
 setup_vnc_forwarding() {
