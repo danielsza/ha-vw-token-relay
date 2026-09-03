@@ -229,29 +229,34 @@ except Exception as e:
         sleep 2
     fi
 
-    # 2) Grant storage permissions FIRST (before any file placement)
-    echo "VNC: Granting storage permissions..."
+    # 2) Enable accessibility service FIRST — app shows InputRequestActivity if not set
+    echo "VNC: Enabling accessibility input service..."
+    CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
+    if ! echo "${CURRENT_A11Y}" | grep -q "droidvnc_ng"; then
+        if [ -n "${CURRENT_A11Y}" ] && [ "${CURRENT_A11Y}" != "null" ]; then
+            NEW_A11Y="${CURRENT_A11Y}:${VNC_PKG}/.InputService"
+        else
+            NEW_A11Y="${VNC_PKG}/.InputService"
+        fi
+        adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
+    fi
+    adb shell settings put secure accessibility_enabled 1 2>/dev/null
+    # Give system time to bind the accessibility service
+    sleep 5
+
+    # 3) Grant ALL permissions
+    echo "VNC: Granting permissions..."
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.WRITE_EXTERNAL_STORAGE'" 2>/dev/null || true
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.READ_EXTERNAL_STORAGE'" 2>/dev/null || true
     adb shell "su -c 'appops set ${VNC_PKG} MANAGE_EXTERNAL_STORAGE allow'" 2>/dev/null || true
     adb shell "su -c 'appops set ${VNC_PKG} android:legacy_storage allow'" 2>/dev/null || true
-
-    # Grant runtime permissions
     adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE'" 2>/dev/null || true
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'" 2>/dev/null || true
     adb shell "su -c 'pm grant ${VNC_PKG} android.permission.SYSTEM_ALERT_WINDOW'" 2>/dev/null || true
     adb shell "su -c 'appops set ${VNC_PKG} SYSTEM_ALERT_WINDOW allow'" 2>/dev/null || true
 
-    # 3) Launch app once to let it initialize its own storage directories properly
-    echo "VNC: Initial launch to create storage dirs..."
-    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
-    sleep 5
-    adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
-    sleep 1
-
-    # 4) Deploy config files — SharedPreferences is the primary config method
-    # (defaults.json via getExternalFilesDir is broken on this device's FUSE layer)
+    # 4) Deploy config via SharedPreferences (primary — bypasses broken FUSE)
     echo "VNC: Writing config via SharedPreferences..."
     VNC_APP_UID=$(adb shell "su -c 'stat -c %u /data/data/${VNC_PKG}'" 2>/dev/null || echo "")
     echo "VNC: App UID=${VNC_APP_UID}"
@@ -283,7 +288,7 @@ PREFSEOF
     fi
     echo "VNC: SharedPreferences written"
 
-    # Also try defaults.json in internal data dir (doesn't go through FUSE)
+    # Also place defaults.json in internal data dir (not FUSE-gated)
     VNC_DEFAULTS="/tmp/vnc_defaults.json"
     VNC_PASS_JSON=""
     if [ -n "${VNC_PASSWORD}" ]; then
@@ -309,25 +314,21 @@ VNCEOF
     fi
     rm -f "${VNC_DEFAULTS}" /tmp/vnc_prefs.xml
 
-    # 5) Enable accessibility service for input injection
-    echo "VNC: Enabling input service..."
-    CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
-    if ! echo "${CURRENT_A11Y}" | grep -q "droidvnc_ng"; then
-        if [ -n "${CURRENT_A11Y}" ] && [ "${CURRENT_A11Y}" != "null" ]; then
-            NEW_A11Y="${CURRENT_A11Y}:${VNC_PKG}/.InputService"
-        else
-            NEW_A11Y="${VNC_PKG}/.InputService"
-        fi
-        adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
-    fi
-    # Give accessibility service time to bind
-    sleep 3
-
-    # 6) Wake screen
+    # 5) Wake screen
     wake_screen
 
-    # 7) Start VNC server via intent
+    # 6) Start VNC server via intent
     start_vnc_server
+
+    # 7) Dismiss InputRequestActivity if it appeared (press Home)
+    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
+        echo "VNC: InputRequestActivity shown — dismissing with Home key..."
+        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+        sleep 2
+        # Restart the service after dismissing
+        start_vnc_server
+    fi
 
     # 8) Accept MediaProjection consent dialog if it appears
     accept_media_projection
