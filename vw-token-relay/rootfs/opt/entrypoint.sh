@@ -219,23 +219,17 @@ setup_vnc() {
     fi
     start_vnc_server
 
-    # 8) Check for InputRequestActivity or other blocking dialogs
-    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-    echo "VNC: Post-start foreground: ${FOREGROUND}"
-    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-        echo "VNC: InputRequestActivity still shown — dismissing..."
-        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-        sleep 2
-        start_vnc_server
-    fi
-
-    # 9) Accept MediaProjection consent dialog if it appears
+    # 8) Accept MediaProjection consent dialog if it appears (for MediaProjection mode)
+    #    The multi-step flow should now proceed past InputRequestActivity.
+    #    Next blocking point could be the MediaProjection consent dialog.
     if [ "${VNC_USE_FALLBACK}" = "false" ]; then
-        # MediaProjection mode — try root grant first, then dialog accept
         echo "VNC: Granting MediaProjection via root..."
         adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
         accept_media_projection
     fi
+
+    # 9) Wait for VNC to finish its permission flow and start listening
+    sleep 5
 
     # 10) Verify VNC is actually listening on phone
     verify_vnc_listening
@@ -339,13 +333,27 @@ vnc_setup_accessibility() {
     fi
 
     # Wait for InputService to connect (10 attempts, 30s)
+    # Check for EITHER mIsConnected=true (newer Android) OR the service
+    # being listed in "Bound services" (Android 11 format)
     echo "VNC: Waiting for accessibility service to connect..."
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        A11Y_BOUND=$(adb shell "dumpsys accessibility" 2>/dev/null | grep -A5 "droidvnc_ng")
-        if echo "${A11Y_BOUND}" | grep -qi "mIsConnected=true"; then
-            echo "VNC: InputService connected!"
+        A11Y_DUMP=$(adb shell "dumpsys accessibility" 2>/dev/null)
+        A11Y_VNC=$(echo "${A11Y_DUMP}" | grep -A15 "droidvnc_ng")
+        # Method 1: explicit mIsConnected field (Android 12+)
+        if echo "${A11Y_VNC}" | grep -qi "mIsConnected=true"; then
+            echo "VNC: InputService connected (mIsConnected=true)!"
             VNC_A11Y_CONNECTED=true
             return 0
+        fi
+        # Method 2: service in "Bound services" but NOT in "Binding services" or "Crashed services" (Android 11)
+        if echo "${A11Y_VNC}" | grep -q "Bound services:.*droidVNC"; then
+            A11Y_BINDING=$(echo "${A11Y_VNC}" | grep "Binding services:" | head -1)
+            A11Y_CRASHED=$(echo "${A11Y_VNC}" | grep "Crashed services:" | head -1)
+            if ! echo "${A11Y_BINDING}" | grep -q "droidvnc" && ! echo "${A11Y_CRASHED}" | grep -q "droidvnc"; then
+                echo "VNC: InputService connected (in Bound services)!"
+                VNC_A11Y_CONNECTED=true
+                return 0
+            fi
         fi
         echo "VNC: Waiting for bind... (${i}/10)"
         sleep 3
@@ -353,7 +361,7 @@ vnc_setup_accessibility() {
 
     echo "VNC: WARNING — InputService did not connect after 30s"
     echo "VNC: Accessibility state:"
-    adb shell "dumpsys accessibility" 2>/dev/null | grep -A10 "droidvnc_ng" | head -15
+    adb shell "dumpsys accessibility" 2>/dev/null | grep -A15 "droidvnc_ng" | head -20
 }
 
 vnc_grant_permissions() {
@@ -439,7 +447,8 @@ start_vnc_server() {
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
     sleep 5
 
-    # Start the foreground service
+    # Start the foreground service — this triggers Step 1 of droidVNC-NG's
+    # multi-step permission flow: persist intent → request input (a11y)
     VNC_START_CMD="am start-foreground-service"
     VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
     VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
@@ -455,8 +464,31 @@ start_vnc_server() {
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
+    echo "VNC: Sending ACTION_START..."
     adb shell "${VNC_START_CMD}" 2>&1
     sleep 3
+
+    # droidVNC-NG has a multi-step permission flow:
+    #   ACTION_START → InputRequestActivity (Step 2) → storage/notification (Step 3) → MediaProjection (Step 4) → VNC starts
+    # If InputRequestActivity appears (because InputService.isConnected() returns false),
+    # the flow blocks. Pressing Home just hides it without calling postResult().
+    # Fix: dismiss the activity AND manually send ACTION_HANDLE_INPUT_RESULT to bypass the block.
+    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
+        echo "VNC: InputRequestActivity blocking — bypassing with direct intent..."
+        # Dismiss the blocking activity
+        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+        sleep 1
+        # Send the result intent directly to MainService (same as what postResult() does)
+        # This tells MainService "accessibility check done, proceed to next step"
+        adb shell "am start-foreground-service \
+            -n ${VNC_PKG}/.MainService \
+            -a action_handle_a11y_result \
+            --ez result_a11y true \
+            --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+        echo "VNC: Sent ACTION_HANDLE_INPUT_RESULT — flow should continue to Steps 3-5"
+        sleep 5
+    fi
 }
 
 accept_media_projection() {
