@@ -222,14 +222,15 @@ except Exception as e:
         VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
         echo "VNC: Installed version: ${VNC_INSTALLED_VER}"
     else
-        # Clean slate: clear app data to reset broken FUSE/storage state
-        echo "VNC: Clearing app data for clean start..."
+        # Just force-stop, don't pm clear — it wipes accessibility binding
+        # and the FUSE error is a system bug that pm clear can't fix
+        echo "VNC: Stopping app for clean restart..."
         adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
-        adb shell "pm clear ${VNC_PKG}" 2>/dev/null
-        sleep 2
+        sleep 1
     fi
 
-    # 2) Enable accessibility service FIRST — app shows InputRequestActivity if not set
+    # 2) Enable accessibility service FIRST — required for fallback screen capture
+    #    and to avoid InputRequestActivity blocking VNC start
     echo "VNC: Enabling accessibility input service..."
     CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
     if ! echo "${CURRENT_A11Y}" | grep -q "droidvnc_ng"; then
@@ -241,8 +242,30 @@ except Exception as e:
         adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
     fi
     adb shell settings put secure accessibility_enabled 1 2>/dev/null
-    # Give system time to bind the accessibility service
-    sleep 5
+
+    # Launch app briefly to trigger accessibility service binding
+    echo "VNC: Launching app to trigger accessibility binding..."
+    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
+    sleep 3
+    # Press Home if InputRequestActivity appeared
+    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
+        echo "VNC: Dismissing InputRequestActivity..."
+        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+        sleep 1
+    fi
+
+    # Wait for InputService to bind — check with dumpsys
+    echo "VNC: Waiting for accessibility service to bind..."
+    for i in 1 2 3 4 5 6; do
+        A11Y_STATUS=$(adb shell "dumpsys accessibility" 2>/dev/null | grep -i "droidvnc_ng" | head -3)
+        if echo "${A11Y_STATUS}" | grep -qi "isConnected=true\|Connected"; then
+            echo "VNC: InputService connected"
+            break
+        fi
+        echo "VNC: Waiting... (${i}/6) ${A11Y_STATUS}"
+        sleep 3
+    done
 
     # 3) Grant ALL permissions
     echo "VNC: Granting permissions..."
@@ -320,13 +343,13 @@ VNCEOF
     # 6) Start VNC server via intent
     start_vnc_server
 
-    # 7) Dismiss InputRequestActivity if it appeared (press Home)
+    # 7) Check for InputRequestActivity or other blocking dialogs
     FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+    echo "VNC: Post-start foreground: ${FOREGROUND}"
     if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-        echo "VNC: InputRequestActivity shown — dismissing with Home key..."
+        echo "VNC: InputRequestActivity still shown — dismissing..."
         adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
         sleep 2
-        # Restart the service after dismissing
         start_vnc_server
     fi
 
