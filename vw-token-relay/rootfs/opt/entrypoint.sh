@@ -163,12 +163,27 @@ setup_vnc() {
 
     echo "VNC: Setting up droidVNC-NG..."
 
-    # 1) Install APK if not already on phone
-    if adb shell pm list packages 2>/dev/null | grep -q "${VNC_PKG}"; then
-        echo "VNC: droidVNC-NG already installed"
+    # 1) Install or update APK — check version, force update if < 2.1.0
+    VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
+    echo "VNC: Installed version: ${VNC_INSTALLED_VER:-not installed}"
+
+    VNC_NEED_INSTALL=false
+    if [ -z "${VNC_INSTALLED_VER}" ]; then
+        VNC_NEED_INSTALL=true
     else
-        echo "VNC: Installing droidVNC-NG..."
-        # Download if not cached
+        # Need at least 2.1.0 for EXTRA_FALLBACK_SCREEN_CAPTURE
+        VNC_MAJOR=$(echo "${VNC_INSTALLED_VER}" | cut -d. -f1)
+        VNC_MINOR=$(echo "${VNC_INSTALLED_VER}" | cut -d. -f2)
+        if [ "${VNC_MAJOR}" -lt 2 ] 2>/dev/null || { [ "${VNC_MAJOR}" -eq 2 ] && [ "${VNC_MINOR}" -lt 1 ]; } 2>/dev/null; then
+            echo "VNC: Version ${VNC_INSTALLED_VER} too old — need >= 2.1.0 for fallback capture"
+            VNC_NEED_INSTALL=true
+            # Delete cached APK to force re-download
+            rm -f "${VNC_APK_CACHE}"
+        fi
+    fi
+
+    if [ "${VNC_NEED_INSTALL}" = "true" ]; then
+        echo "VNC: Installing/updating droidVNC-NG..."
         if [ ! -f "${VNC_APK_CACHE}" ]; then
             mkdir -p "$(dirname "${VNC_APK_CACHE}")"
             echo "VNC: Downloading latest release from GitHub..."
@@ -192,17 +207,83 @@ except Exception as e:
                 return 1
             fi
         fi
+        # Uninstall old version first if present (cleans up broken storage state)
+        if [ -n "${VNC_INSTALLED_VER}" ]; then
+            echo "VNC: Removing old version..."
+            adb shell "pm uninstall ${VNC_PKG}" 2>/dev/null || true
+            sleep 2
+        fi
         adb install "${VNC_APK_CACHE}" 2>&1
         if [ $? -ne 0 ]; then
             echo "VNC: Install failed"
             rm -f "${VNC_APK_CACHE}"
             return 1
         fi
-        echo "VNC: Installed successfully"
+        VNC_INSTALLED_VER=$(adb shell "dumpsys package ${VNC_PKG}" 2>/dev/null | grep "versionName" | head -1 | sed 's/.*versionName=//' | tr -d '[:space:]')
+        echo "VNC: Installed version: ${VNC_INSTALLED_VER}"
+    else
+        # Clean slate: clear app data to reset broken FUSE/storage state
+        echo "VNC: Clearing app data for clean start..."
+        adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
+        adb shell "pm clear ${VNC_PKG}" 2>/dev/null
+        sleep 2
     fi
 
-    # 2) Push defaults.json preseed (sets access key, port, password, auto-start)
-    echo "VNC: Writing preseed config..."
+    # 2) Grant storage permissions FIRST (before any file placement)
+    echo "VNC: Granting storage permissions..."
+    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.WRITE_EXTERNAL_STORAGE'" 2>/dev/null || true
+    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.READ_EXTERNAL_STORAGE'" 2>/dev/null || true
+    adb shell "su -c 'appops set ${VNC_PKG} MANAGE_EXTERNAL_STORAGE allow'" 2>/dev/null || true
+    adb shell "su -c 'appops set ${VNC_PKG} android:legacy_storage allow'" 2>/dev/null || true
+
+    # Grant runtime permissions
+    adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
+    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE'" 2>/dev/null || true
+    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'" 2>/dev/null || true
+    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.SYSTEM_ALERT_WINDOW'" 2>/dev/null || true
+    adb shell "su -c 'appops set ${VNC_PKG} SYSTEM_ALERT_WINDOW allow'" 2>/dev/null || true
+
+    # 3) Launch app once to let it initialize its own storage directories properly
+    echo "VNC: Initial launch to create storage dirs..."
+    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
+    sleep 5
+    adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
+    sleep 1
+
+    # 4) Deploy config files — SharedPreferences is the primary config method
+    # (defaults.json via getExternalFilesDir is broken on this device's FUSE layer)
+    echo "VNC: Writing config via SharedPreferences..."
+    VNC_APP_UID=$(adb shell "su -c 'stat -c %u /data/data/${VNC_PKG}'" 2>/dev/null || echo "")
+    echo "VNC: App UID=${VNC_APP_UID}"
+
+    VNC_PREFS_DIR="/data/data/${VNC_PKG}/shared_prefs"
+    adb shell "su -c 'mkdir -p ${VNC_PREFS_DIR}'" 2>/dev/null
+    VNC_PASS_PREF=""
+    if [ -n "${VNC_PASSWORD}" ]; then
+        VNC_PASS_PREF="    <string name=\"settings_password\">${VNC_PASSWORD}</string>"
+    fi
+    cat > /tmp/vnc_prefs.xml << PREFSEOF
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <int name="settings_port" value="5900" />
+    <string name="settings_access_key">${VNC_ACCESS_KEY}</string>
+    <boolean name="settings_start_on_boot" value="true" />
+    <int name="settings_start_on_boot_delay" value="5" />
+    <boolean name="settings_view_only" value="false" />
+    <boolean name="settings_file_transfer" value="false" />
+    <float name="settings_scaling" value="0.5" />
+${VNC_PASS_PREF}
+</map>
+PREFSEOF
+    adb push /tmp/vnc_prefs.xml /data/local/tmp/vnc_prefs.xml 2>/dev/null
+    adb shell "su -c 'cp /data/local/tmp/vnc_prefs.xml ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
+    if [ -n "${VNC_APP_UID}" ]; then
+        adb shell "su -c 'chown ${VNC_APP_UID}:${VNC_APP_UID} ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
+        adb shell "su -c 'chmod 660 ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
+    fi
+    echo "VNC: SharedPreferences written"
+
+    # Also try defaults.json in internal data dir (doesn't go through FUSE)
     VNC_DEFAULTS="/tmp/vnc_defaults.json"
     VNC_PASS_JSON=""
     if [ -n "${VNC_PASSWORD}" ]; then
@@ -220,64 +301,15 @@ except Exception as e:
     "scaling": 0.5
 }
 VNCEOF
-    # Android 11 scoped storage blocks getExternalFilesDir — create with root + correct UID
     adb push "${VNC_DEFAULTS}" /data/local/tmp/vnc_defaults.json 2>/dev/null
-    VNC_APP_UID=$(adb shell "su -c 'stat -c %u /data/data/${VNC_PKG}'" 2>/dev/null || echo "")
-    echo "VNC: App UID=${VNC_APP_UID}"
-
-    # Try external files dir first (where the app looks)
-    adb shell "su -c 'mkdir -p /storage/emulated/0/Android/data/${VNC_PKG}/files'" 2>/dev/null
-    adb shell "su -c 'cp /data/local/tmp/vnc_defaults.json /storage/emulated/0/Android/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
-    if [ -n "${VNC_APP_UID}" ]; then
-        adb shell "su -c 'chown -R ${VNC_APP_UID}:${VNC_APP_UID} /storage/emulated/0/Android/data/${VNC_PKG}/files'" 2>/dev/null
-        adb shell "su -c 'chmod 755 /storage/emulated/0/Android/data/${VNC_PKG}/files'" 2>/dev/null
-        adb shell "su -c 'chmod 644 /storage/emulated/0/Android/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
-    fi
-
-    # Also place in internal data dir as fallback
     adb shell "su -c 'mkdir -p /data/data/${VNC_PKG}/files'" 2>/dev/null
     adb shell "su -c 'cp /data/local/tmp/vnc_defaults.json /data/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
     if [ -n "${VNC_APP_UID}" ]; then
         adb shell "su -c 'chown ${VNC_APP_UID}:${VNC_APP_UID} /data/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
     fi
-
-    # Verify the file exists
-    VNC_DEFAULTS_CHECK=$(adb shell "su -c 'ls -la /storage/emulated/0/Android/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null || echo "MISSING")
-    echo "VNC: defaults.json → ${VNC_DEFAULTS_CHECK}"
-
-    # Also write settings directly into SharedPreferences (bypasses FUSE issues)
-    VNC_PREFS_DIR="/data/data/${VNC_PKG}/shared_prefs"
-    adb shell "su -c 'mkdir -p ${VNC_PREFS_DIR}'" 2>/dev/null
-    cat > /tmp/vnc_prefs.xml << 'PREFSEOF'
-<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
-<map>
-    <int name="settings_port" value="5900" />
-    <string name="settings_access_key">vwrelay_vnc_local</string>
-    <boolean name="settings_start_on_boot" value="true" />
-    <int name="settings_start_on_boot_delay" value="5" />
-    <boolean name="settings_view_only" value="false" />
-    <boolean name="settings_file_transfer" value="false" />
-    <float name="settings_scaling" value="0.5" />
-</map>
-PREFSEOF
-    adb push /tmp/vnc_prefs.xml /data/local/tmp/vnc_prefs.xml 2>/dev/null
-    adb shell "su -c 'cp /data/local/tmp/vnc_prefs.xml ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
-    if [ -n "${VNC_APP_UID}" ]; then
-        adb shell "su -c 'chown ${VNC_APP_UID}:${VNC_APP_UID} ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
-        adb shell "su -c 'chmod 660 ${VNC_PREFS_DIR}/${VNC_PKG}_preferences.xml'" 2>/dev/null
-    fi
-    echo "VNC: SharedPreferences written as fallback"
     rm -f "${VNC_DEFAULTS}" /tmp/vnc_prefs.xml
 
-    # 3) Grant ALL permissions the app might need (before first launch)
-    echo "VNC: Granting permissions..."
-    adb shell "su -c 'appops set ${VNC_PKG} PROJECT_MEDIA allow'" 2>/dev/null
-    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE'" 2>/dev/null || true
-    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'" 2>/dev/null || true
-    adb shell "su -c 'pm grant ${VNC_PKG} android.permission.SYSTEM_ALERT_WINDOW'" 2>/dev/null || true
-    adb shell "su -c 'appops set ${VNC_PKG} SYSTEM_ALERT_WINDOW allow'" 2>/dev/null || true
-
-    # 4) Enable accessibility service for input injection
+    # 5) Enable accessibility service for input injection
     echo "VNC: Enabling input service..."
     CURRENT_A11Y=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null || echo "")
     if ! echo "${CURRENT_A11Y}" | grep -q "droidvnc_ng"; then
@@ -288,20 +320,22 @@ PREFSEOF
         fi
         adb shell settings put secure enabled_accessibility_services "${NEW_A11Y}" 2>/dev/null
     fi
+    # Give accessibility service time to bind
+    sleep 3
 
-    # 5) Wake screen (MediaProjection dialog needs a visible display)
+    # 6) Wake screen
     wake_screen
 
-    # 6) Start VNC server via intent
+    # 7) Start VNC server via intent
     start_vnc_server
 
-    # 7) Accept MediaProjection consent dialog if it appears
+    # 8) Accept MediaProjection consent dialog if it appears
     accept_media_projection
 
-    # 8) Verify VNC is actually listening on phone
+    # 9) Verify VNC is actually listening on phone
     verify_vnc_listening
 
-    # 9) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
+    # 10) Set up port forwarding: phone:5900 → container:0.0.0.0:5900
     setup_vnc_forwarding
 }
 
