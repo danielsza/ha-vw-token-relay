@@ -473,47 +473,45 @@ start_vnc_server() {
 vnc_bypass_permission_flow() {
     echo "VNC: Checking for blocking permission activities..."
 
-    for round in 1 2 3 4 5 6; do
+    for round in 1 2 3 4 5 6 7 8; do
         FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
         echo "VNC: Round ${round} foreground: ${FOREGROUND}"
 
         if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
             echo "VNC: Bypassing InputRequestActivity (Step 2 — accessibility)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
-            # Send ACTION_HANDLE_INPUT_RESULT directly to MainService
+            # DO NOT press HOME — the app must stay in the foreground so Android
+            # allows it to start MediaProjectionRequestActivity (Step 4).
+            # Pressing HOME puts the app in background and Android 11's background
+            # activity launch restrictions would block Step 4.
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_a11y_result \
                 --ez result_a11y true \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
             echo "VNC: Sent input result — proceeding to Step 3"
-            sleep 3
+            sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "WriteStorageRequestActivity"; then
             echo "VNC: Bypassing WriteStorageRequestActivity (Step 3 — storage)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
-            # Send ACTION_HANDLE_WRITE_STORAGE_RESULT directly
+            # Don't press HOME — keep app in foreground for Step 4
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_write_storage_result \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent storage result — proceeding to VNC start"
-            sleep 3
+            echo "VNC: Sent storage result — proceeding to Step 4"
+            sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "NotificationRequestActivity"; then
             echo "VNC: Bypassing NotificationRequestActivity (Step 3 — notification)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
+            # Don't press HOME — keep app in foreground for Step 4
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_notification_result \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
             echo "VNC: Sent notification result"
-            sleep 3
+            sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
