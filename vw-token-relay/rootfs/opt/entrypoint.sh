@@ -333,15 +333,21 @@ vnc_setup_accessibility() {
             VNC_A11Y_CONNECTED=true
             return 0
         fi
-        # Method 2: service in "Bound services" but NOT in "Binding services" or "Crashed services" (Android 11)
-        if echo "${A11Y_VNC}" | grep -q "Bound services:.*droidVNC"; then
-            A11Y_BINDING=$(echo "${A11Y_VNC}" | grep "Binding services:" | head -1)
-            A11Y_CRASHED=$(echo "${A11Y_VNC}" | grep "Crashed services:" | head -1)
-            if ! echo "${A11Y_BINDING}" | grep -q "droidvnc" && ! echo "${A11Y_CRASHED}" | grep -q "droidvnc"; then
+        # Method 2: service in "Bound services" (Android 11)
+        if echo "${A11Y_VNC}" | grep -qi "Bound services:.*droidvnc"; then
+            A11Y_BINDING=$(echo "${A11Y_VNC}" | grep -i "Binding services:" | head -1)
+            A11Y_CRASHED=$(echo "${A11Y_VNC}" | grep -i "Crashed services:" | head -1)
+            if ! echo "${A11Y_BINDING}" | grep -qi "droidvnc" && ! echo "${A11Y_CRASHED}" | grep -qi "droidvnc"; then
                 echo "VNC: InputService connected (in Bound services)!"
                 VNC_A11Y_CONNECTED=true
                 return 0
             fi
+        fi
+        # Method 3: service has mIsSystemBoundAsClient=true (Android 11 alternative)
+        if echo "${A11Y_VNC}" | grep -qi "mIsSystemBoundAsClient=true"; then
+            echo "VNC: InputService connected (mIsSystemBoundAsClient=true)!"
+            VNC_A11Y_CONNECTED=true
+            return 0
         fi
         echo "VNC: Waiting for bind... (${i}/10)"
         sleep 3
