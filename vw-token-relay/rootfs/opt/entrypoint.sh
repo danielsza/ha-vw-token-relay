@@ -356,11 +356,12 @@ vnc_deploy_config() {
 <map>
     <int name="settings_port" value="5900" />
     <string name="settings_access_key">${VNC_ACCESS_KEY}</string>
-    <boolean name="settings_start_on_boot" value="true" />
+    <boolean name="settings_start_on_boot" value="false" />
     <int name="settings_start_on_boot_delay" value="5" />
     <boolean name="settings_view_only" value="false" />
     <boolean name="settings_file_transfer" value="false" />
     <float name="settings_scaling" value="0.5" />
+    <boolean name="write_storage_permission_asked_before" value="true" />
 ${VNC_PASS_PREF}
 </map>
 PREFSEOF
@@ -385,7 +386,7 @@ PREFSEOF
     "port": 5900,
     ${VNC_PASS_JSON}
     "accessKey": "${VNC_ACCESS_KEY}",
-    "startOnBoot": true,
+    "startOnBoot": false,
     "startOnBootDelay": 5,
     "viewOnly": false,
     "fileTransfer": false,
@@ -434,31 +435,62 @@ start_vnc_server() {
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
     sleep 3
 
-    # Start the foreground service with EXTRA_FALLBACK_SCREEN_CAPTURE=true.
-    # This lets the VNC server start immediately (port 5900 opens) even without
-    # MediaProjection consent. We obtain MediaProjection separately after.
+    # Start the foreground service with flags that make the permission flow
+    # auto-complete without any dialogs:
+    #   EXTRA_VIEW_ONLY=true       → inputRequested=false (skips InputRequestActivity)
+    #   settings_start_on_boot=false (in prefs) → startOnBootRequested=false
+    #   settings_file_transfer=false (in prefs) → WriteStorageRequestActivity skips
+    #   EXTRA_FALLBACK_SCREEN_CAPTURE=true → vncStartServer() runs without MediaProjection
+    # Flow: ACTION_START → auto-postResult(a11y) → auto-postResult(storage) → vncStartServer()
     VNC_START_CMD="am start-foreground-service"
     VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
     VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
     VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
     VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
     VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
+    VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_VIEW_ONLY true"
     VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
-    echo "VNC: Sending ACTION_START (fallback+upgrade mode)..."
+    echo "VNC: Sending ACTION_START (auto-skip dialogs + fallback capture)..."
     adb shell "${VNC_START_CMD}" 2>&1
+    sleep 5
+
+    # Wait for VNC server to start (port 5900) — should be fast since no dialogs
+    VNC_CHECK=""
+    for wait_round in 1 2 3 4 5 6; do
+        VNC_CHECK=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep ":5900 " || echo "")
+        if [ -n "${VNC_CHECK}" ]; then
+            echo "VNC: Port 5900 open — server started in fallback mode!"
+            break
+        fi
+        echo "VNC: Port 5900 not yet open — waiting (${wait_round}/6)..."
+        # Capture logcat for diagnostics on last round
+        if [ "${wait_round}" -eq 6 ]; then
+            echo "VNC: --- diagnostic logcat ---"
+            adb shell "logcat -d -t 50" 2>&1 | grep -i "MainService\|InputRequest\|WriteStorage\|Access key\|vncStart\|stopSelf\|onStartCommand\|Defaults\|fallback" | tail -20
+            echo "VNC: --- end diagnostic ---"
+        fi
+        sleep 3
+    done
+
+    if [ -z "${VNC_CHECK}" ]; then
+        echo "VNC: Port 5900 not open after auto-skip flow"
+        echo "VNC: Foreground activity:"
+        adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1
+        return 1
+    fi
+
+    # Upgrade to MediaProjection for real screen capture (fallback is blank/low-quality)
+    echo "VNC: Upgrading to MediaProjection capture..."
+    wake_screen
+    sleep 1
+    adb shell "am start -n ${VNC_PKG}/.MediaProjectionRequestActivity \
+        --ez upgrading_from_no_or_fallback_screen_capture true" 2>/dev/null
     sleep 3
-
-    # Debug: capture MainService logs right after ACTION_START
-    echo "VNC: --- MainService log after ACTION_START ---"
-    adb shell "logcat -d -t 30" 2>&1 | grep -i "MainService\|Access key\|onStartCommand\|stopSelf\|vncStart" | tail -15
-    echo "VNC: --- end MainService log ---"
-
-    # Bypass the multi-step permission flow by sending result intents directly
-    # to MainService instead of waiting for UI activities to appear.
-    vnc_bypass_permission_flow
+    accept_media_projection
+    echo "VNC: VNC setup complete"
 }
 
 vnc_click_dialog_button() {
@@ -497,64 +529,6 @@ vnc_click_dialog_button() {
     echo "VNC: Trying coordinate fallback for negative button..."
     adb shell "input tap 364 874" 2>/dev/null
     return 1
-}
-
-vnc_bypass_permission_flow() {
-    # v1.12.1: Direct intent chain approach.
-    # Instead of detecting foreground activities and pressing UI buttons,
-    # send result intents directly to MainService to skip each permission step.
-    # Combined with EXTRA_FALLBACK_SCREEN_CAPTURE=true, the VNC server starts
-    # immediately. We then upgrade to MediaProjection for real screen capture.
-    echo "VNC: Bypassing permission flow with direct intents..."
-
-    # Step 2: Skip InputRequestActivity — tell MainService a11y was declined
-    echo "VNC: Sending a11y result (skip input request)..."
-    adb shell "am start-foreground-service \
-        -n ${VNC_PKG}/.MainService \
-        -a action_handle_a11y_result \
-        --ez result_a11y false \
-        --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>/dev/null
-    sleep 2
-
-    # Step 3: Skip WriteStorageRequestActivity — tell MainService storage was declined.
-    # With EXTRA_FALLBACK_SCREEN_CAPTURE=true in the persisted start intent
-    # (from ACTION_START above), MainService enters the fallback branch and
-    # calls vncStartServer() immediately — port 5900 opens.
-    echo "VNC: Sending write storage result (skip storage request)..."
-    adb shell "am start-foreground-service \
-        -n ${VNC_PKG}/.MainService \
-        -a action_handle_write_storage_result \
-        --ez result_write_storage false \
-        --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>/dev/null
-    sleep 3
-
-    # Wait for VNC server to start (port 5900)
-    for wait_round in 1 2 3 4; do
-        VNC_CHECK=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep 5900 || echo "")
-        if [ -n "${VNC_CHECK}" ]; then
-            echo "VNC: Port 5900 open — VNC server started in fallback mode!"
-            break
-        fi
-        echo "VNC: Port 5900 not yet open — waiting (${wait_round}/4)..."
-        sleep 3
-    done
-
-    if [ -z "${VNC_CHECK}" ]; then
-        echo "VNC: Port 5900 still not open after direct intent chain"
-        return 1
-    fi
-
-    # Step 4: Upgrade to MediaProjection for real screen capture.
-    # The VNC server is running with InputService fallback (blank/low-quality),
-    # but MediaProjection gives actual screen content.
-    echo "VNC: Upgrading to MediaProjection capture..."
-    wake_screen
-    sleep 1
-    adb shell "am start -n ${VNC_PKG}/.MediaProjectionRequestActivity \
-        --ez upgrading_from_no_or_fallback_screen_capture true" 2>/dev/null
-    sleep 3
-    accept_media_projection
-    echo "VNC: Permission flow complete"
 }
 
 accept_media_projection() {
