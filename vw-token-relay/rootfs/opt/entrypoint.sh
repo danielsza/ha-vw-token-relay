@@ -450,70 +450,110 @@ start_vnc_server() {
     vnc_bypass_permission_flow
 }
 
-vnc_bypass_permission_flow() {
-    echo "VNC: Checking for blocking permission activities..."
+vnc_click_dialog_button() {
+    # Click a dialog button by searching for text in uiautomator dump.
+    # Args: button texts to search for (tries each in order).
+    # Falls back to coordinate-based tapping if uiautomator fails.
+    sleep 2
+    DUMP=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
 
-    # MediaProjection mode has more steps than fallback, so allow more rounds.
-    # CRITICAL: Never press HOME — Android 11 blocks background activity launches.
-    # Instead: send result intent → BACK → re-launch MainActivity to keep foreground.
+    if [ ${#DUMP} -gt 100 ]; then
+        echo "VNC: UI dump: ${#DUMP} chars"
+        for BTN_TEXT in "$@"; do
+            BOUNDS=$(echo "${DUMP}" | grep -oi "text=\"${BTN_TEXT}\"[^/]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | head -1 | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"')
+            if [ -n "${BOUNDS}" ]; then
+                X1=$(echo "${BOUNDS}" | sed 's/bounds="\[\([0-9]*\),.*/\1/')
+                Y1=$(echo "${BOUNDS}" | sed 's/bounds="\[[0-9]*,\([0-9]*\)\].*/\1/')
+                X2=$(echo "${BOUNDS}" | sed 's/.*\]\[\([0-9]*\),.*/\1/')
+                Y2=$(echo "${BOUNDS}" | sed 's/.*\]\[[0-9]*,\([0-9]*\)\].*/\1/')
+                CX=$(( (X1 + X2) / 2 ))
+                CY=$(( (Y1 + Y2) / 2 ))
+                echo "VNC: Found '${BTN_TEXT}' at ${CX},${CY} — tapping..."
+                adb shell "input tap ${CX} ${CY}" 2>/dev/null
+                return 0
+            fi
+        done
+        echo "VNC: Button not found by text in UI dump"
+        # Log first 500 chars of dump for debugging
+        echo "VNC: UI dump excerpt: $(echo "${DUMP}" | head -c 500)"
+    else
+        echo "VNC: UI dump too short (${#DUMP} chars)"
+    fi
+
+    # Fallback: on Moto G Pure (720x1600) with Material AlertDialog,
+    # the "No" button (negative/left) is roughly at these coordinates.
+    # Dialog buttons are right-aligned; negative is left of positive.
+    echo "VNC: Trying coordinate fallback for negative button..."
+    adb shell "input tap 364 874" 2>/dev/null
+    return 1
+}
+
+vnc_bypass_permission_flow() {
+    echo "VNC: Navigating permission flow via UI interaction..."
+
+    # droidVNC-NG shows a chain of permission activities (AlertDialogs):
+    #   InputRequestActivity → WriteStorageRequestActivity → MediaProjectionRequestActivity
+    # Each dialog has Yes/No buttons. We click "No" to skip optional permissions
+    # and let the app chain through to MediaProjectionRequestActivity, where we
+    # accept the system's screen capture consent dialog.
+    #
+    # v1.11.4 failed because sending raw intents left InputRequestActivity's dialog
+    # on screen, blocking the chain. Clicking the actual button via uiautomator
+    # lets the app's own code call finish() and chain properly.
 
     for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
         FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
         echo "VNC: Round ${round} foreground: ${FOREGROUND}"
 
         if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-            echo "VNC: Bypassing InputRequestActivity (Step 2 — accessibility)..."
-            # Tell MainService the a11y check passed. MainService chains:
-            # Step 2 → Step 3 (skip if granted) → Step 4 (MediaProjection).
-            # Do NOT press BACK or HOME — that would dismiss the next activity
-            # that MainService launches (MediaProjectionRequestActivity).
-            adb shell "am start-foreground-service \
-                -n ${VNC_PKG}/.MainService \
-                -a action_handle_a11y_result \
-                --ez result_a11y true \
-                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent input result — waiting for next step..."
+            echo "VNC: InputRequestActivity detected — clicking 'No' to skip a11y..."
+            # Click "No" — we don't need InputService for MediaProjection capture.
+            # The app will call postResult(false) → MainService chains onward → finish().
+            vnc_click_dialog_button "NO" "No" "no" "CANCEL" "Cancel" "DENY" "Deny"
             sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "WriteStorageRequestActivity"; then
-            echo "VNC: Bypassing WriteStorageRequestActivity (Step 3 — storage)..."
-            adb shell "am start-foreground-service \
-                -n ${VNC_PKG}/.MainService \
-                -a action_handle_write_storage_result \
-                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent storage result — waiting for MediaProjection step..."
+            echo "VNC: WriteStorageRequestActivity detected — clicking 'No' to skip..."
+            vnc_click_dialog_button "NO" "No" "no" "CANCEL" "Cancel" "DENY" "Deny"
             sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "NotificationRequestActivity"; then
-            echo "VNC: Bypassing NotificationRequestActivity (Step 3 — notification)..."
-            adb shell "am start-foreground-service \
-                -n ${VNC_PKG}/.MainService \
-                -a action_handle_notification_result \
-                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent notification result — waiting for MediaProjection step..."
+            echo "VNC: NotificationRequestActivity detected — clicking 'No' to skip..."
+            vnc_click_dialog_button "NO" "No" "no" "CANCEL" "Cancel" "DENY" "Deny"
             sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
-            # Step 4: MediaProjection consent. This activity launches the system's
-            # "Start recording?" dialog. We need to ACCEPT it, not bypass it.
-            echo "VNC: MediaProjectionRequestActivity detected (Step 4) — accepting consent dialog..."
+            echo "VNC: MediaProjectionRequestActivity detected — accepting consent..."
             accept_media_projection
             sleep 3
             continue
 
         elif echo "${FOREGROUND}" | grep -qi "MediaProjection\|GrantPermission\|permission.*Activity"; then
-            # System consent dialog (shown by SystemUI or framework)
             echo "VNC: System consent dialog detected — accepting..."
             accept_media_projection
             sleep 3
             continue
         fi
 
-        # No blocking activity — flow has progressed past permission checks
-        echo "VNC: No blocking activity detected — permission flow complete"
+        # Check if VNC port is now open — the flow completed
+        VNC_CHECK=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep 5900 || echo "")
+        if [ -n "${VNC_CHECK}" ]; then
+            echo "VNC: Port 5900 open — permission flow complete!"
+            break
+        fi
+
+        echo "VNC: No blocking activity detected — waiting..."
+        # If we just dismissed InputRequestActivity, MediaProjectionRequestActivity
+        # might take a moment to appear. Give it one more round.
+        if [ "${round}" -lt 12 ]; then
+            sleep 3
+            continue
+        fi
+
+        echo "VNC: Permission flow timed out"
         break
     done
 }
