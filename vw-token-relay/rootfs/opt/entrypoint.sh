@@ -463,20 +463,17 @@ vnc_bypass_permission_flow() {
 
         if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
             echo "VNC: Bypassing InputRequestActivity (Step 2 — accessibility)..."
-            # 1) Tell MainService the a11y check passed
+            # Tell MainService the a11y check passed. MainService chains:
+            # Step 2 → Step 3 (skip if granted) → Step 4 (MediaProjection).
+            # Do NOT press BACK or HOME — that would dismiss the next activity
+            # that MainService launches (MediaProjectionRequestActivity).
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_a11y_result \
                 --ez result_a11y true \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            sleep 2
-            # 2) Dismiss the activity with BACK (not HOME!) to stay in app task
-            adb shell "input keyevent KEYCODE_BACK" 2>/dev/null
-            sleep 1
-            # 3) Re-launch MainActivity to keep app in foreground for next steps
-            adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
-            echo "VNC: Sent input result + BACK + re-launch — proceeding to Step 3"
-            sleep 3
+            echo "VNC: Sent input result — waiting for next step..."
+            sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "WriteStorageRequestActivity"; then
@@ -485,12 +482,8 @@ vnc_bypass_permission_flow() {
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_write_storage_result \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            sleep 2
-            adb shell "input keyevent KEYCODE_BACK" 2>/dev/null
-            sleep 1
-            adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
-            echo "VNC: Sent storage result — proceeding to Step 4"
-            sleep 3
+            echo "VNC: Sent storage result — waiting for MediaProjection step..."
+            sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "NotificationRequestActivity"; then
@@ -499,12 +492,8 @@ vnc_bypass_permission_flow() {
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_notification_result \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            sleep 2
-            adb shell "input keyevent KEYCODE_BACK" 2>/dev/null
-            sleep 1
-            adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
-            echo "VNC: Sent notification result — proceeding to Step 4"
-            sleep 3
+            echo "VNC: Sent notification result — waiting for MediaProjection step..."
+            sleep 5
             continue
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
