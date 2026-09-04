@@ -170,37 +170,13 @@ setup_vnc() {
     VNC_A11Y_CONNECTED=false
     vnc_setup_accessibility
 
-    # 3) If accessibility didn't connect, reboot the phone to force Android to
-    #    rebind the service from scratch. This makes onServiceConnected() fire
-    #    and sets InputService.instance, which is needed for takeScreenshot().
+    # 3) Accessibility binding is optional — it enables input (touch/keyboard).
+    #    Screen capture uses MediaProjection (VirtualDisplay) which does NOT need
+    #    InputService. If a11y didn't bind, VNC will show the screen but input
+    #    may not work. That's acceptable for monitoring.
     if [ "${VNC_A11Y_CONNECTED}" = "false" ]; then
-        echo "VNC: ═══ RECOVERY: Rebooting phone to force accessibility rebind ═══"
-        echo "VNC: InputService didn't bind — Android needs a reboot to reinitialize"
-        echo "VNC: accessibility services properly (onServiceConnected must fire)."
-        adb reboot 2>/dev/null
-        echo "VNC: Waiting for phone to come back online..."
-        sleep 10
-        # Wait for ADB to reconnect (up to 120s)
-        for wait_i in $(seq 1 24); do
-            if adb shell "echo ok" 2>/dev/null | grep -q "ok"; then
-                echo "VNC: Phone is back online (after ~$((wait_i * 5))s)"
-                break
-            fi
-            sleep 5
-        done
-        sleep 10
-        # Unlock screen after reboot
-        wake_screen
-        adb shell "input keyevent KEYCODE_WAKEUP" 2>/dev/null
-        sleep 1
-        adb shell "wm dismiss-keyguard" 2>/dev/null
-        sleep 1
-        adb shell "input swipe 360 1400 360 600" 2>/dev/null
-        sleep 1
-        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-        sleep 3
-        # Re-setup accessibility (should bind properly after fresh boot)
-        vnc_setup_accessibility
+        echo "VNC: InputService did NOT bind — input may be limited"
+        echo "VNC: Screen capture will use MediaProjection (no a11y needed)"
     fi
 
     # 4) Grant ALL permissions
@@ -212,10 +188,10 @@ setup_vnc() {
     # 6) Wake screen
     wake_screen
 
-    # 7) Start VNC server using fallback screen capture (accessibility takeScreenshot).
-    #    The phone reboot in step 3 ensures InputService is properly bound so
-    #    takeScreenshot() works. Fallback mode skips MediaProjection consent (Step 4).
-    echo "VNC: Starting VNC server (fallback capture mode, a11y=${VNC_A11Y_CONNECTED})"
+    # 7) Start VNC server using MediaProjection for screen capture.
+    #    MediaProjection uses a VirtualDisplay — no InputService needed for capture.
+    #    The bypass flow accepts the system's MediaProjection consent dialog via ADB.
+    echo "VNC: Starting VNC server (MediaProjection mode, a11y=${VNC_A11Y_CONNECTED})"
     start_vnc_server
 
     # 8) Wait for VNC to finish its multi-step permission flow
@@ -452,11 +428,12 @@ start_vnc_server() {
     VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
     VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
     VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
-    VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
+    # NO EXTRA_FALLBACK_SCREEN_CAPTURE — use MediaProjection for screen capture.
+    # Fallback mode needs InputService.mMainHandler which never binds on Android 11.
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
-    echo "VNC: Sending ACTION_START (fallback capture mode)..."
+    echo "VNC: Sending ACTION_START (MediaProjection mode)..."
     adb shell "${VNC_START_CMD}" 2>&1
     sleep 3
 
@@ -465,64 +442,83 @@ start_vnc_server() {
     # detecting the blocking activity and sending the result intent directly.
     #
     # Flow: ACTION_START (Step 1) → InputRequestActivity (Step 2) →
-    #        WriteStorageRequestActivity (Step 3, Android <13) → VNC starts
-    #        (Step 4 MediaProjection SKIPPED because EXTRA_FALLBACK_SCREEN_CAPTURE=true)
+    #        WriteStorageRequestActivity (Step 3, Android <13) →
+    #        MediaProjectionRequestActivity (Step 4) → consent dialog → VNC starts
+    #
+    # CRITICAL: Don't press HOME — Android 11 blocks background activity launches.
+    # Use BACK + re-launch to keep the app in the foreground task.
     vnc_bypass_permission_flow
 }
 
 vnc_bypass_permission_flow() {
     echo "VNC: Checking for blocking permission activities..."
 
-    for round in 1 2 3 4 5 6; do
+    # MediaProjection mode has more steps than fallback, so allow more rounds.
+    # CRITICAL: Never press HOME — Android 11 blocks background activity launches.
+    # Instead: send result intent → BACK → re-launch MainActivity to keep foreground.
+
+    for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
         FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
         echo "VNC: Round ${round} foreground: ${FOREGROUND}"
 
         if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
             echo "VNC: Bypassing InputRequestActivity (Step 2 — accessibility)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
+            # 1) Tell MainService the a11y check passed
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_a11y_result \
                 --ez result_a11y true \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent input result — proceeding to Step 3"
+            sleep 2
+            # 2) Dismiss the activity with BACK (not HOME!) to stay in app task
+            adb shell "input keyevent KEYCODE_BACK" 2>/dev/null
+            sleep 1
+            # 3) Re-launch MainActivity to keep app in foreground for next steps
+            adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
+            echo "VNC: Sent input result + BACK + re-launch — proceeding to Step 3"
             sleep 3
             continue
 
         elif echo "${FOREGROUND}" | grep -q "WriteStorageRequestActivity"; then
             echo "VNC: Bypassing WriteStorageRequestActivity (Step 3 — storage)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_write_storage_result \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent storage result — proceeding to VNC start"
+            sleep 2
+            adb shell "input keyevent KEYCODE_BACK" 2>/dev/null
+            sleep 1
+            adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
+            echo "VNC: Sent storage result — proceeding to Step 4"
             sleep 3
             continue
 
         elif echo "${FOREGROUND}" | grep -q "NotificationRequestActivity"; then
             echo "VNC: Bypassing NotificationRequestActivity (Step 3 — notification)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
             adb shell "am start-foreground-service \
                 -n ${VNC_PKG}/.MainService \
                 -a action_handle_notification_result \
                 --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
-            echo "VNC: Sent notification result"
+            sleep 2
+            adb shell "input keyevent KEYCODE_BACK" 2>/dev/null
+            sleep 1
+            adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>/dev/null
+            echo "VNC: Sent notification result — proceeding to Step 4"
             sleep 3
             continue
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
-            echo "VNC: Bypassing MediaProjectionRequestActivity (Step 4 — should not happen with fallback)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
-            adb shell "am start-foreground-service \
-                -n ${VNC_PKG}/.MainService \
-                -a action_handle_media_projection_result \
-                --ei result_code_media_projection_request 0 \
-                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+            # Step 4: MediaProjection consent. This activity launches the system's
+            # "Start recording?" dialog. We need to ACCEPT it, not bypass it.
+            echo "VNC: MediaProjectionRequestActivity detected (Step 4) — accepting consent dialog..."
+            accept_media_projection
+            sleep 3
+            continue
+
+        elif echo "${FOREGROUND}" | grep -qi "MediaProjection\|GrantPermission\|permission.*Activity"; then
+            # System consent dialog (shown by SystemUI or framework)
+            echo "VNC: System consent dialog detected — accepting..."
+            accept_media_projection
             sleep 3
             continue
         fi
