@@ -209,11 +209,11 @@ setup_vnc() {
     # 6) Wake screen
     wake_screen
 
-    # 7) Start VNC server — always use fallback screen capture to skip
-    #    MediaProjection consent (Step 4). If accessibility isn't truly connected,
-    #    screen capture will fail but the VNC TCP server should still start.
-    VNC_USE_FALLBACK=true
-    echo "VNC: Using fallback screen capture mode (a11y=${VNC_A11Y_CONNECTED})"
+    # 7) Start VNC server using MediaProjection for screen capture.
+    #    The consent dialog (Step 4) is handled by accept_media_projection().
+    #    This avoids the black screen issue with fallback mode where
+    #    InputService.takeScreenshot() fails due to broken accessibility binding.
+    echo "VNC: Starting VNC server (MediaProjection mode, a11y=${VNC_A11Y_CONNECTED})"
     start_vnc_server
 
     # 8) Wait for VNC to finish its multi-step permission flow
@@ -444,11 +444,13 @@ start_vnc_server() {
     VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
     VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
     VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
-    VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
+    # MediaProjection mode — consent dialog handled by accept_media_projection()
+    # Fallback mode (accessibility takeScreenshot) causes black screen because
+    # InputService.onServiceConnected() doesn't fire reliably after reinstall
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
-    echo "VNC: Sending ACTION_START (fallback capture mode)..."
+    echo "VNC: Sending ACTION_START (MediaProjection capture mode)..."
     adb shell "${VNC_START_CMD}" 2>&1
     sleep 3
 
@@ -457,8 +459,8 @@ start_vnc_server() {
     # detecting the blocking activity and sending the result intent directly.
     #
     # Flow: ACTION_START (Step 1) → InputRequestActivity (Step 2) →
-    #        WriteStorageRequestActivity (Step 3, Android <13) → VNC starts
-    #        (Step 4 MediaProjection is SKIPPED because EXTRA_FALLBACK_SCREEN_CAPTURE=true)
+    #        WriteStorageRequestActivity (Step 3, Android <13) →
+    #        MediaProjectionRequestActivity (Step 4, consent dialog clicked) → VNC starts
     vnc_bypass_permission_flow
 }
 
@@ -509,16 +511,10 @@ vnc_bypass_permission_flow() {
             continue
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
-            echo "VNC: Bypassing MediaProjectionRequestActivity (Step 4 — should not happen with fallback)..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 1
-            # This shouldn't happen with EXTRA_FALLBACK_SCREEN_CAPTURE=true,
-            # but if it does, send result code 0 (no projection — use fallback)
-            adb shell "am start-foreground-service \
-                -n ${VNC_PKG}/.MainService \
-                -a action_handle_media_projection_result \
-                --ei result_code_media_projection_request 0 \
-                --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>&1
+            echo "VNC: MediaProjectionRequestActivity detected (Step 4) — accepting consent dialog..."
+            # Don't dismiss — the system consent dialog appears on top.
+            # Click "Start now" to approve MediaProjection for screen capture.
+            accept_media_projection
             sleep 3
             continue
         fi
@@ -583,11 +579,17 @@ accept_media_projection() {
         else
             echo "VNC: UI dump too short (${#DUMP} chars) — trying blind accept"
             # If uiautomator consistently fails, try blind keypress
-            if [ "${attempt}" -ge 3 ]; then
+            if [ "${attempt}" -ge 2 ]; then
+                # Blind accept: Tab to "Start now" button and Enter
+                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+                sleep 0.3
+                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+                sleep 0.3
                 adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
                 sleep 1
-                # Also try tap at common "Start now" button position on Moto G Pure (720x1440)
-                adb shell "input tap 540 1200" 2>/dev/null
+                # Also try tap at "Start now" position on Moto G Pure (720x1600)
+                # The consent dialog's right button is roughly at x=540, y=880
+                adb shell "input tap 540 880" 2>/dev/null
                 sleep 1
             fi
         fi
