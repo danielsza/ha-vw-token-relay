@@ -310,170 +310,21 @@ vnc_wait_a11y_bind() {
 }
 
 vnc_setup_accessibility() {
-    echo "VNC: Setting up accessibility input service..."
+    echo "VNC: Setting up accessibility input service (best-effort)..."
+    echo "VNC: NOTE: Input will work via ADB proxy even if a11y binding fails"
 
-    # Strategy 1: settings put secure (fast, often fails on Moto G)
-    echo "VNC: Strategy 1 — settings put secure..."
-    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
-    sleep 3
-    FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-    if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-        adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-        sleep 0.3
-        adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-        sleep 2
-    fi
-    adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-    sleep 1
-
-    adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
-    adb shell settings put secure accessibility_enabled 0 2>/dev/null
-    sleep 2
+    # Enable a11y via settings (works on some devices)
     adb shell settings put secure enabled_accessibility_services "${VNC_PKG}/.InputService" 2>/dev/null
     adb shell settings put secure accessibility_enabled 1 2>/dev/null
     sleep 3
 
-    if vnc_wait_a11y_bind 15; then
-        return 0
-    fi
-    echo "VNC: Strategy 1 failed"
-
-    # Strategy 2: Toggle through Android Settings UI
-    # The Settings UI goes through AccessibilityManager's proper binding flow,
-    # which works where 'settings put secure' fails.
-    echo "VNC: Strategy 2 — toggling via Settings UI..."
-
-    # First, clear the settings-level registration so the UI shows it as OFF
-    adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
-    adb shell settings put secure accessibility_enabled 0 2>/dev/null
-    sleep 2
-
-    # Open Accessibility Settings
-    adb shell "am start -a android.settings.ACCESSIBILITY_SETTINGS" 2>/dev/null
-    sleep 3
-
-    # Try to find and tap the droidVNC-NG Input service entry
-    # Use uiautomator dump to locate it
-    UIDUMP=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
-    echo "VNC: UI dump length: ${#UIDUMP}"
-
-    if [ ${#UIDUMP} -gt 200 ] && echo "${UIDUMP}" | grep -qi "droidVNC\|Input Service\|VNC"; then
-        echo "VNC: Found VNC entry in UI dump — parsing bounds..."
-        # Extract bounds for the VNC accessibility entry
-        VNC_BOUNDS=$(echo "${UIDUMP}" | grep -oi 'text="[^"]*[Vv][Nn][Cc][^"]*"[^>]*bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1 | grep -o 'bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1)
-        if [ -n "${VNC_BOUNDS}" ]; then
-            # Parse [x1,y1][x2,y2] → tap center
-            VNC_X1=$(echo "${VNC_BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\].*/\1/')
-            VNC_Y1=$(echo "${VNC_BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
-            VNC_X2=$(echo "${VNC_BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\1/')
-            VNC_Y2=$(echo "${VNC_BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
-            TAP_X=$(( (VNC_X1 + VNC_X2) / 2 ))
-            TAP_Y=$(( (VNC_Y1 + VNC_Y2) / 2 ))
-            echo "VNC: Tapping VNC entry at (${TAP_X}, ${TAP_Y})..."
-            adb shell "input tap ${TAP_X} ${TAP_Y}" 2>/dev/null
-            sleep 2
-        fi
-    else
-        echo "VNC: UI dump unavailable — using key navigation..."
-        # Navigate through settings using Tab/Enter
-        # On Moto G Pure a11y settings, Tab cycles through items
-        for nav in 1 2 3 4 5 6 7 8; do
-            adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-            sleep 0.5
-        done
-        adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-        sleep 2
-    fi
-
-    # Now we should be on the service detail page with a toggle switch
-    # Try to find the toggle/switch via uiautomator
-    UIDUMP2=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
-    echo "VNC: Service page dump length: ${#UIDUMP2}"
-
-    if [ ${#UIDUMP2} -gt 200 ]; then
-        # Look for a Switch or ToggleButton
-        SWITCH_BOUNDS=$(echo "${UIDUMP2}" | grep -oi 'class="android.widget.Switch"[^>]*bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1 | grep -o 'bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1)
-        if [ -z "${SWITCH_BOUNDS}" ]; then
-            SWITCH_BOUNDS=$(echo "${UIDUMP2}" | grep -oi 'class="android.widget.ToggleButton"[^>]*bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1 | grep -o 'bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1)
-        fi
-        if [ -n "${SWITCH_BOUNDS}" ]; then
-            SW_X1=$(echo "${SWITCH_BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\].*/\1/')
-            SW_Y1=$(echo "${SWITCH_BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
-            SW_X2=$(echo "${SWITCH_BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\1/')
-            SW_Y2=$(echo "${SWITCH_BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
-            SW_TAP_X=$(( (SW_X1 + SW_X2) / 2 ))
-            SW_TAP_Y=$(( (SW_Y1 + SW_Y2) / 2 ))
-            echo "VNC: Tapping switch at (${SW_TAP_X}, ${SW_TAP_Y})..."
-            adb shell "input tap ${SW_TAP_X} ${SW_TAP_Y}" 2>/dev/null
-            sleep 2
-        else
-            echo "VNC: No switch found — trying top-right corner..."
-            # Switch is typically at top-right on 720px wide screen
-            adb shell "input tap 660 200" 2>/dev/null
-            sleep 2
-        fi
-    else
-        echo "VNC: No UI dump — trying switch at typical position..."
-        # On 720x1600 screen, switch is typically at top-right
-        adb shell "input tap 660 200" 2>/dev/null
-        sleep 2
-    fi
-
-    # Accept the confirmation dialog ("Allow" button)
-    sleep 1
-    UIDUMP3=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
-    if [ ${#UIDUMP3} -gt 200 ] && echo "${UIDUMP3}" | grep -qi "Allow\|OK"; then
-        ALLOW_BOUNDS=$(echo "${UIDUMP3}" | grep -oi 'text="Allow"[^>]*bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1 | grep -o 'bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1)
-        if [ -n "${ALLOW_BOUNDS}" ]; then
-            AL_X1=$(echo "${ALLOW_BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\].*/\1/')
-            AL_Y1=$(echo "${ALLOW_BOUNDS}" | sed 's/.*\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
-            AL_X2=$(echo "${ALLOW_BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\1/')
-            AL_Y2=$(echo "${ALLOW_BOUNDS}" | sed 's/.*\]\[\([0-9]*\),\([0-9]*\)\].*/\2/')
-            AL_TAP_X=$(( (AL_X1 + AL_X2) / 2 ))
-            AL_TAP_Y=$(( (AL_Y1 + AL_Y2) / 2 ))
-            echo "VNC: Tapping Allow at (${AL_TAP_X}, ${AL_TAP_Y})..."
-            adb shell "input tap ${AL_TAP_X} ${AL_TAP_Y}" 2>/dev/null
-        else
-            echo "VNC: Allow button not found in dump — using Tab+Enter..."
-            adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-            sleep 0.3
-            adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-        fi
-    else
-        echo "VNC: Using Tab+Enter for confirmation dialog..."
-        adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-        sleep 0.3
-        adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-    fi
-    sleep 3
-
-    # Go home
-    adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-    sleep 1
-
-    if vnc_wait_a11y_bind 20; then
-        return 0
-    fi
-    echo "VNC: Strategy 2 failed"
-
-    # Strategy 3: Use root to call AccessibilityManager via app_process
-    echo "VNC: Strategy 3 — root service enable via app_process..."
-    adb shell "su -c 'settings put secure enabled_accessibility_services ${VNC_PKG}/.InputService'" 2>/dev/null
-    adb shell "su -c 'settings put secure accessibility_enabled 1'" 2>/dev/null
-    sleep 2
-    # Force AccessibilityManagerService to re-read settings
-    adb shell "su -c 'cmd accessibility set-bind-instant-service-allowed true'" 2>/dev/null || true
-    # Kill and let system restart with a11y enabled
-    adb shell "su -c 'kill \$(pidof ${VNC_PKG})'" 2>/dev/null
-    sleep 5
-
-    if vnc_wait_a11y_bind 20; then
+    # Quick check — if it binds, great; if not, the proxy handles input
+    if vnc_wait_a11y_bind 10; then
+        echo "VNC: InputService bound — native input active"
         return 0
     fi
 
-    echo "VNC: WARNING — All strategies failed. InputService did not bind."
-    echo "VNC: Accessibility state:"
-    adb shell "dumpsys accessibility" 2>/dev/null | grep -A15 "droidvnc_ng" | head -20
+    echo "VNC: InputService did not bind — VNC input proxy will handle input via ADB"
 }
 
 vnc_grant_permissions() {
@@ -871,13 +722,16 @@ setup_vnc_forwarding() {
     echo "VNC: Setting up port forwarding..."
     adb forward tcp:15900 tcp:5900 2>/dev/null
 
-    # Kill any existing socat for VNC
+    # Kill any existing VNC proxy or socat for VNC
     pkill -f "socat.*TCP-LISTEN:5900" 2>/dev/null || true
+    pkill -f "vnc_input_proxy" 2>/dev/null || true
     sleep 1
 
-    # Bridge: external:5900 → localhost:15900 (ADB forward) → phone:5900
-    socat TCP-LISTEN:5900,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:15900 &
-    echo "VNC: Port forwarding active — connect to port 5900"
+    # VNC Input Proxy: intercepts mouse/keyboard from VNC client and injects via ADB.
+    # This bypasses the broken InputService/AccessibilityService entirely.
+    # external:5900 → [proxy] → localhost:15900 (ADB forward) → phone:5900
+    VNC_PROXY_PORT=5900 VNC_BACKEND_PORT=15900 python3 /opt/vnc_input_proxy.py &
+    echo "VNC: Input proxy active — connect to port 5900 (input via ADB injection)"
 }
 
 ensure_vnc() {
@@ -885,9 +739,9 @@ ensure_vnc() {
         return 0
     fi
 
-    # Check if socat bridge is still running
-    if ! pgrep -f "socat.*TCP-LISTEN:5900" > /dev/null 2>&1; then
-        echo "VNC: socat bridge died — restarting forwarding..."
+    # Check if VNC input proxy is still running
+    if ! pgrep -f "vnc_input_proxy" > /dev/null 2>&1; then
+        echo "VNC: input proxy died — restarting forwarding..."
         setup_vnc_forwarding
     fi
 
