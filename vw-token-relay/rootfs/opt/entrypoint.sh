@@ -274,44 +274,48 @@ vnc_install_if_needed() {
 vnc_setup_accessibility() {
     echo "VNC: Setting up accessibility input service..."
 
-    # Toggle off then on
-    echo "VNC: Toggling accessibility service off/on..."
-    adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
-    adb shell settings put secure accessibility_enabled 0 2>/dev/null
-    sleep 2
+    # CRITICAL: launch the app FIRST so the process is fully running, THEN toggle
+    # accessibility. On Android 11, toggling a11y while the app process is stopped
+    # causes the system to start the process + bind concurrently, which races and
+    # fails silently. With the process already running, the bind succeeds.
 
-    # Re-enable
-    adb shell settings put secure enabled_accessibility_services "${VNC_PKG}/.InputService" 2>/dev/null
-    adb shell settings put secure accessibility_enabled 1 2>/dev/null
+    # Step 1: Ensure process is running — launch the app
+    echo "VNC: Launching app first (process must be running before a11y toggle)..."
+    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
     sleep 3
 
-    # Launch app so Android has the service process to bind to
-    echo "VNC: Launching app to trigger accessibility binding..."
-    adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
-    sleep 5
-
-    # Press Home if InputRequestActivity appeared
+    # Dismiss InputRequestActivity if it appeared (it blocks further actions)
     FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
     if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-        echo "VNC: Dismissing InputRequestActivity..."
-        adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-        sleep 1
+        echo "VNC: Dismissing InputRequestActivity via Tab+Enter..."
+        adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+        sleep 0.3
+        adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+        sleep 2
     fi
+    adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+    sleep 1
+
+    # Step 2: Now toggle a11y with process running
+    echo "VNC: Toggling accessibility service off/on (process already running)..."
+    adb shell settings put secure enabled_accessibility_services "" 2>/dev/null
+    adb shell settings put secure accessibility_enabled 0 2>/dev/null
+    sleep 3
+
+    adb shell settings put secure enabled_accessibility_services "${VNC_PKG}/.InputService" 2>/dev/null
+    adb shell settings put secure accessibility_enabled 1 2>/dev/null
+    sleep 5
 
     # Wait for InputService to connect (10 attempts, 30s)
-    # Check for EITHER mIsConnected=true (newer Android) OR the service
-    # being listed in "Bound services" (Android 11 format)
     echo "VNC: Waiting for accessibility service to connect..."
     for i in 1 2 3 4 5 6 7 8 9 10; do
         A11Y_DUMP=$(adb shell "dumpsys accessibility" 2>/dev/null)
         A11Y_VNC=$(echo "${A11Y_DUMP}" | grep -A15 "droidvnc_ng")
-        # Method 1: explicit mIsConnected field (Android 12+)
         if echo "${A11Y_VNC}" | grep -qi "mIsConnected=true"; then
             echo "VNC: InputService connected (mIsConnected=true)!"
             VNC_A11Y_CONNECTED=true
             return 0
         fi
-        # Method 2: service in "Bound services" (Android 11)
         if echo "${A11Y_VNC}" | grep -qi "Bound services:.*droidvnc"; then
             A11Y_BINDING=$(echo "${A11Y_VNC}" | grep -i "Binding services:" | head -1)
             A11Y_CRASHED=$(echo "${A11Y_VNC}" | grep -i "Crashed services:" | head -1)
@@ -321,7 +325,6 @@ vnc_setup_accessibility() {
                 return 0
             fi
         fi
-        # Method 3: service has mIsSystemBoundAsClient=true (Android 11 alternative)
         if echo "${A11Y_VNC}" | grep -qi "mIsSystemBoundAsClient=true"; then
             echo "VNC: InputService connected (mIsSystemBoundAsClient=true)!"
             VNC_A11Y_CONNECTED=true
@@ -334,6 +337,60 @@ vnc_setup_accessibility() {
     echo "VNC: WARNING — InputService did not connect after 30s"
     echo "VNC: Accessibility state:"
     adb shell "dumpsys accessibility" 2>/dev/null | grep -A15 "droidvnc_ng" | head -20
+
+    # Fallback: kill the process while a11y is STILL ENABLED.
+    # Android's AccessibilityManagerService will detect the crash and
+    # automatically restart + rebind the service within ~10s.
+    echo "VNC: Fallback — killing app process to trigger system a11y rebind..."
+    adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
+    sleep 10
+
+    # Check again after system-initiated rebind
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        A11Y_DUMP=$(adb shell "dumpsys accessibility" 2>/dev/null)
+        A11Y_VNC=$(echo "${A11Y_DUMP}" | grep -A15 "droidvnc_ng")
+        if echo "${A11Y_VNC}" | grep -qi "mIsConnected=true\|mIsSystemBoundAsClient=true"; then
+            echo "VNC: InputService connected after crash-rebind!"
+            VNC_A11Y_CONNECTED=true
+            return 0
+        fi
+        if echo "${A11Y_VNC}" | grep -qi "Bound services:.*droidvnc"; then
+            A11Y_CRASHED=$(echo "${A11Y_VNC}" | grep -i "Crashed services:" | head -1)
+            if ! echo "${A11Y_CRASHED}" | grep -qi "droidvnc"; then
+                echo "VNC: InputService connected after crash-rebind (in Bound services)!"
+                VNC_A11Y_CONNECTED=true
+                return 0
+            fi
+        fi
+        echo "VNC: Waiting for crash-rebind... (${i}/10)"
+        sleep 3
+    done
+
+    echo "VNC: FALLBACK 2 — trying phone reboot to force a11y binding..."
+    adb reboot 2>/dev/null
+    echo "VNC: Waiting for phone to reboot (90s)..."
+    sleep 90
+    # Wait for ADB to reconnect
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        if adb shell "echo ok" 2>/dev/null | grep -q "ok"; then
+            echo "VNC: ADB reconnected after reboot"
+            break
+        fi
+        echo "VNC: Waiting for ADB... (${i}/12)"
+        sleep 10
+    done
+    sleep 10
+
+    # After reboot, a11y settings persist — check if service auto-bound
+    A11Y_DUMP=$(adb shell "dumpsys accessibility" 2>/dev/null)
+    A11Y_VNC=$(echo "${A11Y_DUMP}" | grep -A15 "droidvnc_ng")
+    if echo "${A11Y_VNC}" | grep -qi "mIsConnected=true\|mIsSystemBoundAsClient=true\|Bound services:.*droidvnc"; then
+        echo "VNC: InputService connected after reboot!"
+        VNC_A11Y_CONNECTED=true
+        return 0
+    fi
+
+    echo "VNC: WARNING — InputService STILL did not bind after reboot"
 }
 
 vnc_grant_permissions() {
