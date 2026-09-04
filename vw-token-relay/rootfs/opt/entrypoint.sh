@@ -372,8 +372,10 @@ PREFSEOF
     fi
     echo "VNC: SharedPreferences written"
 
-    # Also place defaults.json in internal data dir (not FUSE-gated)
+    # Place defaults.json in EXTERNAL files dir — Defaults.kt reads from
+    # context.getExternalFilesDir(null) = /storage/emulated/0/Android/data/<pkg>/files/
     VNC_DEFAULTS="/tmp/vnc_defaults.json"
+    VNC_EXT_DIR="/storage/emulated/0/Android/data/${VNC_PKG}/files"
     VNC_PASS_JSON=""
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_PASS_JSON="\"password\": \"${VNC_PASSWORD}\","
@@ -391,6 +393,13 @@ PREFSEOF
 }
 VNCEOF
     adb push "${VNC_DEFAULTS}" /data/local/tmp/vnc_defaults.json 2>/dev/null
+    # External files dir (where the app reads from)
+    adb shell "su -c 'mkdir -p ${VNC_EXT_DIR}'" 2>/dev/null
+    adb shell "su -c 'cp /data/local/tmp/vnc_defaults.json ${VNC_EXT_DIR}/defaults.json'" 2>/dev/null
+    if [ -n "${VNC_APP_UID}" ]; then
+        adb shell "su -c 'chown -R ${VNC_APP_UID}:${VNC_APP_UID} /storage/emulated/0/Android/data/${VNC_PKG}'" 2>/dev/null
+    fi
+    # Also place in internal files dir as a fallback
     adb shell "su -c 'mkdir -p /data/data/${VNC_PKG}/files'" 2>/dev/null
     adb shell "su -c 'cp /data/local/tmp/vnc_defaults.json /data/data/${VNC_PKG}/files/defaults.json'" 2>/dev/null
     if [ -n "${VNC_APP_UID}" ]; then
@@ -401,6 +410,11 @@ VNCEOF
 
 start_vnc_server() {
     echo "VNC: Starting server..."
+
+    # Keep screen on while plugged in (phone is always on USB)
+    adb shell "svc power stayon usb" 2>/dev/null || true
+    wake_screen
+
     # Force stop first to ensure clean state
     adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
     sleep 2
@@ -408,36 +422,27 @@ start_vnc_server() {
     # Launch main activity so the app initializes
     echo "VNC: Launching main activity..."
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
-    sleep 5
+    sleep 3
 
-    # Start the foreground service — triggers Step 1 of droidVNC-NG's
-    # multi-step permission flow: persist intent → InputRequest (Step 2) →
-    # WriteStorage/Notification (Step 3) → MediaProjection (Step 4) → VNC starts
+    # Start the foreground service with EXTRA_FALLBACK_SCREEN_CAPTURE=true.
+    # This lets the VNC server start immediately (port 5900 opens) even without
+    # MediaProjection consent. We obtain MediaProjection separately after.
     VNC_START_CMD="am start-foreground-service"
     VNC_START_CMD="${VNC_START_CMD} -n ${VNC_PKG}/.MainService"
     VNC_START_CMD="${VNC_START_CMD} -a ${VNC_PKG}.ACTION_START"
     VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}"
     VNC_START_CMD="${VNC_START_CMD} --ei ${VNC_PKG}.EXTRA_PORT 5900"
     VNC_START_CMD="${VNC_START_CMD} --ef ${VNC_PKG}.EXTRA_SCALING 0.5"
-    # NO EXTRA_FALLBACK_SCREEN_CAPTURE — use MediaProjection for screen capture.
-    # Fallback mode needs InputService.mMainHandler which never binds on Android 11.
+    VNC_START_CMD="${VNC_START_CMD} --ez ${VNC_PKG}.EXTRA_FALLBACK_SCREEN_CAPTURE true"
     if [ -n "${VNC_PASSWORD}" ]; then
         VNC_START_CMD="${VNC_START_CMD} --es ${VNC_PKG}.EXTRA_PASSWORD ${VNC_PASSWORD}"
     fi
-    echo "VNC: Sending ACTION_START (MediaProjection mode)..."
+    echo "VNC: Sending ACTION_START (fallback+upgrade mode)..."
     adb shell "${VNC_START_CMD}" 2>&1
     sleep 3
 
-    # droidVNC-NG has a multi-step permission flow. Each step launches an Activity
-    # that blocks until the user acts. On a headless phone, we bypass each step by
-    # detecting the blocking activity and sending the result intent directly.
-    #
-    # Flow: ACTION_START (Step 1) → InputRequestActivity (Step 2) →
-    #        WriteStorageRequestActivity (Step 3, Android <13) →
-    #        MediaProjectionRequestActivity (Step 4) → consent dialog → VNC starts
-    #
-    # CRITICAL: Don't press HOME — Android 11 blocks background activity launches.
-    # Use BACK + re-launch to keep the app in the foreground task.
+    # Bypass the multi-step permission flow by sending result intents directly
+    # to MainService instead of waiting for UI activities to appear.
     vnc_bypass_permission_flow
 }
 
@@ -480,111 +485,61 @@ vnc_click_dialog_button() {
 }
 
 vnc_bypass_permission_flow() {
-    echo "VNC: Navigating permission flow (multi-strategy)..."
+    # v1.12.1: Direct intent chain approach.
+    # Instead of detecting foreground activities and pressing UI buttons,
+    # send result intents directly to MainService to skip each permission step.
+    # Combined with EXTRA_FALLBACK_SCREEN_CAPTURE=true, the VNC server starts
+    # immediately. We then upgrade to MediaProjection for real screen capture.
+    echo "VNC: Bypassing permission flow with direct intents..."
 
-    # v1.11.5: uiautomator dump fails (32 chars). v1.11.6: HOME + am start
-    # fails because startActivityForResult + FLAG_ACTIVITY_NEW_TASK returns
-    # immediately on Android 11.
-    #
-    # v1.11.7 multi-strategy approach:
-    #   Strategy A: Key events (Tab + Enter) to press the dialog "No" button.
-    #   Strategy B: HOME to background dialog, then send the intent chain to
-    #     MainService with the access key from SharedPreferences, letting
-    #     MainService launch MediaProjectionRequestActivity itself.
+    # Step 2: Skip InputRequestActivity — tell MainService a11y was declined
+    echo "VNC: Sending a11y result (skip input request)..."
+    adb shell "am start-foreground-service \
+        -n ${VNC_PKG}/.MainService \
+        -a action_handle_a11y_result \
+        --ez result_a11y false \
+        --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>/dev/null
+    sleep 2
 
-    VNC_ACCESS_KEY=""
+    # Step 3: Skip WriteStorageRequestActivity — tell MainService storage was declined.
+    # With EXTRA_FALLBACK_SCREEN_CAPTURE=true in the persisted start intent
+    # (from ACTION_START above), MainService enters the fallback branch and
+    # calls vncStartServer() immediately — port 5900 opens.
+    echo "VNC: Sending write storage result (skip storage request)..."
+    adb shell "am start-foreground-service \
+        -n ${VNC_PKG}/.MainService \
+        -a action_handle_write_storage_result \
+        --ez result_write_storage false \
+        --es ${VNC_PKG}.EXTRA_ACCESS_KEY ${VNC_ACCESS_KEY}" 2>/dev/null
+    sleep 3
 
-    for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-        echo "VNC: Round ${round} foreground: ${FOREGROUND}"
-
-        if echo "${FOREGROUND}" | grep -q "InputRequestActivity\|WriteStorageRequestActivity\|NotificationRequestActivity"; then
-
-            if [ "${round}" -le 4 ]; then
-                # Strategy A: press the dialog button via key events.
-                # AlertDialog buttons are focusable via Tab. On Material dialogs,
-                # Tab order is: Negative ("No") → Positive ("Yes").
-                echo "VNC: Strategy A — pressing dialog button via key events..."
-                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-                sleep 0.5
-                adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-                sleep 3
-                # Check if that worked
-                FOREGROUND2=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-                if ! echo "${FOREGROUND2}" | grep -q "InputRequestActivity\|WriteStorageRequestActivity\|NotificationRequestActivity"; then
-                    echo "VNC: Key events dismissed the activity!"
-                    sleep 2
-                    continue
-                fi
-                # Try Tab+Tab+Enter (in case first Tab hit the wrong button)
-                echo "VNC: Retrying with Tab+Tab+Enter..."
-                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-                sleep 0.3
-                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-                sleep 0.3
-                adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-                sleep 5
-                continue
-            else
-                # Strategy B: HOME + direct intent to MainService with access key.
-                echo "VNC: Strategy B — HOME + intent chain to MainService..."
-                # Read access key from SharedPreferences (needed for MainService to accept the intent)
-                if [ -z "${VNC_ACCESS_KEY}" ]; then
-                    VNC_ACCESS_KEY=$(adb shell "su -c 'cat /data/data/${VNC_PKG}/shared_prefs/${VNC_PKG}_preferences.xml'" 2>/dev/null | grep -o 'name="extra_access_key"[^<]*' | sed 's/.*>//;s/<.*//' | tr -d '[:space:]')
-                    echo "VNC: Access key: ${VNC_ACCESS_KEY:+found (${#VNC_ACCESS_KEY} chars)}${VNC_ACCESS_KEY:-NOT FOUND}"
-                fi
-                adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-                sleep 2
-                if [ -n "${VNC_ACCESS_KEY}" ]; then
-                    # Send a11y result=false to MainService — this chains to
-                    # WriteStorage (skipped) → MediaProjection consent
-                    adb shell "am startservice \
-                        -n ${VNC_PKG}/.MainService \
-                        -a action_handle_a11y_result \
-                        --ez result_a11y false \
-                        --es ${VNC_PKG}.EXTRA_ACCESS_KEY '${VNC_ACCESS_KEY}'" 2>/dev/null
-                    echo "VNC: Sent a11y result intent with access key"
-                else
-                    # No access key — try without (may be rejected)
-                    adb shell "am startservice \
-                        -n ${VNC_PKG}/.MainService \
-                        -a action_handle_a11y_result \
-                        --ez result_a11y false" 2>/dev/null
-                    echo "VNC: Sent a11y result intent (no access key)"
-                fi
-                sleep 5
-                continue
-            fi
-
-        elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
-            echo "VNC: MediaProjectionRequestActivity detected — accepting consent..."
-            accept_media_projection
-            sleep 3
-            continue
-
-        elif echo "${FOREGROUND}" | grep -qi "MediaProjection\|GrantPermission\|permission.*Activity"; then
-            echo "VNC: System consent dialog detected — accepting..."
-            accept_media_projection
-            sleep 3
-            continue
-        fi
-
-        # Check if VNC port is now open — the flow completed
+    # Wait for VNC server to start (port 5900)
+    for wait_round in 1 2 3 4; do
         VNC_CHECK=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep 5900 || echo "")
         if [ -n "${VNC_CHECK}" ]; then
-            echo "VNC: Port 5900 open — permission flow complete!"
+            echo "VNC: Port 5900 open — VNC server started in fallback mode!"
             break
         fi
-
-        echo "VNC: No blocking activity detected — waiting..."
-        if [ "${round}" -lt 12 ]; then
-            sleep 3
-            continue
-        fi
-
-        echo "VNC: Permission flow timed out"
-        break
+        echo "VNC: Port 5900 not yet open — waiting (${wait_round}/4)..."
+        sleep 3
     done
+
+    if [ -z "${VNC_CHECK}" ]; then
+        echo "VNC: Port 5900 still not open after direct intent chain"
+        return 1
+    fi
+
+    # Step 4: Upgrade to MediaProjection for real screen capture.
+    # The VNC server is running with InputService fallback (blank/low-quality),
+    # but MediaProjection gives actual screen content.
+    echo "VNC: Upgrading to MediaProjection capture..."
+    wake_screen
+    sleep 1
+    adb shell "am start -n ${VNC_PKG}/.MediaProjectionRequestActivity \
+        --ez upgrading_from_no_or_fallback_screen_capture true" 2>/dev/null
+    sleep 3
+    accept_media_projection
+    echo "VNC: Permission flow complete"
 }
 
 accept_media_projection() {
@@ -698,10 +653,6 @@ verify_vnc_listening() {
     adb shell "am force-stop ${VNC_PKG}" 2>/dev/null || true
     sleep 2
     start_vnc_server
-
-    if [ "${VNC_USE_FALLBACK}" = "false" ]; then
-        accept_media_projection
-    fi
     sleep 5
 
     LISTENING2=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep 5900 || echo "")
