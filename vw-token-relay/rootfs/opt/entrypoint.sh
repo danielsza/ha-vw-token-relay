@@ -489,31 +489,81 @@ vnc_click_dialog_button() {
 }
 
 vnc_bypass_permission_flow() {
-    echo "VNC: Navigating permission flow (HOME + direct launch)..."
+    echo "VNC: Navigating permission flow (multi-strategy)..."
 
-    # v1.11.5 tried uiautomator to click dialog buttons, but dump returns only
-    # 32 chars on this device ("ERROR: could not get idle state").
-    # v1.11.6 approach: when a blocking permission activity (InputRequestActivity,
-    # WriteStorageRequestActivity) is in the foreground, press HOME to background
-    # it, then directly launch MediaProjectionRequestActivity. This skips the
-    # dialog interaction entirely and goes straight to the system consent dialog.
-    # MediaProjectionRequestActivity's own code posts the projection token back
-    # to MainService with the correct access key from SharedPreferences.
+    # v1.11.5: uiautomator dump fails (32 chars). v1.11.6: HOME + am start
+    # fails because startActivityForResult + FLAG_ACTIVITY_NEW_TASK returns
+    # immediately on Android 11.
+    #
+    # v1.11.7 multi-strategy approach:
+    #   Strategy A: Key events (Tab + Enter) to press the dialog "No" button.
+    #   Strategy B: HOME to background dialog, then send the intent chain to
+    #     MainService with the access key from SharedPreferences, letting
+    #     MainService launch MediaProjectionRequestActivity itself.
+
+    VNC_ACCESS_KEY=""
 
     for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
         FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
         echo "VNC: Round ${round} foreground: ${FOREGROUND}"
 
         if echo "${FOREGROUND}" | grep -q "InputRequestActivity\|WriteStorageRequestActivity\|NotificationRequestActivity"; then
-            echo "VNC: Blocking permission activity — pressing HOME and launching MediaProjection directly..."
-            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
-            sleep 2
-            # Directly launch MediaProjectionRequestActivity — it will show the
-            # system's screen capture consent dialog. On accept, it posts
-            # ACTION_HANDLE_MEDIA_PROJECTION_REQUEST_RESULT to MainService.
-            adb shell "am start -n ${VNC_PKG}/.MediaProjectionRequestActivity" 2>/dev/null
-            sleep 3
-            continue
+
+            if [ "${round}" -le 4 ]; then
+                # Strategy A: press the dialog button via key events.
+                # AlertDialog buttons are focusable via Tab. On Material dialogs,
+                # Tab order is: Negative ("No") → Positive ("Yes").
+                echo "VNC: Strategy A — pressing dialog button via key events..."
+                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+                sleep 0.5
+                adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+                sleep 3
+                # Check if that worked
+                FOREGROUND2=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
+                if ! echo "${FOREGROUND2}" | grep -q "InputRequestActivity\|WriteStorageRequestActivity\|NotificationRequestActivity"; then
+                    echo "VNC: Key events dismissed the activity!"
+                    sleep 2
+                    continue
+                fi
+                # Try Tab+Tab+Enter (in case first Tab hit the wrong button)
+                echo "VNC: Retrying with Tab+Tab+Enter..."
+                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+                sleep 0.3
+                adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
+                sleep 0.3
+                adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+                sleep 5
+                continue
+            else
+                # Strategy B: HOME + direct intent to MainService with access key.
+                echo "VNC: Strategy B — HOME + intent chain to MainService..."
+                # Read access key from SharedPreferences (needed for MainService to accept the intent)
+                if [ -z "${VNC_ACCESS_KEY}" ]; then
+                    VNC_ACCESS_KEY=$(adb shell "su -c 'cat /data/data/${VNC_PKG}/shared_prefs/${VNC_PKG}_preferences.xml'" 2>/dev/null | grep -o 'name="extra_access_key"[^<]*' | sed 's/.*>//;s/<.*//' | tr -d '[:space:]')
+                    echo "VNC: Access key: ${VNC_ACCESS_KEY:+found (${#VNC_ACCESS_KEY} chars)}${VNC_ACCESS_KEY:-NOT FOUND}"
+                fi
+                adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+                sleep 2
+                if [ -n "${VNC_ACCESS_KEY}" ]; then
+                    # Send a11y result=false to MainService — this chains to
+                    # WriteStorage (skipped) → MediaProjection consent
+                    adb shell "am startservice \
+                        -n ${VNC_PKG}/.MainService \
+                        -a action_handle_a11y_result \
+                        --ez result_a11y false \
+                        --es ${VNC_PKG}.EXTRA_ACCESS_KEY '${VNC_ACCESS_KEY}'" 2>/dev/null
+                    echo "VNC: Sent a11y result intent with access key"
+                else
+                    # No access key — try without (may be rejected)
+                    adb shell "am startservice \
+                        -n ${VNC_PKG}/.MainService \
+                        -a action_handle_a11y_result \
+                        --ez result_a11y false" 2>/dev/null
+                    echo "VNC: Sent a11y result intent (no access key)"
+                fi
+                sleep 5
+                continue
+            fi
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
             echo "VNC: MediaProjectionRequestActivity detected — accepting consent..."
