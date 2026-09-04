@@ -419,6 +419,16 @@ start_vnc_server() {
     adb shell "am force-stop ${VNC_PKG}" 2>/dev/null
     sleep 2
 
+    # Debug: verify access key in SharedPreferences matches what we'll send
+    PREFS_KEY=$(adb shell "su -c 'cat /data/data/${VNC_PKG}/shared_prefs/${VNC_PKG}_preferences.xml'" 2>/dev/null | grep -o 'name="settings_access_key">[^<]*' | sed 's/.*>//')
+    DEFAULTS_KEY=$(adb shell "su -c 'cat /data/data/${VNC_PKG}/shared_prefs/${VNC_PKG}_preferences.xml'" 2>/dev/null | grep -o 'name="defaults_access_key">[^<]*' | sed 's/.*>//')
+    echo "VNC: Access key in intent: '${VNC_ACCESS_KEY}'"
+    echo "VNC: settings_access_key in prefs: '${PREFS_KEY}'"
+    echo "VNC: defaults_access_key in prefs: '${DEFAULTS_KEY}'"
+
+    # Clear logcat for clean capture
+    adb shell "logcat -c" 2>/dev/null || true
+
     # Launch main activity so the app initializes
     echo "VNC: Launching main activity..."
     adb shell "am start -n ${VNC_PKG}/.MainActivity" 2>&1
@@ -440,6 +450,11 @@ start_vnc_server() {
     echo "VNC: Sending ACTION_START (fallback+upgrade mode)..."
     adb shell "${VNC_START_CMD}" 2>&1
     sleep 3
+
+    # Debug: capture MainService logs right after ACTION_START
+    echo "VNC: --- MainService log after ACTION_START ---"
+    adb shell "logcat -d -t 30" 2>&1 | grep -i "MainService\|Access key\|onStartCommand\|stopSelf\|vncStart" | tail -15
+    echo "VNC: --- end MainService log ---"
 
     # Bypass the multi-step permission flow by sending result intents directly
     # to MainService instead of waiting for UI activities to appear.
@@ -634,13 +649,11 @@ verify_vnc_listening() {
     VNC_PID=$(adb shell pidof "${VNC_PKG}" 2>/dev/null || echo "")
     if [ -n "${VNC_PID}" ]; then
         echo "VNC: App running as PID ${VNC_PID}"
-        echo "VNC: --- Full logcat (last 50 lines) ---"
-        adb shell "logcat -d -t 50 --pid=${VNC_PID}" 2>&1 | tail -50
     else
         echo "VNC: App NOT running (crashed?)"
-        echo "VNC: --- Recent crash/VNC logs ---"
-        adb shell "logcat -d -t 100" 2>&1 | grep -i "droidvnc\|MainService\|InputService\|AndroidRuntime\|FATAL\|NullPointer\|died\|crash" | tail -30
     fi
+    echo "VNC: --- VNC-related logcat (all PIDs) ---"
+    adb shell "logcat -d -t 200" 2>&1 | grep -i "MainService\|Access key\|vncStart\|stopSelf\|ACTION_START\|action_handle\|onStartCommand.*start\|Defaults" | tail -30
     echo "VNC: --- Service state ---"
     adb shell "dumpsys activity services ${VNC_PKG}" 2>/dev/null | head -20
     echo "VNC: --- All listening ports ---"
