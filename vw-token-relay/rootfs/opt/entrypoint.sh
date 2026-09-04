@@ -489,40 +489,30 @@ vnc_click_dialog_button() {
 }
 
 vnc_bypass_permission_flow() {
-    echo "VNC: Navigating permission flow via UI interaction..."
+    echo "VNC: Navigating permission flow (HOME + direct launch)..."
 
-    # droidVNC-NG shows a chain of permission activities (AlertDialogs):
-    #   InputRequestActivity → WriteStorageRequestActivity → MediaProjectionRequestActivity
-    # Each dialog has Yes/No buttons. We click "No" to skip optional permissions
-    # and let the app chain through to MediaProjectionRequestActivity, where we
-    # accept the system's screen capture consent dialog.
-    #
-    # v1.11.4 failed because sending raw intents left InputRequestActivity's dialog
-    # on screen, blocking the chain. Clicking the actual button via uiautomator
-    # lets the app's own code call finish() and chain properly.
+    # v1.11.5 tried uiautomator to click dialog buttons, but dump returns only
+    # 32 chars on this device ("ERROR: could not get idle state").
+    # v1.11.6 approach: when a blocking permission activity (InputRequestActivity,
+    # WriteStorageRequestActivity) is in the foreground, press HOME to background
+    # it, then directly launch MediaProjectionRequestActivity. This skips the
+    # dialog interaction entirely and goes straight to the system consent dialog.
+    # MediaProjectionRequestActivity's own code posts the projection token back
+    # to MainService with the correct access key from SharedPreferences.
 
     for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
         FOREGROUND=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
         echo "VNC: Round ${round} foreground: ${FOREGROUND}"
 
-        if echo "${FOREGROUND}" | grep -q "InputRequestActivity"; then
-            echo "VNC: InputRequestActivity detected — clicking 'No' to skip a11y..."
-            # Click "No" — we don't need InputService for MediaProjection capture.
-            # The app will call postResult(false) → MainService chains onward → finish().
-            vnc_click_dialog_button "NO" "No" "no" "CANCEL" "Cancel" "DENY" "Deny"
-            sleep 5
-            continue
-
-        elif echo "${FOREGROUND}" | grep -q "WriteStorageRequestActivity"; then
-            echo "VNC: WriteStorageRequestActivity detected — clicking 'No' to skip..."
-            vnc_click_dialog_button "NO" "No" "no" "CANCEL" "Cancel" "DENY" "Deny"
-            sleep 5
-            continue
-
-        elif echo "${FOREGROUND}" | grep -q "NotificationRequestActivity"; then
-            echo "VNC: NotificationRequestActivity detected — clicking 'No' to skip..."
-            vnc_click_dialog_button "NO" "No" "no" "CANCEL" "Cancel" "DENY" "Deny"
-            sleep 5
+        if echo "${FOREGROUND}" | grep -q "InputRequestActivity\|WriteStorageRequestActivity\|NotificationRequestActivity"; then
+            echo "VNC: Blocking permission activity — pressing HOME and launching MediaProjection directly..."
+            adb shell "input keyevent KEYCODE_HOME" 2>/dev/null
+            sleep 2
+            # Directly launch MediaProjectionRequestActivity — it will show the
+            # system's screen capture consent dialog. On accept, it posts
+            # ACTION_HANDLE_MEDIA_PROJECTION_REQUEST_RESULT to MainService.
+            adb shell "am start -n ${VNC_PKG}/.MediaProjectionRequestActivity" 2>/dev/null
+            sleep 3
             continue
 
         elif echo "${FOREGROUND}" | grep -q "MediaProjectionRequestActivity"; then
@@ -546,8 +536,6 @@ vnc_bypass_permission_flow() {
         fi
 
         echo "VNC: No blocking activity detected — waiting..."
-        # If we just dismissed InputRequestActivity, MediaProjectionRequestActivity
-        # might take a moment to appear. Give it one more round.
         if [ "${round}" -lt 12 ]; then
             sleep 3
             continue
