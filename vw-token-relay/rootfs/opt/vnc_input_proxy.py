@@ -28,6 +28,10 @@ LISTEN_PORT = int(os.environ.get('VNC_PROXY_PORT', '5900'))
 VNC_HOST = '127.0.0.1'
 VNC_PORT = int(os.environ.get('VNC_BACKEND_PORT', '15900'))
 
+# Screen resolution (for coordinate scaling when VNC uses EXTRA_SCALING)
+SCREEN_WIDTH = int(os.environ.get('VNC_SCREEN_WIDTH', '720'))
+SCREEN_HEIGHT = int(os.environ.get('VNC_SCREEN_HEIGHT', '1600'))
+
 # Throttle: minimum ms between ADB input commands
 INPUT_THROTTLE_MS = 50
 _last_input_time = 0
@@ -138,7 +142,7 @@ def handle_key(down_flag, keysym):
 class PointerState:
     """Track VNC pointer state for click/drag/scroll detection."""
 
-    def __init__(self):
+    def __init__(self, scale_x=1.0, scale_y=1.0):
         self.button_mask = 0
         self.x = 0
         self.y = 0
@@ -146,6 +150,12 @@ class PointerState:
         self.press_y = 0
         self.press_time = 0
         self.dragging = False
+        self.scale_x = scale_x
+        self.scale_y = scale_y
+
+    def _to_screen(self, x, y):
+        """Convert VNC framebuffer coordinates to screen coordinates."""
+        return int(x * self.scale_x), int(y * self.scale_y)
 
     def update(self, button_mask, x, y):
         prev_mask = self.button_mask
@@ -170,24 +180,28 @@ class PointerState:
             dy = abs(y - self.press_y)
             duration = time.time() - self.press_time
 
+            sx, sy = self._to_screen(x, y)
+            spx, spy = self._to_screen(self.press_x, self.press_y)
+
             if dx > 10 or dy > 10:
                 # Drag/swipe
                 dur_ms = max(100, int(duration * 1000))
-                adb_input(f'input swipe {self.press_x} {self.press_y} {x} {y} {dur_ms}')
+                adb_input(f'input swipe {spx} {spy} {sx} {sy} {dur_ms}')
             elif duration > 0.5:
                 # Long press
-                adb_input(f'input swipe {x} {y} {x} {y} {int(duration * 1000)}')
+                adb_input(f'input swipe {sx} {sy} {sx} {sy} {int(duration * 1000)}')
             else:
                 # Tap
-                adb_input(f'input tap {x} {y}')
+                adb_input(f'input tap {sx} {sy}')
 
             self.dragging = False
 
         # Scroll (buttons 4=up, 5=down in VNC)
+        sx, sy = self._to_screen(x, y)
         if (button_mask & 8) and not (prev_mask & 8):
-            adb_input(f'input swipe {x} {y} {x} {max(0, y - 200)} 100')  # scroll up
+            adb_input(f'input swipe {sx} {sy} {sx} {max(0, sy - 200)} 100')  # scroll up
         if (button_mask & 16) and not (prev_mask & 16):
-            adb_input(f'input swipe {x} {y} {x} {y + 200} 100')  # scroll down
+            adb_input(f'input swipe {sx} {sy} {sx} {sy + 200} 100')  # scroll down
 
 
 def recv_exact(sock, n):
@@ -302,6 +316,14 @@ def handle_client(client_sock, addr):
         client_sock.sendall(server_init + server_name)
         print(f"VNC proxy: Framebuffer {fb_width}x{fb_height}, name={server_name}")
 
+        # Compute coordinate scale factors: VNC framebuffer → real screen
+        # With EXTRA_SCALING=0.5, fb is 360×800 but ADB expects 720×1600
+        scale_x = SCREEN_WIDTH / fb_width if fb_width > 0 else 1.0
+        scale_y = SCREEN_HEIGHT / fb_height if fb_height > 0 else 1.0
+        if scale_x != 1.0 or scale_y != 1.0:
+            print(f"VNC proxy: Coordinate scaling: {scale_x:.2f}x, {scale_y:.2f}y "
+                  f"(screen {SCREEN_WIDTH}x{SCREEN_HEIGHT})")
+
         # === Main loop ===
         # Forward server→client in a background thread
         srv_thread = threading.Thread(
@@ -312,7 +334,7 @@ def handle_client(client_sock, addr):
         srv_thread.start()
 
         # Handle client→server messages (intercept input)
-        pointer = PointerState()
+        pointer = PointerState(scale_x, scale_y)
 
         while True:
             msg_type_data = recv_exact(client_sock, 1)
