@@ -536,64 +536,67 @@ vnc_click_dialog_button() {
 
 accept_media_projection() {
     # On Android 10+, MediaProjection shows a system consent dialog.
-    # Strategy: use dumpsys activity to detect the dialog activity, then
-    # use both keypress and coordinate-based tap to accept it.
+    # CRITICAL: Never send keypresses to droidVNC's normal UI (MainActivity,
+    # WebViewActivity) — that navigates the app and can STOP the VNC server.
+    # Only interact when we positively identify the system consent dialog.
     echo "VNC: Checking for MediaProjection consent dialog..."
 
     # Ensure screen is on and unlocked
     wake_screen
-    sleep 3
+    sleep 2
 
-    for attempt in 1 2 3 4 5 6 7 8; do
-        # Check which activity is currently in the foreground
+    for attempt in 1 2 3 4 5; do
         RESUMED=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
         echo "VNC: Attempt ${attempt} — resumed: ${RESUMED}"
 
-        # Check if VNC port changed (MediaProjection might have restarted the server)
-        VNC_UP=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep ":5900 " || echo "")
+        # --- SAFE: droidVNC's normal UI (MainActivity, WebViewActivity, etc.) ---
+        # Do NOT send any keypresses — this would navigate the UI and kill VNC
+        if echo "${RESUMED}" | grep -qi "droidvnc" && ! echo "${RESUMED}" | grep -q "MediaProjectionRequestActivity"; then
+            echo "VNC: droidVNC normal UI — not interfering"
+            sleep 2
+            continue
+        fi
 
-        # Strategy 1: Check for system MediaProjection consent dialog
-        # On Android 11, this is a PermissionActivity from MediaProjectionPermissionActivity
-        if echo "${RESUMED}" | grep -qi "MediaProjection\|PermissionActivity\|GrantPermission\|chooser"; then
+        # --- WAIT: droidVNC's MediaProjectionRequestActivity ---
+        # With omit_fallback_screen_capture_dialog=true, this auto-launches
+        # the system consent dialog. Just wait for it to appear.
+        if echo "${RESUMED}" | grep -q "MediaProjectionRequestActivity"; then
+            echo "VNC: MediaProjectionRequestActivity — waiting for system consent..."
+            sleep 3
+            continue
+        fi
+
+        # --- ACCEPT: System consent dialog ---
+        # On Android 11 (Moto G Pure), the system MediaProjection consent dialog
+        # comes from com.android.systemui (MediaProjectionPermissionActivity)
+        if echo "${RESUMED}" | grep -qi "systemui\|PermissionActivity\|GrantPermission\|chooser"; then
             echo "VNC: System consent dialog detected — accepting..."
-            # "Start now" button is typically bottom-right on the dialog
-            # On Moto G Pure 720x1600, the button is around x=540, y=880
+            # Try coordinate tap first: "Start now" button on Moto G Pure 720x1600
             adb shell "input tap 540 880" 2>/dev/null
             sleep 2
-            # Verify it worked
+            # Verify
             RESUMED2=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-            if ! echo "${RESUMED2}" | grep -qi "MediaProjection\|PermissionActivity"; then
+            if ! echo "${RESUMED2}" | grep -qi "systemui\|PermissionActivity\|GrantPermission"; then
                 echo "VNC: Consent dialog dismissed successfully"
                 return 0
             fi
-            # Try keyboard approach
+            # Tap didn't work — try keyboard (Tab to "Start now", Enter)
             adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
             sleep 0.3
             adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
             sleep 2
+            echo "VNC: Sent keyboard accept"
             return 0
         fi
 
-        # Strategy 2: Check for droidVNC's own upgrade dialog
-        if echo "${RESUMED}" | grep -qi "MediaProjectionRequestActivity\|droidvnc"; then
-            echo "VNC: droidVNC MediaProjection dialog detected — tapping Yes..."
-            # This is droidVNC's "upgrade from fallback?" dialog — shouldn't appear
-            # since we set omit_fallback_screen_capture_dialog, but handle it anyway
-            adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-            sleep 0.3
-            adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-            sleep 3
-            continue  # System consent dialog should appear next
-        fi
-
-        # Strategy 3: uiautomator dump (may fail during screen capture)
+        # --- FALLBACK: Unknown activity — try uiautomator to find consent button ---
+        # Only if we don't recognize the foreground activity
         DUMP=$(adb shell "uiautomator dump /dev/tty" 2>/dev/null || echo "")
         if [ ${#DUMP} -gt 100 ]; then
-            echo "VNC: UI dump: ${#DUMP} chars"
-            if echo "${DUMP}" | grep -qi "start now\|Start recording\|allow\|start capturing\|screen capture"; then
-                echo "VNC: Found consent in UI dump — tapping accept..."
+            if echo "${DUMP}" | grep -qi "start now\|Start recording\|start capturing\|screen capture"; then
+                echo "VNC: Found consent text in UI dump — tapping..."
                 BOUNDS=""
-                for BTN_TEXT in "Start now" "START NOW" "Allow" "ALLOW" "Start" "OK"; do
+                for BTN_TEXT in "Start now" "START NOW" "Start" "OK"; do
                     BOUNDS=$(echo "${DUMP}" | grep -oi "text=\"${BTN_TEXT}\"[^/]*bounds=\"\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\"" | head -1 | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"')
                     [ -n "${BOUNDS}" ] && break
                 done
@@ -605,42 +608,16 @@ accept_media_projection() {
                     CX=$(( (X1 + X2) / 2 ))
                     CY=$(( (Y1 + Y2) / 2 ))
                     adb shell "input tap ${CX} ${CY}" 2>/dev/null
-                    echo "VNC: Tapped at ${CX},${CY}"
-                else
-                    adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
+                    echo "VNC: Tapped '${BTN_TEXT}' at ${CX},${CY}"
+                    sleep 2
+                    return 0
                 fi
-                sleep 3
-                return 0
             fi
-        else
-            echo "VNC: UI dump short (${#DUMP} chars)"
-        fi
-
-        # Strategy 4: Blind accept on every attempt (uiautomator is unreliable
-        # during VNC screen capture — just try both approaches each round)
-        echo "VNC: Blind accept attempt..."
-        # Tab+Enter for dialog with keyboard focus
-        adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-        sleep 0.3
-        adb shell "input keyevent KEYCODE_TAB" 2>/dev/null
-        sleep 0.3
-        adb shell "input keyevent KEYCODE_ENTER" 2>/dev/null
-        sleep 1
-        # Coordinate tap for "Start now" on Moto G Pure consent dialog
-        adb shell "input tap 540 880" 2>/dev/null
-        sleep 2
-
-        # Check if consent was accepted (server would restart with MediaProjection)
-        VNC_NOW=$(adb shell "su -c 'ss -tlnp'" 2>/dev/null | grep ":5900 " || echo "")
-        RESUMED3=$(adb shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | head -1)
-        if [ -n "${VNC_NOW}" ] && ! echo "${RESUMED3}" | grep -qi "MediaProjection\|PermissionActivity"; then
-            echo "VNC: Consent likely accepted (no dialog in foreground, port open)"
-            return 0
         fi
 
         sleep 2
     done
-    echo "VNC: No MediaProjection dialog detected/accepted after 8 attempts"
+    echo "VNC: No MediaProjection consent dialog detected after 5 attempts"
     echo "VNC: Server will continue in fallback capture mode"
 }
 
