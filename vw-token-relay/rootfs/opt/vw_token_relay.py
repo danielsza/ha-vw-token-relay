@@ -2297,9 +2297,11 @@ class VWTokenRelay:
                                  "waiting for bottom sheet...")
                         time.sleep(5)
                     else:
-                        log.warning("UI_RST: All Frida methods failed — "
-                                    "falling back to input tap at (%d,%d)",
-                                    cx, cy)
+                        # Try enabling the view via Frida then tapping
+                        log.warning("UI_RST: All Frida click methods "
+                                    "failed — trying enable-then-tap")
+                        self._frida_enable_view("remoteStartButton")
+                        time.sleep(1)
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
                              f"input tap {cx} {cy}"],
@@ -2424,6 +2426,13 @@ class VWTokenRelay:
             self._dismiss_system_dialogs()
             result_xml = self._dump_ui_xml()
             result_msg = self._read_result_text(result_xml) if result_xml else ""
+
+            if result_msg:
+                log.info("UI_RST: Result text: '%s'", result_msg)
+            else:
+                log.warning("UI_RST: No result text captured from app "
+                            "(xml=%d bytes)",
+                            len(result_xml) if result_xml else 0)
 
             # Take final screencap for debugging
             self._screencap()
@@ -2819,22 +2828,61 @@ class VWTokenRelay:
                 var ActivityThread = Java.use('android.app.ActivityThread');
                 var app = ActivityThread.currentApplication();
                 var pkg = app.getPackageName();
+                var targetResName = '""" + resource_id + """';
 
-                // Resolve the resource ID
+                // Try getIdentifier first (fast path)
                 var resId = app.getResources().getIdentifier(
-                    '""" + resource_id + """', 'id', pkg);
-                if (resId === 0) {
-                    send({type: 'error',
-                          msg: 'Resource ID not found: """ + resource_id + """'});
-                    return;
+                    targetResName, 'id', pkg);
+
+                // Helper: recursively walk view hierarchy by resource name
+                function findViewByResName(root, name) {
+                    if (root === null) return null;
+                    try {
+                        var vid = root.getId();
+                        if (vid !== -1) {
+                            try {
+                                var entry = root.getResources()
+                                    .getResourceEntryName(vid);
+                                if (entry === name) return root;
+                            } catch(e) {}
+                        }
+                    } catch(e) {}
+                    // Check if it's a ViewGroup with children
+                    try {
+                        var ViewGroup = Java.use('android.view.ViewGroup');
+                        var vg = Java.cast(root, ViewGroup);
+                        var count = vg.getChildCount();
+                        for (var i = 0; i < count; i++) {
+                            var found = findViewByResName(
+                                vg.getChildAt(i), name);
+                            if (found !== null) return found;
+                        }
+                    } catch(e) {}
+                    return null;
                 }
 
-                // Walk all activities on the heap to find the right one
                 var clicked = false;
                 Java.choose('android.app.Activity', {
                     onMatch: function(act) {
                         if (clicked) return;
-                        var view = act.findViewById(resId);
+                        var view = null;
+
+                        // Method 1: findViewById with resolved ID
+                        if (resId !== 0) {
+                            view = act.findViewById(resId);
+                        }
+
+                        // Method 2: walk the view hierarchy by
+                        // resource entry name (works across modules)
+                        if (view === null) {
+                            try {
+                                var decor = act.getWindow()
+                                    .getDecorView();
+                                view = findViewByResName(
+                                    decor, targetResName);
+                            } catch(e) {}
+                        }
+
                         if (view !== null) {
                             Java.scheduleOnMainThread(function() {
                                 // Enable the view first so performClick
@@ -2842,7 +2890,8 @@ class VWTokenRelay:
                                 view.setEnabled(true);
                                 var result = view.performClick();
                                 send({type: 'success',
-                                      msg: 'performClick returned ' + result});
+                                      msg: 'performClick returned ' +
+                                           result});
                             });
                             clicked = true;
                         }
@@ -2896,6 +2945,98 @@ class VWTokenRelay:
                       resource_id, e)
             return False
 
+    def _frida_enable_view(self, resource_id):
+        """Use Frida to enable a disabled view by walking the view hierarchy.
+
+        Uses getResourceEntryName to match views — works even when
+        getIdentifier fails (e.g. feature module resources).
+        Returns True if the view was found and enabled.
+        """
+        if not self.session:
+            return False
+
+        script_code = """
+        Java.perform(function() {
+            try {
+                var targetName = '""" + resource_id + """';
+
+                function findAndEnable(root) {
+                    if (root === null) return false;
+                    try {
+                        var vid = root.getId();
+                        if (vid !== -1) {
+                            try {
+                                var entry = root.getResources()
+                                    .getResourceEntryName(vid);
+                                if (entry === targetName) {
+                                    Java.scheduleOnMainThread(function() {
+                                        root.setEnabled(true);
+                                        root.setClickable(true);
+                                        send({type: 'success',
+                                              msg: 'Enabled ' + targetName});
+                                    });
+                                    return true;
+                                }
+                            } catch(e) {}
+                        }
+                    } catch(e) {}
+                    try {
+                        var ViewGroup = Java.use('android.view.ViewGroup');
+                        var vg = Java.cast(root, ViewGroup);
+                        for (var i = 0; i < vg.getChildCount(); i++) {
+                            if (findAndEnable(vg.getChildAt(i)))
+                                return true;
+                        }
+                    } catch(e) {}
+                    return false;
+                }
+
+                var found = false;
+                Java.choose('android.app.Activity', {
+                    onMatch: function(act) {
+                        if (found) return;
+                        try {
+                            var decor = act.getWindow().getDecorView();
+                            found = findAndEnable(decor);
+                        } catch(e) {}
+                    },
+                    onComplete: function() {
+                        if (!found)
+                            send({type: 'error',
+                                  msg: 'View not found: ' + targetName});
+                    }
+                });
+            } catch(e) {
+                send({type: 'error', msg: 'Exception: ' + e.message});
+            }
+        });
+        """
+
+        result = {"done": False, "success": False}
+        def _on_msg(message, _data):
+            if message.get("type") == "send":
+                payload = message["payload"]
+                result["done"] = True
+                result["success"] = payload.get("type") == "success"
+                log.info("FRIDA_ENABLE: %s", payload.get("msg", ""))
+
+        try:
+            s = self.session.create_script(script_code)
+            s.on("message", _on_msg)
+            s.load()
+            for _ in range(20):
+                if result["done"]:
+                    break
+                time.sleep(0.5)
+            try:
+                s.unload()
+            except Exception:
+                pass
+            return result["success"]
+        except Exception as e:
+            log.error("FRIDA_ENABLE: Exception: %s", e)
+            return False
+
     def _frida_navigate_to(self, dest_name_hint):
         """Use Frida to navigate via NavController to a destination.
 
@@ -2921,80 +3062,99 @@ class VWTokenRelay:
                 var hostId = app.getResources().getIdentifier(
                     'mainNavHostFragment', 'id', pkg);
 
-                Java.choose('androidx.fragment.app.FragmentActivity', {
-                    onMatch: function(activity) {
+                // Try multiple Activity classes — new app may have
+                // dropped FragmentActivity for ComponentActivity
+                var actClasses = [
+                    'androidx.fragment.app.FragmentActivity',
+                    'androidx.activity.ComponentActivity',
+                    'android.app.Activity'
+                ];
+                var found = false;
+
+                function tryNav(activity) {
+                    if (found) return;
+                    try {
+                        var fm;
                         try {
-                            var fm = activity.getSupportFragmentManager();
-                            var navHostFrag = fm.findFragmentById(hostId);
-                            if (!navHostFrag) {
-                                send({type: 'error',
-                                      msg: 'NavHostFragment not found'});
-                                return;
+                            fm = activity.getSupportFragmentManager();
+                        } catch(e) { return; }
+                        var navHostFrag = fm.findFragmentById(hostId);
+                        if (!navHostFrag) return;
+
+                        var NavHostFragment = Java.use(
+                            'androidx.navigation.fragment.NavHostFragment');
+                        var navController = NavHostFragment
+                            .findNavController(navHostFrag);
+                        var graph = navController.getGraph();
+
+                        var iter = graph.iterator();
+                        var destinations = [];
+                        var targetId = 0;
+                        var targetLabel = '';
+
+                        while (iter.hasNext()) {
+                            var dest = iter.next();
+                            var label = dest.getLabel();
+                            var id = dest.getId();
+                            var cls = dest.getClass().getName();
+                            var labelStr = label ? label.toString() : '';
+                            destinations.push({
+                                id: id, label: labelStr, cls: cls
+                            });
+                            var combined = (labelStr + ' ' + cls)
+                                .toLowerCase();
+                            if (combined.indexOf('""" + hint_lower + """') >= 0
+                                && targetId === 0) {
+                                targetId = id;
+                                targetLabel = labelStr || cls;
                             }
-
-                            var NavHostFragment = Java.use(
-                                'androidx.navigation.fragment.NavHostFragment');
-                            var navController = NavHostFragment
-                                .findNavController(navHostFrag);
-                            var graph = navController.getGraph();
-
-                            // Enumerate all destinations
-                            var iter = graph.iterator();
-                            var destinations = [];
-                            var targetId = 0;
-                            var targetLabel = '';
-
-                            while (iter.hasNext()) {
-                                var dest = iter.next();
-                                var label = dest.getLabel();
-                                var id = dest.getId();
-                                var cls = dest.getClass().getName();
-                                var labelStr = label ? label.toString() : '';
-                                destinations.push({
-                                    id: id,
-                                    label: labelStr,
-                                    cls: cls
-                                });
-
-                                // Check if this matches our hint
-                                var combined = (labelStr + ' ' + cls)
-                                    .toLowerCase();
-                                if (combined.indexOf('""" + hint_lower + """') >= 0
-                                    && targetId === 0) {
-                                    targetId = id;
-                                    targetLabel = labelStr || cls;
-                                }
-                            }
-
-                            send({type: 'destinations',
-                                  msg: JSON.stringify(destinations)});
-
-                            if (targetId !== 0) {
-                                Java.scheduleOnMainThread(function() {
-                                    try {
-                                        navController.navigate(targetId);
-                                        send({type: 'success',
-                                              msg: 'Navigated to ' +
-                                                   targetLabel +
-                                                   ' (id=' + targetId + ')'});
-                                    } catch(e) {
-                                        send({type: 'error',
-                                              msg: 'navigate() failed: ' +
-                                                   e.message});
-                                    }
-                                });
-                            } else {
-                                send({type: 'not_found',
-                                      msg: 'No destination matching hint'});
-                            }
-                        } catch(e) {
-                            send({type: 'error',
-                                  msg: 'Activity processing error: ' +
-                                       e.message});
                         }
-                    },
-                    onComplete: function() {}
-                });
+
+                        send({type: 'destinations',
+                              msg: JSON.stringify(destinations)});
+
+                        if (targetId !== 0) {
+                            found = true;
+                            Java.scheduleOnMainThread(function() {
+                                try {
+                                    navController.navigate(targetId);
+                                    send({type: 'success',
+                                          msg: 'Navigated to ' +
+                                               targetLabel +
+                                               ' (id=' + targetId + ')'});
+                                } catch(e) {
+                                    send({type: 'error',
+                                          msg: 'navigate() failed: ' +
+                                               e.message});
+                                }
+                            });
+                        } else {
+                            send({type: 'not_found',
+                                  msg: 'No destination matching hint'});
+                        }
+                    } catch(e) {
+                        send({type: 'error',
+                              msg: 'Activity error: ' + e.message});
+                    }
+                }
+
+                for (var i = 0; i < actClasses.length && !found; i++) {
+                    try {
+                        Java.choose(actClasses[i], {
+                            onMatch: function(act) {
+                                if (!found) tryNav(act);
+                            },
+                            onComplete: function() {}
+                        });
+                    } catch(e) {
+                        // Class not found, try next
+                    }
+                }
+
+                if (!found) {
+                    send({type: 'error',
+                          msg: 'No Activity with NavController found'});
+                }
             } catch(e) {
                 send({type: 'error', msg: 'Exception: ' + e.message});
             }
