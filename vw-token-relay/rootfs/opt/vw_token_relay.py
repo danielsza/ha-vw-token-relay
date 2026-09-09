@@ -117,16 +117,6 @@ Java.perform(function () {
         '/pair/v1/',         // device pairing
     ];
 
-    // Domains we care about (VW backend)
-    var VW_DOMAINS = ['con-veh.net', 'vwgroup.io', 'volkswagen'];
-
-    function isVwDomain(u) {
-        for (var i = 0; i < VW_DOMAINS.length; i++) {
-            if (u.indexOf(VW_DOMAINS[i]) !== -1) return true;
-        }
-        return false;
-    }
-
     function isApiUrl(u) {
         for (var i = 0; i < API_PATHS.length; i++) {
             if (u.indexOf(API_PATHS[i]) !== -1) return true;
@@ -189,65 +179,63 @@ Java.perform(function () {
         return result;
     }
 
+    // Smaller peek for API responses (32KB) — less native memory pressure
+    var API_PEEK = JLong.parseLong('32768');
+
     Bridge.intercept.implementation = function (chain) {
-        var req  = chain.request();
-        var url  = req.url().toString();
-        var method = req.method();
-        var resp = this.intercept(chain);
+        var resp;
+        try {
+            var req  = chain.request();
+            var url  = req.url().toString();
+            var method = req.method();
+            resp = this.intercept(chain);
 
-        // ── Capture Authorization headers → fresh access tokens ──
-        var hdrs = req.headers();
-        for (var i = 0; i < hdrs.size(); i++) {
-            if (hdrs.name(i) === 'Authorization') {
-                var val = hdrs.value(i);
-                if (val.length > 50) {
-                    send({ type: 'auth_header', url: url, token: val.substring(7) });
+            // ── Capture Authorization headers → fresh access tokens ──
+            var hdrs = req.headers();
+            for (var i = 0; i < hdrs.size(); i++) {
+                if (hdrs.name(i) === 'Authorization') {
+                    var val = hdrs.value(i);
+                    if (val.length > 50) {
+                        send({ type: 'auth_header', url: url, token: val.substring(7) });
+                    }
+                    break;
                 }
-                break;
             }
-        }
 
-        // ── Capture OIDC token responses (access + refresh tokens) ──
-        if (url.indexOf('/oidc/') !== -1) {
-            try {
-                var reqBody = getRequestBody(req);
-                send({ type: 'token_response', url: url, method: method, requestBody: reqBody, body: resp.peekBody(PEEK).string() });
-            } catch (e) {}
-            return resp;
-        }
-
-        // ── FULL TRAFFIC CAPTURE for VW domains (remote start discovery) ──
-        if (isVwDomain(url)) {
-            try {
-                var reqBody = getRequestBody(req);
-                var respBody = resp.peekBody(PEEK).string();
-                var reqHeaders = getHeaders(hdrs);
-                var respCode = resp.code();
-                send({
-                    type: 'full_traffic',
-                    url: url,
-                    method: method,
-                    status: respCode,
-                    requestHeaders: reqHeaders,
-                    requestBody: reqBody,
-                    responseBody: respBody
-                });
-            } catch (e) {
-                send({ type: 'full_traffic', url: url, method: method, error: '' + e });
+            // ── Capture OIDC token responses (access + refresh tokens) ──
+            if (url.indexOf('/oidc/') !== -1) {
+                try {
+                    var reqBody = getRequestBody(req);
+                    send({ type: 'token_response', url: url, method: method, requestBody: reqBody, body: resp.peekBody(PEEK).string() });
+                } catch (e) {}
+                return resp;
             }
-        }
 
-        // ── Also still publish known API responses for normal relay operation ──
-        if (isApiUrl(url)) {
-            try {
-                send({ type: 'api_response', url: url, method: method, body: resp.peekBody(PEEK).string() });
-            } catch (e) {}
-        }
+            // ── Capture known API responses for relay operation ──
+            // NOTE: full_traffic capture removed — was causing native crashes
+            // (Bad access due to invalid address) in OkHttp pool threads via
+            // aggressive peekBody() on every VW domain response.
+            // Remote start discovery is complete; only API paths needed now.
 
+            // Lightweight: capture idToken from URL query params (no body read)
+            if (url.indexOf('idToken=') !== -1) {
+                send({ type: 'id_token_url', url: url });
+            }
+
+            if (isApiUrl(url)) {
+                try {
+                    send({ type: 'api_response', url: url, method: method, body: resp.peekBody(API_PEEK).string() });
+                } catch (e) {}
+            }
+
+        } catch (outerErr) {
+            // Top-level catch — prevent any hook error from crashing the app
+            send({ type: 'hook_error', error: '' + outerErr });
+        }
         return resp;
     };
 
-    send({ type: 'status', msg: 'Hooks installed — FULL TRAFFIC capture + RST signing active' });
+    send({ type: 'status', msg: 'Hooks installed — token + API capture active' });
 });
 
 // ── RPC exports for remote start signing ──────────────────────────
@@ -5051,16 +5039,9 @@ class VWTokenRelay:
                 self._publish_tokens()
                 log.info("Published token_relay (new token)")
 
-        elif msg_type == "full_traffic":
-            # Log ALL VW domain traffic for remote start discovery
+        elif msg_type == "id_token_url":
+            # Lightweight idToken capture from URL query params (no body read)
             url = payload.get("url", "")
-            method = payload.get("method", "?")
-            status = payload.get("status", "?")
-
-            # ── Extract id_token from URL query params ──
-            # The VW app passes idToken as a query param (e.g. /garage?idToken=eyJ...)
-            # This is our primary capture path since the OIDC token exchange
-            # happens in a WebView that Frida can't hook.
             if "idToken=" in url:
                 try:
                     from urllib.parse import urlparse, parse_qs
@@ -5074,52 +5055,34 @@ class VWTokenRelay:
                             log.info("id_token captured from URL query param! (len=%d)", len(captured_id))
                 except Exception as e:
                     log.debug("Failed to extract idToken from URL: %s", e)
-            req_body = payload.get("requestBody", "")
-            resp_body = payload.get("responseBody", "")
-            log.info("═══ TRAFFIC ═══ %s %s → %s", method, url, status)
-            if req_body:
-                log.info("  REQ BODY: %s", req_body[:2000])
-            if resp_body:
-                log.info("  RESP BODY: %s", resp_body[:2000])
-            req_hdrs = payload.get("requestHeaders", {})
-            if req_hdrs:
-                # Log interesting headers (skip boring ones)
-                skip = {'host', 'accept-encoding', 'connection', 'user-agent'}
-                interesting = {k: v for k, v in req_hdrs.items() if k.lower() not in skip}
-                if interesting:
-                    log.info("  REQ HDRS: %s", json.dumps(interesting, indent=None)[:1000])
-            # Also publish to MQTT for easy viewing
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/traffic",
-                json.dumps({
-                    "method": method, "url": url, "status": status,
-                    "requestBody": (req_body or "")[:2000],
-                    "responseBody": (resp_body or "")[:2000],
-                }),
-            )
 
-            # Cache pairing data from pairingRequests responses
-            if "/pair/v1/vehicle/" in url and "pairingRequest" in url and resp_body:
+        elif msg_type == "hook_error":
+            log.warning("Frida hook error: %s", payload.get("error", "unknown"))
+
+        elif msg_type == "full_traffic":
+            # Legacy handler — full_traffic capture removed in v1.13.0
+            # to fix native crashes. Just log the URL for debugging.
+            log.debug("TRAFFIC: %s %s", payload.get("method", "?"), payload.get("url", "?"))
+
+        elif msg_type == "api_response":
+            url = payload.get("url", "")
+            body_str = payload.get("body", "")
+            self._parse_and_publish_vehicle_data(
+                url, body_str, payload.get("method", "GET")
+            )
+            # Cache pairing data from pair/v1 responses
+            if "/pair/v1/vehicle/" in url and "pairingRequest" in url and body_str:
                 try:
-                    resp_data = json.loads(resp_body).get("data", {})
+                    resp_data = json.loads(body_str).get("data", {})
                     if resp_data.get("pairingKeySeed") and resp_data.get("pairingId"):
-                        # Extract vehicle_id from URL (re imported at module level)
                         vid_match = re.search(r'/vehicle/([a-f0-9-]+)/', url)
                         if vid_match:
                             vid = vid_match.group(1)
-                            if not hasattr(self, '_cached_pairings'):
-                                self._cached_pairings = {}
                             self._cached_pairings[vid] = resp_data
-                            log.info("PAIR_CACHE: Cached pairing for %s: id=%s seed=%s",
-                                     vid[:8], resp_data["pairingId"][:8],
-                                     resp_data["pairingKeySeed"])
-                except Exception as e:
-                    log.debug("PAIR_CACHE: Parse error: %s", e)
-
-        elif msg_type == "api_response":
-            self._parse_and_publish_vehicle_data(
-                payload["url"], payload["body"], payload.get("method", "GET")
-            )
+                            log.info("PAIR_CACHE: Cached pairing for %s: id=%s",
+                                     vid[:8], resp_data["pairingId"][:8])
+                except Exception:
+                    pass
 
     # ── Frida connection ────────────────────────────────────────────
     def _ensure_frida_server(self):
