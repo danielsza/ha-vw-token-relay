@@ -5499,6 +5499,41 @@ class VWTokenRelay:
                 except Exception as e:
                     log.error("KEEPALIVE: Frida recovery error: %s", e)
 
+            # ── Frida silent-detach detection ──
+            # Frida session/script objects can remain non-None even when hooks
+            # have silently stopped intercepting (e.g. app process recycled by
+            # Android with no detach callback, or Frida internal state corruption).
+            # Detect this by checking: session looks alive but no fresh token
+            # has been captured in >20 minutes.
+            elif self.session is not None and self._last_token_time:
+                silent_detach_age = (datetime.now() - self._last_token_time).total_seconds() / 60
+                if silent_detach_age > 20:
+                    log.warning(
+                        "KEEPALIVE: Frida session alive but no fresh token "
+                        "in %.0f min — likely silent detach. "
+                        "Force-restarting app + reattaching Frida...",
+                        silent_detach_age)
+                    try:
+                        # Invalidate the stale session
+                        try:
+                            self.session.detach()
+                        except Exception:
+                            pass
+                        self.session = None
+                        self.script = None
+                        # Full restart: force-stop app, reattach Frida, relaunch
+                        self._wake_app_full_restart()
+                        if self.session is not None and self.script is not None:
+                            log.info("KEEPALIVE: Frida recovered from silent detach")
+                            self.mqttc.publish(
+                                f"{MQTT_TOPIC_PREFIX}/status",
+                                "connected", retain=True)
+                        else:
+                            log.error("KEEPALIVE: Silent-detach recovery failed — "
+                                      "will retry next cycle")
+                    except Exception as e:
+                        log.error("KEEPALIVE: Silent-detach recovery error: %s", e)
+
             with self._lock:
                 needs_refresh = False
                 all_expired = True
@@ -5524,21 +5559,22 @@ class VWTokenRelay:
                     no_token_count = 0
                     continue
 
-                # ── Step 2: force-restart the app (~35s) ──
+                # ── Step 2: force-restart the app + reattach Frida (~35s) ──
                 no_token_count += 1
                 log.warning("No fresh tokens after wake — force-restarting "
-                            "VW app (attempt %d)", no_token_count)
-                subprocess.run(
-                    ["adb", "shell", "am", "force-stop", VW_PACKAGE],
-                    capture_output=True, timeout=10)
-                time.sleep(2)
-                subprocess.run(
-                    ["adb", "shell", "am", "start", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
-                    capture_output=True, timeout=10)
-                time.sleep(10)
-                self._navigate_to_vehicle()
-                time.sleep(20)
+                            "VW app + reattaching Frida (attempt %d)",
+                            no_token_count)
+                # Invalidate stale Frida session before killing the process
+                try:
+                    if self.session:
+                        self.session.detach()
+                except Exception:
+                    pass
+                self.session = None
+                self.script = None
+                # Use _wake_app_full_restart which handles force-stop,
+                # relaunch, Frida reattach, and navigation
+                self._wake_app_full_restart()
 
                 if self._tokens_are_fresh():
                     log.info("Token flow recovered after force-restart")
