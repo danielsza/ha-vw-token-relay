@@ -619,6 +619,36 @@ class VWTokenRelay:
                     log.info("PERM: Granted %s", perm)
             except Exception as e:
                 log.error("PERM: Failed: %s", e)
+        elif cmd == "phone_diag":
+            # Gather system info for diagnostics: module list, props, PIF config
+            def _run_diag():
+                results = {}
+                cmds = {
+                    "fingerprint": "getprop ro.build.fingerprint",
+                    "security_patch": "getprop ro.build.version.security_patch",
+                    "abilist": "getprop ro.product.cpu.abilist",
+                    "sdk": "getprop ro.build.version.sdk",
+                    "magisk_version": "magisk -v",
+                    "magisk_versioncode": "magisk -V",
+                    "modules": "ls /data/adb/modules/",
+                    "pif_json": "cat /data/adb/pif.json 2>/dev/null || cat /data/adb/modules/playintegrityfix/pif.json 2>/dev/null || echo NOT_FOUND",
+                    "tricky_store_target": "cat /data/adb/tricky_store/target.txt 2>/dev/null || echo NOT_FOUND",
+                    "tricky_store_keybox": "ls -la /data/adb/tricky_store/keybox.xml 2>/dev/null && sha256sum /data/adb/tricky_store/keybox.xml 2>/dev/null || echo NOT_FOUND",
+                    "denylist": "magisk --denylist ls 2>/dev/null || echo NOT_AVAILABLE",
+                }
+                for key, cmd_str in cmds.items():
+                    try:
+                        r = subprocess.run(
+                            ["adb", "shell", "su", "-c", cmd_str],
+                            capture_output=True, text=True, timeout=15)
+                        results[key] = r.stdout.strip()[:2000]
+                    except Exception as e:
+                        results[key] = f"ERROR: {e}"
+                log.info("PHONE_DIAG: %s", json.dumps(results, indent=2)[:3000])
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/phone_diag",
+                    json.dumps(results))
+            threading.Thread(target=_run_diag, daemon=True).start()
         elif cmd == "adb_uixml":
             # Dump uiautomator XML and log interactive elements
             try:
