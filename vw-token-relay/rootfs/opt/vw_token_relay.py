@@ -627,14 +627,22 @@ class VWTokenRelay:
                     "fingerprint": "getprop ro.build.fingerprint",
                     "security_patch": "getprop ro.build.version.security_patch",
                     "abilist": "getprop ro.product.cpu.abilist",
+                    "abi": "getprop ro.product.cpu.abi",
                     "sdk": "getprop ro.build.version.sdk",
                     "magisk_version": "magisk -v",
                     "magisk_versioncode": "magisk -V",
                     "modules": "ls /data/adb/modules/",
-                    "pif_json": "cat /data/adb/pif.json 2>/dev/null || cat /data/adb/modules/playintegrityfix/pif.json 2>/dev/null || echo NOT_FOUND",
+                    "module_versions": "for m in /data/adb/modules/*/; do echo \"$(basename $m): $(cat ${m}module.prop 2>/dev/null | grep -E '^version=' | head -1)\"; done",
+                    "pif_json": "cat /data/adb/pif.json 2>/dev/null || cat /data/adb/modules/playintegrityfix/pif.json 2>/dev/null || cat /data/adb/modules/playintegrityfix/custom.pif.json 2>/dev/null || echo NOT_FOUND",
+                    "pif_prop": "cat /data/adb/modules/playintegrityfix/pif.prop 2>/dev/null || cat /data/adb/modules/playintegrityfix/custom.pif.prop 2>/dev/null || echo NOT_FOUND",
+                    "autopif_config": "ls -la /data/adb/modules/playintegrityfix/autopif* 2>/dev/null; cat /data/adb/modules/playintegrityfix/migrate.sh 2>/dev/null | head -5; ls /data/adb/modules/playintegrityfix/ 2>/dev/null",
                     "tricky_store_target": "cat /data/adb/tricky_store/target.txt 2>/dev/null || echo NOT_FOUND",
-                    "tricky_store_keybox": "ls -la /data/adb/tricky_store/keybox.xml 2>/dev/null && sha256sum /data/adb/tricky_store/keybox.xml 2>/dev/null || echo NOT_FOUND",
+                    "tricky_store_security_patch": "cat /data/adb/tricky_store/security_patch.txt 2>/dev/null || echo NOT_FOUND",
+                    "tricky_store_keybox_hash": "ls -la /data/adb/tricky_store/keybox.xml 2>/dev/null; cat /data/adb/tricky_store/keybox.xml 2>/dev/null | toybox sha256sum 2>/dev/null || md5sum /data/adb/tricky_store/keybox.xml 2>/dev/null || busybox sha256sum /data/adb/tricky_store/keybox.xml 2>/dev/null || echo HASH_UNAVAILABLE",
                     "denylist": "magisk --denylist ls 2>/dev/null || echo NOT_AVAILABLE",
+                    "denylist_status": "magisk --denylist status 2>/dev/null; echo rc=$?",
+                    "rezygisk_status": "cat /data/adb/modules/rezygisk/module.prop 2>/dev/null || echo NOT_FOUND",
+                    "installed_packages": "pm list packages 2>/dev/null | grep -E 'playintegrity|spic|yasnac|keyattest' || echo NONE_FOUND",
                 }
                 for key, cmd_str in cmds.items():
                     try:
@@ -644,11 +652,27 @@ class VWTokenRelay:
                         results[key] = r.stdout.strip()[:2000]
                     except Exception as e:
                         results[key] = f"ERROR: {e}"
-                log.info("PHONE_DIAG: %s", json.dumps(results, indent=2)[:3000])
+                log.info("PHONE_DIAG: %s", json.dumps(results, indent=2)[:5000])
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/phone_diag",
                     json.dumps(results))
             threading.Thread(target=_run_diag, daemon=True).start()
+        elif cmd == "launch_app":
+            # Launch any app by package name (payload = package name)
+            pkg = payload.strip()
+            if pkg:
+                log.info("LAUNCH_APP: Starting %s", pkg)
+                try:
+                    r = subprocess.run(
+                        ["adb", "shell", "monkey", "-p", pkg, "-c",
+                         "android.intent.category.LAUNCHER", "1"],
+                        capture_output=True, text=True, timeout=15)
+                    log.info("LAUNCH_APP: rc=%d out=%s", r.returncode,
+                             r.stdout.strip()[:200])
+                except Exception as e:
+                    log.error("LAUNCH_APP: %s", e)
+            else:
+                log.warning("LAUNCH_APP: No package name in payload")
         elif cmd == "adb_uixml":
             # Dump uiautomator XML and log interactive elements
             try:
