@@ -5253,8 +5253,20 @@ class VWTokenRelay:
                 capture_output=True, text=True, timeout=10,
             )
             if check.returncode == 0 and check.stdout.strip():
-                log.debug("FRIDA_SERVER: already running (pid %s)", check.stdout.strip())
-                return True
+                pids = check.stdout.strip().split()
+                if len(pids) > 1:
+                    log.warning("FRIDA_SERVER: %d zombie instances detected "
+                                "(pids %s) — killing all and restarting",
+                                len(pids), check.stdout.strip())
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c", "killall frida-server"],
+                        capture_output=True, timeout=10,
+                    )
+                    time.sleep(1)
+                    # Fall through to restart below
+                else:
+                    log.debug("FRIDA_SERVER: already running (pid %s)", check.stdout.strip())
+                    return True
         except Exception as e:
             log.warning("FRIDA_SERVER: pidof check failed: %s", e)
 
@@ -5504,10 +5516,10 @@ class VWTokenRelay:
             # have silently stopped intercepting (e.g. app process recycled by
             # Android with no detach callback, or Frida internal state corruption).
             # Detect this by checking: session looks alive but no fresh token
-            # has been captured in >20 minutes.
+            # has been captured in >8 minutes.
             elif self.session is not None and self._last_token_time:
                 silent_detach_age = (datetime.now() - self._last_token_time).total_seconds() / 60
-                if silent_detach_age > 20:
+                if silent_detach_age > 8:
                     log.warning(
                         "KEEPALIVE: Frida session alive but no fresh token "
                         "in %.0f min — likely silent detach. "
