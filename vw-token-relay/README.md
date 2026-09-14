@@ -19,12 +19,13 @@ A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `Bridge
 ## Requirements
 
 - Rooted Android phone with:
-  - Magisk + Zygisk enabled
-  - Play Integrity Fix (PIF) module (chiteroman, osm0sis, or KOWX712 variant)
-  - Shamiko module for root hiding
+  - Magisk (28.1+)
+  - ReZygisk module (replaces Magisk's built-in Zygisk)
+  - Play Integrity Fix (PIF) module — osm0sis variant with autopif fingerprint rotation
+  - Tricky Store module (software keybox sufficient — no hardware keybox needed)
   - myVW app installed and logged in
   - USB debugging enabled
-  - Frida server running (`frida-server-16.5.9-android-arm64`)
+  - Frida server running (`frida-server-16.5.9-android-arm64` or `android-arm` for 32-bit firmware)
 - USB connection from phone to HA host
 - Mosquitto MQTT broker on HA
 
@@ -34,7 +35,7 @@ A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `Bridge
 - Captures Play Integrity tokens, OAuth access, refresh, and ID tokens from the VW app via Frida hooks
 - Publishes all tokens to MQTT (`vw/token_relay`) with retain for CarConnectivity consumption
 - 20-minute keepalive cycle wakes the app to force token refresh
-- Auto-recovers from Frida crashes, ADB disconnects, and app restarts
+- Auto-recovers from Frida crashes, silent detaches, ADB disconnects, and app restarts
 
 ### Vehicle Commands (via MQTT)
 - **Lock/Unlock:** `vw/cmd/lock` / `vw/cmd/unlock` — send vehicle UUID as payload
@@ -107,24 +108,26 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 
 1. **Unlock bootloader** — `fastboot oem unlock`
 2. **Root with Magisk** — flash patched boot.img via fastboot
-3. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix
-4. **Install Shamiko** — Magisk → Modules → Install Shamiko
-5. **Configure DenyList** — Magisk Settings → Enable Zygisk, Enable DenyList. Add `com.google.android.gms` and the VW app.
-6. **Install Frida server** — push to `/data/local/tmp/frida-server`, chmod +x, start with su
-7. **Install myVW** — sideload APK, log in, grant all permissions
-8. **Enable USB debugging** — Developer Options → USB Debugging
-9. **Keep screen on** — `adb shell settings put global stay_on_while_plugged_in 3`
-10. **Verify PI** — test with SPIC or YASNAC; should show DEVICE_INTEGRITY
+3. **Install ReZygisk** — Magisk → Modules → Install ReZygisk (replaces Magisk's built-in Zygisk)
+4. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix (osm0sis variant with autopif)
+5. **Install Tricky Store** — Magisk → Modules → Install Tricky Store (software keybox is sufficient)
+6. **Configure DenyList** — Magisk Settings → Enable DenyList. Add `com.google.android.gms` and the VW app.
+7. **Install Frida server** — push to `/data/local/tmp/frida-server`, chmod +x, start with su. Use the `arm64` or `arm` binary matching your device's ABI (check `ro.product.cpu.abilist`).
+8. **Install myVW** — sideload APK, log in, grant all permissions
+9. **Enable USB debugging** — Developer Options → USB Debugging
+10. **Keep screen on** — `adb shell settings put global stay_on_while_plugged_in 3`
+11. **Verify PI** — test with SPIC or YASNAC; must show `DEVICE_INTEGRITY` (BASIC alone is not sufficient — VW will reject the token)
 
 ## Reference Setup (known-good)
 
 | Component | Version / Detail |
 |-----------|-----------------|
-| Phone | Motorola Moto G Pure (720×1600, arm64) |
+| Phone | Motorola Moto G Pure XT2163-4 (`ellis`, 720×1600, arm64) |
 | Android | 12 (upgraded from stock 11 — PI did not pass on 11) |
-| Magisk | 28.1+ with Zygisk enabled |
-| PIF module | chiteroman Play Integrity Fix (autopif variant) |
-| Shamiko | Latest (root-hide for GMS + VW app) |
+| Magisk | 28.1+ |
+| ReZygisk | Latest (replaces Magisk's built-in Zygisk) |
+| PIF module | osm0sis Play Integrity Fix with autopif fingerprint rotation |
+| Tricky Store | Latest (software keybox — no hardware keybox needed) |
 | Frida server | 16.5.9-android-arm64 |
 | myVW package | `com.vw.carnet.releaseca` (Canada) |
 | PI verdict | DEVICE_INTEGRITY (verified with SPIC) |
