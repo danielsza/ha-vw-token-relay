@@ -884,26 +884,20 @@ class VWTokenRelay:
                 shutil.move(tmp_path, share_tmp)
                 tmp_path = share_tmp
                 log.info("DOWNLOAD_PUSH: Staged at %s", tmp_path)
-                # Push to phone sdcard first (no root needed)
-                sdcard_tmp = "/sdcard/_dl_tmp_" + os.path.basename(remote_path)
+                # Push to /data/local/tmp/ on phone (always writable by shell)
+                phone_tmp = "/data/local/tmp/_dl_" + os.path.basename(remote_path)
                 r = subprocess.run(
-                    ["adb", "push", tmp_path, sdcard_tmp],
+                    ["adb", "push", tmp_path, phone_tmp],
                     capture_output=True, text=True, timeout=120)
                 log.info("DOWNLOAD_PUSH: adb push rc=%d stdout=%s stderr=%s",
                          r.returncode, r.stdout.strip()[:300], r.stderr.strip()[:300])
                 os.unlink(tmp_path)
                 if r.returncode != 0:
                     raise RuntimeError(f"adb push failed: stdout={r.stdout.strip()[:200]} stderr={r.stderr.strip()[:200]}")
-                # Move to final location (use su if needed for non-sdcard paths)
-                if remote_path.startswith("/sdcard/"):
-                    mv_cmd = f'mv "{sdcard_tmp}" "{remote_path}"'
-                    r2 = subprocess.run(
-                        ["adb", "shell", mv_cmd],
-                        capture_output=True, text=True, timeout=15)
-                else:
-                    r2 = subprocess.run(
-                        ["adb", "shell", f'su -c \'cp "{sdcard_tmp}" "{remote_path}" && chmod 644 "{remote_path}" && rm "{sdcard_tmp}"\''],
-                        capture_output=True, text=True, timeout=15)
+                # Move to final location via su (handles all paths)
+                r2 = subprocess.run(
+                    ["adb", "shell", f'su -c \'cp "{phone_tmp}" "{remote_path}" && chmod 644 "{remote_path}" && rm "{phone_tmp}"\''],
+                    capture_output=True, text=True, timeout=30)
                 result = {
                     "url": url, "remote_path": remote_path,
                     "bytes": total, "rc": r2.returncode,
