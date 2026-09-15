@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Cache-bust: increment to force rebuild of COPY and subsequent layers
-ARG CACHE_BUST=2
+ARG CACHE_BUST=3
 
 # Copy relay script and entrypoint
 COPY rootfs /
