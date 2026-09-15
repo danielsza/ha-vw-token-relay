@@ -19,8 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Cache-bust: increment to force rebuild of COPY and subsequent layers
-ARG CACHE_BUST=3
+# Force layer invalidation — change this string to bust Docker cache
+RUN echo "force-rebuild-20260915-1600" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /
