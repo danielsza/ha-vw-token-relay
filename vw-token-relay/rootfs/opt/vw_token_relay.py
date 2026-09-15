@@ -775,22 +775,28 @@ class VWTokenRelay:
                     json.dumps({"error": str(e)}), retain=False)
         elif cmd == "adb_exec":
             # Run ADB shell command from base64-encoded payload (avoids shell escaping)
-            # payload = JSON {"cmd_b64": "<base64-encoded command>"}
-            # The command is decoded server-side and passed via stdin to avoid quoting issues
+            # payload = JSON {"cmd_b64": "<base64-encoded command>", "su": true/false}
+            # When su=true, runs: adb shell su -c "<cmd>" (argument-passing, not stdin)
+            # When su=false (default), runs: adb shell <cmd> (argument-passing)
             try:
                 data = json.loads(payload)
                 import base64
                 shell_cmd = base64.b64decode(data["cmd_b64"]).decode("utf-8")
-                log.info("ADB_EXEC: Running: %s", shell_cmd[:200])
+                use_su = data.get("su", False)
+                log.info("ADB_EXEC: Running (su=%s): %s", use_su, shell_cmd[:200])
+                if use_su:
+                    adb_args = ["adb", "shell", "su", "-c", shell_cmd]
+                else:
+                    adb_args = ["adb", "shell", shell_cmd]
                 r = subprocess.run(
-                    ["adb", "shell"],
-                    input=shell_cmd + "\n",
+                    adb_args,
                     capture_output=True, text=True, timeout=30)
                 result = {
                     "cmd": shell_cmd[:200],
                     "stdout": r.stdout.strip()[:2000],
                     "stderr": r.stderr.strip()[:500],
                     "rc": r.returncode,
+                    "su": use_su,
                 }
                 log.info("ADB_EXEC: rc=%d stdout=%s", r.returncode,
                          r.stdout.strip()[:500])
