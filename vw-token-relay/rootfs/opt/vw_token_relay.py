@@ -878,14 +878,22 @@ class VWTokenRelay:
                             tf.write(chunk)
                             total += len(chunk)
                 log.info("DOWNLOAD_PUSH: Downloaded %d bytes to %s", total, tmp_path)
+                # Stage in /share/ (shared volume, avoids /tmp permission issues)
+                import shutil
+                share_tmp = "/share/_dl_tmp_" + os.path.basename(remote_path)
+                shutil.move(tmp_path, share_tmp)
+                tmp_path = share_tmp
+                log.info("DOWNLOAD_PUSH: Staged at %s", tmp_path)
                 # Push to phone sdcard first (no root needed)
                 sdcard_tmp = "/sdcard/_dl_tmp_" + os.path.basename(remote_path)
                 r = subprocess.run(
                     ["adb", "push", tmp_path, sdcard_tmp],
-                    capture_output=True, text=True, timeout=60)
+                    capture_output=True, text=True, timeout=120)
+                log.info("DOWNLOAD_PUSH: adb push rc=%d stdout=%s stderr=%s",
+                         r.returncode, r.stdout.strip()[:300], r.stderr.strip()[:300])
                 os.unlink(tmp_path)
                 if r.returncode != 0:
-                    raise RuntimeError(f"adb push failed: {r.stderr}")
+                    raise RuntimeError(f"adb push failed: stdout={r.stdout.strip()[:200]} stderr={r.stderr.strip()[:200]}")
                 # Move to final location (use su if needed for non-sdcard paths)
                 if remote_path.startswith("/sdcard/"):
                     mv_cmd = f'mv "{sdcard_tmp}" "{remote_path}"'
