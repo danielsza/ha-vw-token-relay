@@ -746,9 +746,12 @@ class VWTokenRelay:
             try:
                 shell_cmd = payload.strip()
                 log.info("ADB_SHELL: Running: %s", shell_cmd[:200])
+                # Use list-form to avoid host-shell expansion and ADB daemon issues
+                # The entire shell_cmd is passed as a single argument to adb shell,
+                # so the phone's shell handles pipes/redirects/quoting correctly
                 r = subprocess.run(
-                    f"adb shell {shell_cmd}",
-                    capture_output=True, text=True, timeout=30, shell=True)
+                    ["adb", "shell", shell_cmd],
+                    capture_output=True, text=True, timeout=30)
                 result = {
                     "cmd": shell_cmd[:200],
                     "stdout": r.stdout.strip()[:2000],
