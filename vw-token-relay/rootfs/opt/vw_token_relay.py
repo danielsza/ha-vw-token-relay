@@ -773,6 +773,36 @@ class VWTokenRelay:
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/adb_shell",
                     json.dumps({"error": str(e)}), retain=False)
+        elif cmd == "adb_exec":
+            # Run ADB shell command from base64-encoded payload (avoids shell escaping)
+            # payload = JSON {"cmd_b64": "<base64-encoded command>"}
+            # The command is decoded server-side and passed via stdin to avoid quoting issues
+            try:
+                data = json.loads(payload)
+                import base64
+                shell_cmd = base64.b64decode(data["cmd_b64"]).decode("utf-8")
+                log.info("ADB_EXEC: Running: %s", shell_cmd[:200])
+                r = subprocess.run(
+                    ["adb", "shell"],
+                    input=shell_cmd + "\n",
+                    capture_output=True, text=True, timeout=30)
+                result = {
+                    "cmd": shell_cmd[:200],
+                    "stdout": r.stdout.strip()[:2000],
+                    "stderr": r.stderr.strip()[:500],
+                    "rc": r.returncode,
+                }
+                log.info("ADB_EXEC: rc=%d stdout=%s", r.returncode,
+                         r.stdout.strip()[:500])
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_exec",
+                    json.dumps(result), retain=False)
+            except Exception as e:
+                log.error("ADB_EXEC: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_exec",
+                    json.dumps({"error": str(e)}), retain=False)
+
         elif cmd == "adb_push":
             # Write file content to phone: payload = JSON {"path": "/path", "content": "..."}
             # Content can be base64-encoded if "encoding": "base64" is set
