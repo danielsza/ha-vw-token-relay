@@ -742,16 +742,140 @@ class VWTokenRelay:
                 log.error("ADB_SWIPE: Failed: %s", e)
         elif cmd == "adb_shell":
             # Run arbitrary ADB shell command: payload = command string
+            # Uses shell=True via 'adb shell <cmd>' so quotes/pipes/redirects work
             try:
-                log.info("ADB_SHELL: Running: %s", payload.strip()[:100])
+                shell_cmd = payload.strip()
+                log.info("ADB_SHELL: Running: %s", shell_cmd[:200])
                 r = subprocess.run(
-                    ["adb", "shell"] + payload.strip().split(),
-                    capture_output=True, text=True, timeout=15)
-                log.info("ADB_SHELL: stdout=%s", r.stdout.strip()[:500])
+                    f"adb shell {shell_cmd}",
+                    capture_output=True, text=True, timeout=30, shell=True)
+                result = {
+                    "cmd": shell_cmd[:200],
+                    "stdout": r.stdout.strip()[:2000],
+                    "stderr": r.stderr.strip()[:500],
+                    "rc": r.returncode,
+                }
+                log.info("ADB_SHELL: rc=%d stdout=%s", r.returncode,
+                         r.stdout.strip()[:500])
                 if r.stderr.strip():
                     log.info("ADB_SHELL: stderr=%s", r.stderr.strip()[:200])
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_shell",
+                    json.dumps(result), retain=False)
+            except subprocess.TimeoutExpired:
+                log.error("ADB_SHELL: Timeout after 30s")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_shell",
+                    json.dumps({"error": "timeout", "cmd": shell_cmd[:200]}),
+                    retain=False)
             except Exception as e:
                 log.error("ADB_SHELL: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_shell",
+                    json.dumps({"error": str(e)}), retain=False)
+        elif cmd == "adb_push":
+            # Write file content to phone: payload = JSON {"path": "/path", "content": "..."}
+            # Content can be base64-encoded if "encoding": "base64" is set
+            try:
+                data = json.loads(payload)
+                fpath = data["path"]
+                content = data["content"]
+                encoding = data.get("encoding", "text")
+                if encoding == "base64":
+                    import base64
+                    content = base64.b64decode(content).decode("utf-8")
+                log.info("ADB_PUSH: Writing %d bytes to %s", len(content), fpath)
+                # Write to temp file locally, then push via adb
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp',
+                                                  delete=False) as tf:
+                    tf.write(content)
+                    tmp_path = tf.name
+                # Push to phone
+                r = subprocess.run(
+                    ["adb", "push", tmp_path, "/sdcard/_relay_tmp"],
+                    capture_output=True, text=True, timeout=15)
+                os.unlink(tmp_path)
+                if r.returncode != 0:
+                    raise RuntimeError(f"adb push failed: {r.stderr}")
+                # Move to final location with su
+                r2 = subprocess.run(
+                    f'adb shell su -c "cp /sdcard/_relay_tmp {fpath} && chmod 644 {fpath} && rm /sdcard/_relay_tmp"',
+                    capture_output=True, text=True, timeout=15, shell=True)
+                result = {
+                    "path": fpath,
+                    "bytes": len(content),
+                    "rc": r2.returncode,
+                    "stdout": r2.stdout.strip()[:500],
+                    "stderr": r2.stderr.strip()[:500],
+                }
+                log.info("ADB_PUSH: Done rc=%d path=%s", r2.returncode, fpath)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_push",
+                    json.dumps(result), retain=False)
+            except Exception as e:
+                log.error("ADB_PUSH: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_push",
+                    json.dumps({"error": str(e)}), retain=False)
+        elif cmd == "adb_pull":
+            # Pull a file from the phone to /share/: payload = JSON {"path": "/phone/path"}
+            # Optionally "dest": filename override in /share/
+            try:
+                data = json.loads(payload)
+                phone_path = data["path"]
+                basename = data.get("dest", os.path.basename(phone_path))
+                local_path = f"/share/{basename}"
+                log.info("ADB_PULL: Pulling %s -> %s", phone_path, local_path)
+                # Pull via adb (use su + cat for root-owned files)
+                r = subprocess.run(
+                    f'adb exec-out su -c "cat {phone_path}" > {local_path}',
+                    capture_output=False, timeout=30, shell=True)
+                import os as _os
+                if _os.path.exists(local_path) and _os.path.getsize(local_path) > 0:
+                    sz = _os.path.getsize(local_path)
+                    log.info("ADB_PULL: Success, %d bytes", sz)
+                    result = {"status": "ok", "path": local_path, "size": sz,
+                              "phone_path": phone_path}
+                    # If image, create HTML viewer
+                    if basename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                        import base64
+                        ext = basename.rsplit('.', 1)[-1].lower()
+                        mime = {'png': 'image/png', 'jpg': 'image/jpeg',
+                                'jpeg': 'image/jpeg', 'bmp': 'image/bmp'}.get(ext, 'image/png')
+                        with open(local_path, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode()
+                        html = (
+                            '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                            f'<title>{basename}</title>'
+                            '<style>body{margin:0;background:#111;display:flex;'
+                            'justify-content:center;align-items:flex-start;min-height:100vh}'
+                            'img{max-height:100vh;width:auto}</style></head>'
+                            f'<body><img src="data:{mime};base64,{b64}"/>'
+                            '</body></html>'
+                        )
+                        html_path = f"/share/{basename}.html"
+                        with open(html_path, "w") as f:
+                            f.write(html)
+                        result["html_path"] = html_path
+                        log.info("ADB_PULL: HTML viewer at %s", html_path)
+                else:
+                    result = {"status": "error", "msg": "File empty or not created",
+                              "phone_path": phone_path}
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_pull",
+                    json.dumps(result), retain=False)
+            except subprocess.TimeoutExpired:
+                log.error("ADB_PULL: Timeout pulling %s", phone_path)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_pull",
+                    json.dumps({"error": "timeout", "phone_path": phone_path}),
+                    retain=False)
+            except Exception as e:
+                log.error("ADB_PULL: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/adb_pull",
+                    json.dumps({"error": str(e)}), retain=False)
         elif cmd == "ui_find":
             # Find UI elements by text and write results to /share/ui_find.txt
             search = payload.strip() if payload.strip() else ""
