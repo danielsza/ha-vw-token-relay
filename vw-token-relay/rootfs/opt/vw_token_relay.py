@@ -827,10 +827,19 @@ class VWTokenRelay:
                 basename = data.get("dest", os.path.basename(phone_path))
                 local_path = f"/share/{basename}"
                 log.info("ADB_PULL: Pulling %s -> %s", phone_path, local_path)
-                # Pull via adb (use su + cat for root-owned files)
+                # Copy to accessible location first, then adb pull
+                subprocess.run(
+                    f'adb shell su -c "cp {phone_path} /data/local/tmp/_pull_tmp"',
+                    capture_output=True, text=True, timeout=15, shell=True)
+                subprocess.run(
+                    f'adb shell su -c "chmod 644 /data/local/tmp/_pull_tmp"',
+                    capture_output=True, text=True, timeout=5, shell=True)
                 r = subprocess.run(
-                    f'adb exec-out su -c "cat {phone_path}" > {local_path}',
-                    capture_output=False, timeout=30, shell=True)
+                    ["adb", "pull", "/data/local/tmp/_pull_tmp", local_path],
+                    capture_output=True, text=True, timeout=30)
+                subprocess.run(
+                    'adb shell su -c "rm /data/local/tmp/_pull_tmp"',
+                    capture_output=True, text=True, timeout=5, shell=True)
                 import os as _os
                 if _os.path.exists(local_path) and _os.path.getsize(local_path) > 0:
                     sz = _os.path.getsize(local_path)
