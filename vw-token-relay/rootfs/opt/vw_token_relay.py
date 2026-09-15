@@ -857,6 +857,61 @@ class VWTokenRelay:
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/adb_push",
                     json.dumps({"error": str(e)}), retain=False)
+        elif cmd == "download_push":
+            # Download a file from URL and push to phone
+            # payload = JSON {"url": "https://...", "remote_path": "/sdcard/Download/file.zip"}
+            try:
+                data = json.loads(payload)
+                url = data["url"]
+                remote_path = data["remote_path"]
+                log.info("DOWNLOAD_PUSH: Downloading %s -> %s", url, remote_path)
+                import tempfile
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=120) as resp:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as tf:
+                        tmp_path = tf.name
+                        total = 0
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            tf.write(chunk)
+                            total += len(chunk)
+                log.info("DOWNLOAD_PUSH: Downloaded %d bytes to %s", total, tmp_path)
+                # Push to phone sdcard first (no root needed)
+                sdcard_tmp = "/sdcard/_dl_tmp_" + os.path.basename(remote_path)
+                r = subprocess.run(
+                    ["adb", "push", tmp_path, sdcard_tmp],
+                    capture_output=True, text=True, timeout=60)
+                os.unlink(tmp_path)
+                if r.returncode != 0:
+                    raise RuntimeError(f"adb push failed: {r.stderr}")
+                # Move to final location (use su if needed for non-sdcard paths)
+                if remote_path.startswith("/sdcard/"):
+                    mv_cmd = f'mv "{sdcard_tmp}" "{remote_path}"'
+                    r2 = subprocess.run(
+                        ["adb", "shell", mv_cmd],
+                        capture_output=True, text=True, timeout=15)
+                else:
+                    r2 = subprocess.run(
+                        ["adb", "shell", f'su -c \'cp "{sdcard_tmp}" "{remote_path}" && chmod 644 "{remote_path}" && rm "{sdcard_tmp}"\''],
+                        capture_output=True, text=True, timeout=15)
+                result = {
+                    "url": url, "remote_path": remote_path,
+                    "bytes": total, "rc": r2.returncode,
+                    "stdout": r2.stdout.strip()[:500],
+                    "stderr": r2.stderr.strip()[:500],
+                }
+                log.info("DOWNLOAD_PUSH: Done rc=%d path=%s bytes=%d", r2.returncode, remote_path, total)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/download_push",
+                    json.dumps(result), retain=False)
+            except Exception as e:
+                log.error("DOWNLOAD_PUSH: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/download_push",
+                    json.dumps({"error": str(e)}), retain=False)
+
         elif cmd == "adb_pull":
             # Pull a file from the phone to /share/: payload = JSON {"path": "/phone/path"}
             # Optionally "dest": filename override in /share/
