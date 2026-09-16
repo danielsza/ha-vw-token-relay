@@ -995,6 +995,8 @@ class VWTokenRelay:
                 from PIL import Image
                 import io
                 img = Image.open(src_path)
+                if img.mode == "RGBA":
+                    img = img.convert("RGB")
                 orig_w, orig_h = img.size
                 ratio = width / orig_w
                 new_h = int(orig_h * ratio)

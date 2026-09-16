@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Force layer invalidation — change this string to bust Docker cache
-RUN echo "force-rebuild-20260916-0005" > /tmp/.build_marker
+RUN echo "force-rebuild-20260916-0010" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /
