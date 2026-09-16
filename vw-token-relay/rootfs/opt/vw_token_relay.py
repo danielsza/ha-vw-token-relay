@@ -1013,8 +1013,21 @@ class VWTokenRelay:
                     "jpeg_bytes": len(buf.getvalue()),
                     "b64": b64_str,
                 }
-                log.info("IMG_THUMB: %s %dx%d -> %dx%d (%d bytes JPEG)",
-                         filename, orig_w, orig_h, width, new_h, len(buf.getvalue()))
+                # Also save JPEG to /share/ and create HTML viewer
+                thumb_name = os.path.splitext(filename)[0] + "_thumb.jpg"
+                thumb_path = f"/share/{thumb_name}"
+                with open(thumb_path, "wb") as f:
+                    f.write(buf.getvalue())
+                # Create HTML viewer
+                html = f"""<!DOCTYPE html><html><head><title>{thumb_name}</title>
+<style>body{{margin:0;background:#111;display:flex;justify-content:center;align-items:center;min-height:100vh}}
+img{{max-width:100%;height:auto}}</style></head>
+<body><img src="data:image/jpeg;base64,{b64_str}"></body></html>"""
+                with open(f"{thumb_path}.html", "w") as f:
+                    f.write(html)
+                result["saved"] = thumb_name
+                log.info("IMG_THUMB: %s %dx%d -> %dx%d (%d bytes JPEG) saved=%s",
+                         filename, orig_w, orig_h, width, new_h, len(buf.getvalue()), thumb_name)
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/img_thumb",
                     json.dumps(result), retain=False)
