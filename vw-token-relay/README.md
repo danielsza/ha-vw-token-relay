@@ -65,13 +65,13 @@ The UI-driven path is the only way to do remote start. The relay navigates the V
 
 ### Play Integrity Auto-Fix
 - Monitors token freshness (PIF health check every ~20 min)
-- If tokens go stale (>45 min), automatically:
-  1. Updates the PIF fingerprint (runs the module's built-in autopif script)
-  2. Reboots the phone with boot-loop protection (skips if uptime < 30 min)
-  3. Unlocks the screen after reboot (wake + dismiss-keyguard + swipe + home)
-  4. Wakes the VW app and waits for fresh tokens
+- If tokens go stale (>45 min), escalates through three levels:
+  1. **Level 1:** Updates PIF fingerprint (autopif) + reboots phone with boot-loop protection
+  2. **Level 2:** Removes and re-adds the Google account on the phone (fixes stale Finsky credentials that cause PI to drop to BASIC). Requires `google_email` and `google_password` in config.
+  3. **Level 3+:** Notifies user, keeps retrying PIF updates
+- Unlocks screen after reboot (wake + dismiss-keyguard + swipe + home)
 - Publishes health status to `vw/pif_health` (healthy/degraded/cooldown/critical)
-- Only notifies the user after 2+ consecutive auto-fix attempts fail
+- Google account refresh status published to `vw/google_refresh`
 
 ### Error Notifications
 - Publishes errors to `vw/error`, `vw/pif_health`, `vw/pif_update`, `vw/auto_login`
@@ -102,6 +102,8 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 | `vw_username` | VW account email (for auto-login after app crash) |
 | `vw_password` | VW account password |
 | `vw_spin` | Vehicle S-PIN (for remote start, lock/unlock) |
+| `google_email` | Google account email on phone (for auto-refresh when PI drops) |
+| `google_password` | Google account password (for auto-refresh when PI drops) |
 | `log_level` | Log verbosity: info, debug, warning, error |
 
 ## Phone Setup Guide

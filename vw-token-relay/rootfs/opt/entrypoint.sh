@@ -12,6 +12,8 @@ BASE_URL=$(jq -r '.base_url' "$OPTIONS")
 VW_USERNAME=$(jq -r '.vw_username // empty' "$OPTIONS")
 VW_PASSWORD=$(jq -r '.vw_password // empty' "$OPTIONS")
 VW_SPIN=$(jq -r '.vw_spin // empty' "$OPTIONS")
+GOOGLE_EMAIL=$(jq -r '.google_email // empty' "$OPTIONS")
+GOOGLE_PASSWORD=$(jq -r '.google_password // empty' "$OPTIONS")
 LOG_LEVEL=$(jq -r '.log_level' "$OPTIONS")
 VNC_ENABLED=$(jq -r '.vnc_enabled // true' "$OPTIONS")
 VNC_PASSWORD=$(jq -r '.vnc_password // empty' "$OPTIONS")
@@ -149,6 +151,8 @@ CMD="${CMD} --mqtt-port ${MQTT_PORT}"
 [ -n "${VW_USERNAME}" ] && CMD="${CMD} --vw-email ${VW_USERNAME}"
 [ -n "${VW_PASSWORD}" ] && CMD="${CMD} --vw-password ${VW_PASSWORD}"
 [ -n "${VW_SPIN}" ] && CMD="${CMD} --vw-spin ${VW_SPIN}"
+[ -n "${GOOGLE_EMAIL}" ] && CMD="${CMD} --google-email ${GOOGLE_EMAIL}"
+[ -n "${GOOGLE_PASSWORD}" ] && CMD="${CMD} --google-password ${GOOGLE_PASSWORD}"
 
 # ── VNC Server (droidVNC-NG) ──
 VNC_PKG="net.christianbeier.droidvnc_ng"

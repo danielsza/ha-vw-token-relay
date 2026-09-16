@@ -417,7 +417,8 @@ rpc.exports = {
 
 class VWTokenRelay:
     def __init__(self, mqtt_host, mqtt_port=1883, mqtt_user=None, mqtt_pass=None,
-                 vw_email=None, vw_password=None, vw_spin=None):
+                 vw_email=None, vw_password=None, vw_spin=None,
+                 google_email=None, google_password=None):
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
         self.mqtt_user = mqtt_user
@@ -427,6 +428,10 @@ class VWTokenRelay:
         self.vw_email = vw_email
         self.vw_password = vw_password
         self.vw_spin = vw_spin
+
+        # Google account credentials (for PI credential refresh)
+        self.google_email = google_email
+        self.google_password = google_password
 
         # PIF health tracking
         self._last_token_time = None  # set on every fresh token capture
@@ -576,6 +581,8 @@ class VWTokenRelay:
             threading.Thread(target=self._clear_app_data, daemon=True).start()
         elif cmd == "auto_login":
             threading.Thread(target=self._auto_login, daemon=True).start()
+        elif cmd == "refresh_google":
+            threading.Thread(target=self._refresh_google_account, daemon=True).start()
         elif cmd == "adb_tap":
             # Tap arbitrary coordinates: payload = "x,y" e.g. "360,1439"
             try:
@@ -5136,6 +5143,305 @@ img{{max-width:100%;height:auto}}</style></head>
         finally:
             self._phone_recovery_in_progress = False
 
+    def _refresh_google_account(self):
+        """Remove and re-add the Google account to fix stale Play Services credentials.
+
+        Stale Google credentials cause Finsky to throw IntegrityException internally,
+        which makes Play Integrity fall back to basic-only mode (BASIC instead of
+        STRONG/DEVICE). Removing and re-adding the account forces fresh credential
+        negotiation and restores full PI capability.
+
+        Flow: Settings → Accounts → Google → Remove → Add Account → Google → sign in.
+        Uses uiautomator for element finding, with coordinate fallbacks for known
+        Moto G Pure (720x1600) layout positions.
+        """
+        if not self.google_email or not self.google_password:
+            log.error("GOOGLE_REFRESH: No google_email/google_password configured")
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                json.dumps({"status": "error", "reason": "no credentials configured"}))
+            return
+
+        log.info("GOOGLE_REFRESH: ====== Starting Google account refresh ======")
+        self.mqttc.publish(
+            f"{MQTT_TOPIC_PREFIX}/google_refresh",
+            json.dumps({"status": "started"}))
+
+        def _adb_cmd(cmd_str, timeout=10):
+            try:
+                r = subprocess.run(
+                    ["adb", "shell", "su", "-c", cmd_str],
+                    capture_output=True, text=True, timeout=timeout)
+                return r.stdout.strip()
+            except Exception as e:
+                log.warning("GOOGLE_REFRESH: adb cmd failed: %s", e)
+                return ""
+
+        def _tap(x, y, desc=""):
+            log.info("GOOGLE_REFRESH: tap(%d, %d) %s", x, y, desc)
+            _adb_cmd(f"input tap {x} {y}")
+            time.sleep(1.5)
+
+        def _input_text_raw(text):
+            """Type text without escaping — use for password fields where
+            special chars need to go through as-is."""
+            _adb_cmd(f"input text '{text}'")
+
+        try:
+            # Wake screen first
+            self._wake_screen()
+            time.sleep(1)
+
+            # ── Phase 1: Remove existing Google account ──
+            log.info("GOOGLE_REFRESH: Phase 1 — Removing existing Google account")
+
+            # Check how many accounts exist
+            account_check = _adb_cmd("dumpsys account | grep -c 'Account.*type=com.google'")
+            log.info("GOOGLE_REFRESH: Current Google account count: %s", account_check)
+
+            if account_check.strip() == "0":
+                log.info("GOOGLE_REFRESH: No Google account to remove, skipping to add")
+            else:
+                # Open Accounts settings
+                _adb_cmd("am start -a android.settings.SYNC_SETTINGS")
+                time.sleep(3)
+
+                # Find and tap "Google" in the accounts list
+                xml = self._dump_ui_xml()
+                elems = self._find_ui_elements(xml, text="Google")
+                if elems:
+                    cx, cy, _, _ = elems[0]
+                    _tap(cx, cy, "Google account entry")
+                else:
+                    log.warning("GOOGLE_REFRESH: 'Google' not found in accounts, trying text search")
+                    # Try content-desc
+                    elems = self._find_ui_elements(xml, content_desc="Google")
+                    if elems:
+                        cx, cy, _, _ = elems[0]
+                        _tap(cx, cy, "Google account (content-desc)")
+                    else:
+                        log.warning("GOOGLE_REFRESH: Falling back to known position for Google entry")
+                        _tap(360, 400, "Google account (fallback)")
+                time.sleep(2)
+
+                # Now we should see the account email — tap it
+                xml = self._dump_ui_xml()
+                elems = self._find_ui_elements(xml, text=self.google_email)
+                if elems:
+                    cx, cy, _, _ = elems[0]
+                    _tap(cx, cy, f"account {self.google_email}")
+                else:
+                    log.info("GOOGLE_REFRESH: Email not found in UI, tapping first item")
+                    _tap(360, 400, "first account item (fallback)")
+                time.sleep(2)
+
+                # Find and tap "Remove account" button
+                xml = self._dump_ui_xml()
+                elems = self._find_ui_elements(xml, text="Remove account")
+                if elems:
+                    cx, cy, _, _ = elems[0]
+                    _tap(cx, cy, "Remove account button")
+                else:
+                    log.warning("GOOGLE_REFRESH: 'Remove account' not found, scrolling down")
+                    _adb_cmd("input swipe 360 1200 360 400 300")
+                    time.sleep(1)
+                    xml = self._dump_ui_xml()
+                    elems = self._find_ui_elements(xml, text="Remove account")
+                    if elems:
+                        cx, cy, _, _ = elems[0]
+                        _tap(cx, cy, "Remove account (after scroll)")
+                    else:
+                        log.error("GOOGLE_REFRESH: Cannot find 'Remove account' — aborting")
+                        self.mqttc.publish(
+                            f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                            json.dumps({"status": "error", "reason": "remove button not found"}))
+                        return
+                time.sleep(2)
+
+                # Confirm removal in dialog — look for "Remove account" button in dialog
+                xml = self._dump_ui_xml()
+                elems = self._find_ui_elements(xml, text="Remove account")
+                if elems:
+                    cx, cy, _, _ = elems[0]
+                    _tap(cx, cy, "Confirm remove account")
+                else:
+                    # Try "OK" or "Remove" as fallback
+                    for btn_text in ["OK", "Remove", "REMOVE"]:
+                        elems = self._find_ui_elements(xml, text=btn_text)
+                        if elems:
+                            cx, cy, _, _ = elems[0]
+                            _tap(cx, cy, f"Confirm ({btn_text})")
+                            break
+                time.sleep(3)
+
+                # Verify removal
+                account_check = _adb_cmd("dumpsys account | grep -c 'Account.*type=com.google'")
+                log.info("GOOGLE_REFRESH: Account count after removal: %s", account_check)
+                if account_check.strip() != "0":
+                    log.warning("GOOGLE_REFRESH: Account may not have been removed (count=%s)",
+                                account_check.strip())
+
+            # ── Phase 2: Add Google account ──
+            log.info("GOOGLE_REFRESH: Phase 2 — Adding Google account")
+
+            # Go home first to clear any leftover settings screens
+            _adb_cmd("input keyevent KEYCODE_HOME")
+            time.sleep(2)
+
+            # Open Add Account settings
+            _adb_cmd("am start -a android.settings.ADD_ACCOUNT_SETTINGS")
+            time.sleep(3)
+
+            # Tap "Google" in account type list (~180, 485 on Moto G Pure)
+            xml = self._dump_ui_xml()
+            elems = self._find_ui_elements(xml, text="Google")
+            if elems:
+                cx, cy, _, _ = elems[0]
+                _tap(cx, cy, "Google account type")
+            else:
+                _tap(180, 485, "Google account type (fallback)")
+            time.sleep(5)
+
+            # Wait for email field to appear (Google sign-in WebView)
+            for attempt in range(6):
+                xml = self._dump_ui_xml()
+                # Look for email input or "Sign in" / "Email or phone" text
+                elems = self._find_ui_elements(xml, text="Email or phone")
+                if not elems:
+                    elems = self._find_ui_elements(xml, resource_id="identifierId")
+                if not elems:
+                    elems = self._find_ui_elements(xml, text="Sign in")
+                if elems:
+                    log.info("GOOGLE_REFRESH: Sign-in page detected (attempt %d)", attempt)
+                    break
+                log.info("GOOGLE_REFRESH: Waiting for sign-in page (attempt %d)...", attempt)
+                time.sleep(3)
+
+            # Tap the email field area and type email
+            _tap(350, 553, "email field")
+            time.sleep(1)
+
+            # Type email and immediately press Enter (avoids autocomplete mangling)
+            escaped_email = self.google_email.replace("@", "\\@")
+            _adb_cmd(f"input text {escaped_email}")
+            time.sleep(0.3)
+            _adb_cmd("input keyevent 66")  # Enter
+            log.info("GOOGLE_REFRESH: Email entered, waiting for password page")
+            time.sleep(8)
+
+            # Wait for password field
+            for attempt in range(4):
+                xml = self._dump_ui_xml()
+                elems = self._find_ui_elements(xml, text="Enter your password")
+                if not elems:
+                    elems = self._find_ui_elements(xml, resource_id="password")
+                if elems:
+                    log.info("GOOGLE_REFRESH: Password page detected")
+                    break
+                time.sleep(3)
+
+            # Tap password field and type password
+            _tap(350, 460, "password field")
+            time.sleep(1)
+
+            # Type password — NO trailing dot fix for password fields
+            _adb_cmd(f"input text {self.google_password}")
+            time.sleep(0.3)
+            _adb_cmd("input keyevent 66")  # Enter immediately
+            log.info("GOOGLE_REFRESH: Password entered, waiting for result")
+            time.sleep(10)
+
+            # Handle post-login screens (I agree, Don't back up, etc.)
+            for screen_attempt in range(5):
+                xml = self._dump_ui_xml()
+                if not xml:
+                    time.sleep(3)
+                    continue
+
+                # Check for "I agree" button
+                elems = self._find_ui_elements(xml, text="I agree")
+                if elems:
+                    cx, cy, _, _ = elems[0]
+                    _tap(cx, cy, "I agree")
+                    time.sleep(3)
+                    continue
+
+                # Check for "More" button (precedes I agree on some pages)
+                elems = self._find_ui_elements(xml, text="More")
+                if not elems:
+                    elems = self._find_ui_elements(xml, content_desc="More")
+                if elems:
+                    cx, cy, _, _ = elems[0]
+                    _tap(cx, cy, "More")
+                    time.sleep(2)
+                    continue
+
+                # Check for "Accept" / "ACCEPT"
+                for accept_text in ["Accept", "ACCEPT"]:
+                    elems = self._find_ui_elements(xml, text=accept_text)
+                    if elems:
+                        cx, cy, _, _ = elems[0]
+                        _tap(cx, cy, accept_text)
+                        time.sleep(3)
+                        break
+                else:
+                    # Check for "Don't back up" or "Skip"
+                    for skip_text in ["Don't back up", "Don’t back up", "Skip"]:
+                        elems = self._find_ui_elements(xml, text=skip_text)
+                        if elems:
+                            cx, cy, _, _ = elems[0]
+                            _tap(cx, cy, skip_text)
+                            time.sleep(3)
+                            break
+                    else:
+                        # Check if we're on the accounts page (success)
+                        elems = self._find_ui_elements(xml, text=self.google_email)
+                        if elems:
+                            log.info("GOOGLE_REFRESH: Account appears in UI — success!")
+                            break
+                        # Check for "Wrong password" error
+                        elems = self._find_ui_elements(xml, text="Wrong password")
+                        if elems:
+                            log.error("GOOGLE_REFRESH: Wrong password! Check google_password config")
+                            self.mqttc.publish(
+                                f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                                json.dumps({"status": "error", "reason": "wrong password"}))
+                            _adb_cmd("input keyevent KEYCODE_HOME")
+                            return
+                        log.info("GOOGLE_REFRESH: Post-login screen %d — no known buttons, waiting",
+                                 screen_attempt)
+                        time.sleep(3)
+
+            # Go home
+            _adb_cmd("input keyevent KEYCODE_HOME")
+            time.sleep(2)
+
+            # Verify account was added
+            account_check = _adb_cmd("dumpsys account | grep -c 'Account.*type=com.google'")
+            log.info("GOOGLE_REFRESH: Final Google account count: %s", account_check)
+
+            if account_check.strip() and int(account_check.strip()) > 0:
+                log.info("GOOGLE_REFRESH: ====== SUCCESS — Google account refreshed ======")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                    json.dumps({"status": "success", "accounts": account_check.strip()}))
+            else:
+                log.error("GOOGLE_REFRESH: ====== FAILED — no Google account found after flow ======")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                    json.dumps({"status": "error", "reason": "account not found after sign-in"}))
+
+        except Exception as e:
+            log.error("GOOGLE_REFRESH: Unexpected error: %s", e, exc_info=True)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                json.dumps({"status": "error", "reason": str(e)}))
+            # Try to go home in case we left settings open
+            try:
+                _adb_cmd("input keyevent KEYCODE_HOME")
+            except Exception:
+                pass
+
     def _update_pif(self):
         """Run the Play Integrity fingerprint updater script."""
         log.info("Running PIF fingerprint updater...")
@@ -6000,12 +6306,23 @@ img{{max-width:100%;height:auto}}</style></head>
                 elif token_age_min > 45 and cooldown_ok:
                     self._pif_fix_attempts += 1
                     if self._pif_fix_attempts <= 1:
+                        # Level 1: Update PIF fingerprint + reboot
                         pif_status = "degraded"
-                        log.warning("PIF HEALTH: No fresh token in %.0f min — auto-fix attempt #%d",
+                        log.warning("PIF HEALTH: No fresh token in %.0f min — auto-fix attempt #%d (fingerprint update)",
                                     token_age_min, self._pif_fix_attempts)
                         self._pif_reboot_cooldown = datetime.now()
                         threading.Thread(target=self._update_pif, daemon=True).start()
+                    elif self._pif_fix_attempts == 2 and self.google_email and self.google_password:
+                        # Level 2: Refresh Google account credentials
+                        # Stale Google creds cause Finsky IntegrityException → BASIC only
+                        pif_status = "degraded"
+                        log.warning("PIF HEALTH: Fingerprint update didn't help (%.0f min stale) — "
+                                    "attempting Google account refresh (attempt #%d)",
+                                    token_age_min, self._pif_fix_attempts)
+                        self._pif_reboot_cooldown = datetime.now()
+                        threading.Thread(target=self._refresh_google_account, daemon=True).start()
                     else:
+                        # Level 3+: Notify user, keep trying PIF update
                         pif_status = "critical"
                         log.error("PIF HEALTH: Still no fresh token after %d fix attempts (%.0f min stale) — NOTIFY USER",
                                   self._pif_fix_attempts, token_age_min)
@@ -6121,6 +6438,10 @@ def main():
                    help="VW account password (or VW_PASSWORD env var)")
     p.add_argument("--vw-spin", default=os.environ.get("VW_SPIN"),
                    help="VW S-PIN (or VW_SPIN env var)")
+    p.add_argument("--google-email", default=os.environ.get("GOOGLE_EMAIL"),
+                   help="Google account email for PI credential refresh (or GOOGLE_EMAIL env var)")
+    p.add_argument("--google-password", default=os.environ.get("GOOGLE_PASSWORD"),
+                   help="Google account password (or GOOGLE_PASSWORD env var)")
     args = p.parse_args()
 
     VWTokenRelay(
@@ -6131,6 +6452,8 @@ def main():
         vw_email=args.vw_email,
         vw_password=args.vw_password,
         vw_spin=args.vw_spin,
+        google_email=args.google_email,
+        google_password=args.google_password,
     ).run()
 
 
