@@ -6,7 +6,7 @@ Captures Play Integrity tokens and OAuth credentials from the VW myVW app via Fr
 
 VW's North American API requires every request to carry a Play Integrity–attested token. This is already enforced in the US and is expected to roll out to Canada. The official myVW app passes Google's device attestation check; a headless Python connector cannot. This add-on bridges the gap: a rooted Android phone runs the real myVW app, Frida hooks intercept the attested tokens in real-time, and MQTT delivers them to CarConnectivity or Home Assistant automations. Without this (or a similar relay), the [VW NA connector](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na) cannot authenticate.
 
-**Note:** This has been tested on the Canadian endpoint where PI is not yet enforced. The relay captures and forwards PI tokens, but we cannot yet confirm they pass validation on the US endpoint. US testing is needed.
+**Note:** Tested on the Canadian endpoint. As of September 2026, the phone achieves **MEETS_STRONG_INTEGRITY** — the highest Play Integrity level — with a software keybox and Pixel 9a Canary fingerprint. This should satisfy both the Canadian and US endpoints. See [Play Integrity Result](#play-integrity-result) below.
 
 ## Architecture
 
@@ -116,7 +116,7 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 8. **Install myVW** — sideload APK, log in, grant all permissions
 9. **Enable USB debugging** — Developer Options → USB Debugging
 10. **Keep screen on** — `adb shell settings put global stay_on_while_plugged_in 3`
-11. **Verify PI** — test with SPIC or YASNAC; must show `DEVICE_INTEGRITY` (BASIC alone is not sufficient — VW will reject the token)
+11. **Verify PI** — test with SPIC (`com.henrikherzig.playintegritychecker`); must show `MEETS_DEVICE_INTEGRITY` or higher. BASIC alone may not be sufficient — VW US requires DEVICE, and VW Canada may enforce it as well. With the Pixel 9a Canary fingerprint + software keybox, MEETS_STRONG_INTEGRITY is achievable. If PI drops to BASIC after a while, remove and re-add the Google account on the phone (stale credentials cause Finsky to fall back to basic-only mode).
 
 ## Reference Setup (known-good)
 
@@ -126,11 +126,12 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 | Android | 12 (upgraded from stock 11 — PI did not pass on 11) |
 | Magisk | 28.1+ |
 | ReZygisk | Latest (replaces Magisk's built-in Zygisk) |
-| PIF module | osm0sis Play Integrity Fix with autopif fingerprint rotation |
+| PIF module | osm0sis Play Integrity Fix v18.0-lsposed with autopif fingerprint rotation |
 | Tricky Store | Latest (software keybox — no hardware keybox needed) |
-| Frida server | 16.5.9-android-arm64 |
+| Frida server | 16.5.9-android-arm (32-bit — Moto G Pure is armeabi-v7a only) |
 | myVW package | `com.vw.carnet.releaseca` (Canada) |
-| PI verdict | DEVICE_INTEGRITY (verified with SPIC) |
+| PI verdict | **MEETS_STRONG_INTEGRITY** (verified with SPIC — see screenshot below) |
+| PIF fingerprint | Pixel 9a (`tegu_beta`) Canary — `google/tegu_beta/tegu:CANARY/ZP11.260717.006/16004061:user/release-keys` |
 | HA host | HP mini PC (x86, USB connection to phone) |
 | MQTT broker | Mosquitto (HA add-on) |
 
@@ -140,6 +141,18 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 |---------|----------|-----|----------------|
 | 2025 VW ID. Buzz 1st Edition | MEB/EV | WCT | lock, unlock, climate, charging, status |
 | 2024 VW Atlas | MQB/ICE | ATC | lock, unlock, climate, remote start, status |
+
+## Play Integrity Result
+
+![SPIC showing MEETS_STRONG_INTEGRITY](https://raw.githubusercontent.com/danielsza/ha-vw-token-relay/main/docs/spic-strong-integrity.png)
+
+**MEETS_STRONG_INTEGRITY** achieved on a rooted Moto G Pure with a software keybox. Key factors:
+
+1. **Pixel 9a Canary fingerprint** — `google/tegu_beta/tegu:CANARY/ZP11.260717.006/16004061:user/release-keys` with `DEVICE_INITIAL_SDK_INT=32` and `SECURITY_PATCH=2026-08-05`
+2. **Fresh Google account credentials** — stale Google credentials cause Finsky to throw `IntegrityException` and fall back to basic-only mode. If PI drops to BASIC, remove the Google account and re-add it.
+3. **ReZygisk + Tricky Store + PIF** — no Shamiko needed. DenyList enabled but empty (not required for these modules).
+
+Previously achieved BASIC_INTEGRITY only (see `docs/spic-basic-integrity.png` for comparison). The upgrade to STRONG was achieved by switching from a Pixel 6 Canary fingerprint to Pixel 9a Canary and refreshing the Google account credentials on the phone.
 
 ## Region Notes
 
