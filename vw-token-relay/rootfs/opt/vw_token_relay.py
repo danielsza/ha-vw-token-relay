@@ -981,6 +981,46 @@ class VWTokenRelay:
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/adb_pull",
                     json.dumps({"error": str(e)}), retain=False)
+        elif cmd == "img_thumb":
+            # Resize an image from /share/ and return as base64 JPEG thumbnail
+            # payload = JSON {"file": "spic4.png", "width": 200, "quality": 30}
+            try:
+                data = json.loads(payload)
+                filename = data.get("file", "")
+                width = int(data.get("width", 200))
+                quality = int(data.get("quality", 30))
+                src_path = f"/share/{filename}"
+                if not os.path.exists(src_path):
+                    raise FileNotFoundError(f"{src_path} not found")
+                from PIL import Image
+                import io
+                img = Image.open(src_path)
+                orig_w, orig_h = img.size
+                ratio = width / orig_w
+                new_h = int(orig_h * ratio)
+                img = img.resize((width, new_h), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                result = {
+                    "status": "ok",
+                    "file": filename,
+                    "orig_size": f"{orig_w}x{orig_h}",
+                    "thumb_size": f"{width}x{new_h}",
+                    "jpeg_bytes": len(buf.getvalue()),
+                    "b64": b64,
+                }
+                log.info("IMG_THUMB: %s %dx%d -> %dx%d (%d bytes JPEG)",
+                         filename, orig_w, orig_h, width, new_h, len(buf.getvalue()))
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/img_thumb",
+                    json.dumps(result), retain=False)
+            except Exception as e:
+                log.error("IMG_THUMB: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/img_thumb",
+                    json.dumps({"error": str(e)}), retain=False)
+
         elif cmd == "ui_find":
             # Find UI elements by text and write results to /share/ui_find.txt
             search = payload.strip() if payload.strip() else ""

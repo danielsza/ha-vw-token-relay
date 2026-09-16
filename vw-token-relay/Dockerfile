@@ -16,11 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         paho-mqtt \
         PyJWT \
         cryptography \
+        Pillow \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Force layer invalidation — change this string to bust Docker cache
-RUN echo "force-rebuild-20260915-1600" > /tmp/.build_marker
+RUN echo "force-rebuild-20260916-0005" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /
