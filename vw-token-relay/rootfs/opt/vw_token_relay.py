@@ -994,6 +994,7 @@ class VWTokenRelay:
                     raise FileNotFoundError(f"{src_path} not found")
                 from PIL import Image
                 import io
+                import base64 as b64mod
                 img = Image.open(src_path)
                 if img.mode == "RGBA":
                     img = img.convert("RGB")
@@ -1003,14 +1004,14 @@ class VWTokenRelay:
                 img = img.resize((width, new_h), Image.LANCZOS)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=quality)
-                b64 = base64.b64encode(buf.getvalue()).decode()
+                b64_str = b64mod.b64encode(buf.getvalue()).decode()
                 result = {
                     "status": "ok",
                     "file": filename,
                     "orig_size": f"{orig_w}x{orig_h}",
                     "thumb_size": f"{width}x{new_h}",
                     "jpeg_bytes": len(buf.getvalue()),
-                    "b64": b64,
+                    "b64": b64_str,
                 }
                 log.info("IMG_THUMB: %s %dx%d -> %dx%d (%d bytes JPEG)",
                          filename, orig_w, orig_h, width, new_h, len(buf.getvalue()))
