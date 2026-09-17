@@ -5569,6 +5569,8 @@ img{{max-width:100%;height:auto}}</style></head>
         if self.play_integrity_token:
             token_relay["play_integrity_token"] = self.play_integrity_token
         if token_relay.get("access_token"):
+            # Add issued_at so consumers can calculate real remaining TTL
+            token_relay["issued_at"] = datetime.now().isoformat()
             self.mqttc.publish(
                 f"{MQTT_TOPIC_PREFIX}/token_relay",
                 json.dumps(token_relay),
@@ -6073,7 +6075,7 @@ img{{max-width:100%;height:auto}}</style></head>
         no_token_count = 0
 
         while self._running:
-            time.sleep(300)  # 5 minutes
+            time.sleep(180)  # 3 minutes — keep tokens fresh for CC MQTT consumer
 
             # ── Phone health check (early detection) ──
             phone_health = self._check_phone_health()
@@ -6195,12 +6197,12 @@ img{{max-width:100%;height:auto}}</style></head>
                 needs_refresh = False
                 all_expired = True
                 for vid, t in self.tokens.items():
-                    if datetime.now() > t["expiry"] - timedelta(minutes=5):
+                    if datetime.now() > t["expiry"] - timedelta(minutes=10):
                         needs_refresh = True
                     else:
                         all_expired = False
                 if self.global_expiry:
-                    if datetime.now() > self.global_expiry - timedelta(minutes=5):
+                    if datetime.now() > self.global_expiry - timedelta(minutes=10):
                         needs_refresh = True
                     else:
                         all_expired = False
