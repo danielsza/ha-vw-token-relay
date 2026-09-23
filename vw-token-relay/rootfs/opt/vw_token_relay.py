@@ -2406,73 +2406,136 @@ img{{max-width:100%;height:auto}}</style></head>
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
-            # Step 1.5a: Dismiss any VW alert dialogs (e.g. "Vehicle
-            # Location Unknown") that may have appeared after tapping
-            # Atlas. These block the dashboard and hide all buttons
-            # from uiautomator.
-            self._dismiss_vw_alert_dialogs()
-            self._dismiss_system_dialogs()
-
-            # Step 1.5b: Ensure we're on the Home tab (not Navigation/
-            # Car Finder). The VW app remembers the last-viewed tab —
-            # if a previous run left us on the Navigation tab, the
-            # dashboard buttons won't be visible.
-            # NOTE: The active tab has clickable="false" (can't click
-            # what's already selected). The selected= attribute is
-            # always "false" for all nav items, so we use clickable.
-            xml = self._dump_ui_xml()
-            if xml:
-                nav_tab = self._find_ui_elements(
-                    xml, resource_id="navigation_nav_graph")
-                home_tab = self._find_ui_elements(
-                    xml, resource_id="home_nav_graph")
-                nav_is_active = (nav_tab and
-                                 nav_tab[0][3].get("clickable") == "false")
-                home_is_active = (home_tab and
-                                  home_tab[0][3].get("clickable") == "false")
-                if nav_is_active:
-                    log.info("UI_RST: On Navigation tab — switching "
-                             "to Home tab")
-                    if home_tab:
-                        hx, hy = home_tab[0][0], home_tab[0][1]
-                        subprocess.run(
-                            ["adb", "shell", "su", "-c",
-                             f"input tap {hx} {hy}"],
-                            capture_output=True, timeout=10)
-                        time.sleep(5)
+            # ── IMMEDIATE POST-ATLAS BUTTON CHECK ──
+            # Check for the button RIGHT NOW, before any UI interaction
+            # (dialog dismissals, tab checks, wake, screencap) that would
+            # collapse the toolbar and trigger a vehicle status re-fetch.
+            # Manual testing confirmed: 25-30s after tapping Atlas with
+            # NO other interactions, the button is at [35,833][685,945]
+            # with enabled="true".
+            imm_xml = self._dump_ui_xml()
+            imm_btn_clicked = False
+            if imm_xml:
+                imm_btn = self._find_ui_elements(
+                    imm_xml, resource_id="remoteStartButton")
+                if imm_btn:
+                    imm_enabled = imm_btn[0][3].get("enabled")
+                    imm_bounds = imm_btn[0][3].get("bounds", "")
+                    log.info("UI_RST: IMMEDIATE post-Atlas check — "
+                             "button found, enabled=%s bounds=%s",
+                             imm_enabled, imm_bounds)
+                    if imm_enabled == "true":
+                        log.info("UI_RST: Button ENABLED immediately "
+                                 "after Atlas — clicking NOW")
+                        # Dismiss promo banner if present
+                        imm_close = self._find_ui_elements(
+                            imm_xml, resource_id="closeButton")
+                        if imm_close:
+                            log.info("UI_RST: Dismissing banner at "
+                                     "(%d,%d) before immediate click",
+                                     imm_close[0][0], imm_close[0][1])
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {imm_close[0][0]} "
+                                 f"{imm_close[0][1]}"],
+                                capture_output=True, timeout=10)
+                            time.sleep(4)
+                            # Re-dump for fresh button position
+                            imm_xml = self._dump_ui_xml() or imm_xml
+                            imm_btn = self._find_ui_elements(
+                                imm_xml,
+                                resource_id="remoteStartButton")
+                        if imm_btn:
+                            bx, by = imm_btn[0][0], imm_btn[0][1]
+                            log.info("UI_RST: Immediate click at "
+                                     "(%d,%d)", bx, by)
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {bx} {by}"],
+                                capture_output=True, timeout=10)
+                            imm_btn_clicked = True
                     else:
-                        # Fallback: tap known Home tab position
+                        log.info("UI_RST: IMMEDIATE post-Atlas check — "
+                                 "button disabled, will skip scroll in "
+                                 "retry loop")
+                else:
+                    log.info("UI_RST: IMMEDIATE post-Atlas check — "
+                             "button NOT in XML (toolbar may already "
+                             "be collapsed)")
+            else:
+                log.warning("UI_RST: IMMEDIATE post-Atlas XML dump "
+                            "failed")
+
+            if imm_btn_clicked:
+                # Skip all the dialog/tab/retry machinery — go straight
+                # to bottom-sheet handling
+                log.info("UI_RST: Skipping retry loop — button was "
+                         "clicked via immediate check")
+                time.sleep(5)
+                # Fall through to bottom-sheet handling below
+            else:
+                # ── Original flow continues ──
+
+                # Step 1.5a: Dismiss any VW alert dialogs (e.g. "Vehicle
+                # Location Unknown") that may have appeared after tapping
+                # Atlas. These block the dashboard and hide all buttons
+                # from uiautomator.
+                self._dismiss_vw_alert_dialogs()
+                self._dismiss_system_dialogs()
+
+                # Step 1.5b: Ensure we're on the Home tab
+                xml = self._dump_ui_xml()
+                if xml:
+                    nav_tab = self._find_ui_elements(
+                        xml, resource_id="navigation_nav_graph")
+                    home_tab = self._find_ui_elements(
+                        xml, resource_id="home_nav_graph")
+                    nav_is_active = (nav_tab and
+                                     nav_tab[0][3].get("clickable") == "false")
+                    home_is_active = (home_tab and
+                                      home_tab[0][3].get("clickable") == "false")
+                    if nav_is_active:
+                        log.info("UI_RST: On Navigation tab — switching "
+                                 "to Home tab")
+                        if home_tab:
+                            hx, hy = home_tab[0][0], home_tab[0][1]
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {hx} {hy}"],
+                                capture_output=True, timeout=10)
+                            time.sleep(5)
+                        else:
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input tap 72 1460"],
+                                capture_output=True, timeout=10)
+                            time.sleep(5)
+                        self._dismiss_vw_alert_dialogs()
+                    elif home_is_active:
+                        log.info("UI_RST: Already on Home tab")
+                    else:
+                        log.info("UI_RST: Unknown tab state — tapping "
+                                 "Home tab at (72,1460)")
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
                              "input tap 72 1460"],
                             capture_output=True, timeout=10)
                         time.sleep(5)
-                    # After switching tabs, dismiss any new dialogs
-                    self._dismiss_vw_alert_dialogs()
-                elif home_is_active:
-                    log.info("UI_RST: Already on Home tab")
-                else:
-                    # Not sure which tab — tap Home anyway
-                    log.info("UI_RST: Unknown tab state — tapping "
-                             "Home tab at (72,1460)")
-                    subprocess.run(
-                        ["adb", "shell", "su", "-c",
-                         "input tap 72 1460"],
-                        capture_output=True, timeout=10)
-                    time.sleep(5)
-                    self._dismiss_vw_alert_dialogs()
+                        self._dismiss_vw_alert_dialogs()
 
-            # Step 2: Check foreground + take diagnostic screencap
-            self._wake_screen()
-            time.sleep(1)
-            self._dismiss_system_dialogs()
-            fg_step2 = self._get_foreground_activity()
-            log.info("UI_RST: Step 2 foreground: %s", (fg_step2 or "?")[:80])
-            self._screencap()  # Diagnostic: see what's on screen
+                # Step 2: Check foreground + take diagnostic screencap
+                self._wake_screen()
+                time.sleep(1)
+                self._dismiss_system_dialogs()
+                fg_step2 = self._get_foreground_activity()
+                log.info("UI_RST: Step 2 foreground: %s",
+                         (fg_step2 or "?")[:80])
+                self._screencap()
 
             # Step 3: Find "Remote start" button on the dashboard
             # Strategy: dismiss crash dialogs, scroll to top (expand
             # collapsing toolbar), then search with retries.
+            # SKIP if the immediate post-Atlas check already clicked it.
             elems = None
             search_texts = (
                 ["Stop engine", "Stop", "Engine running",
@@ -2484,7 +2547,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 search_rids += ["stopEngineButton", "remoteStopButton",
                                 "engineRunningButton", "remoteStartStopButton"]
 
-            for attempt in range(5):
+            for attempt in range(5 if not imm_btn_clicked else 0):
                 # Wake screen + dismiss keyguard before every attempt
                 self._wake_screen()
                 subprocess.run(
@@ -2694,7 +2757,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("UI_RST: Button not found (attempt %d/5)", attempt)
                 time.sleep(3)  # Give dashboard more time to load
 
-            if not elems:
+            if not elems and not imm_btn_clicked:
                 log.error("UI_RST: Cannot find Remote start/stop button "
                           "after 5 attempts")
                 log.error("UI_RST: Full UI XML dump:\n%s",
@@ -2702,115 +2765,116 @@ img{{max-width:100%;height:auto}}</style></head>
                 self._screencap()
                 return False
 
-            cx, cy = elems[0][0], elems[0][1]
-            btn_attrs = elems[0][3]
+            if not imm_btn_clicked:
+                cx, cy = elems[0][0], elems[0][1]
+                btn_attrs = elems[0][3]
 
-            # Dismiss the "Scheduled App Maintenance" / "Special offer"
-            # carousel banner if present — it may be blocking button
-            # enablement.  Dismiss FIRST, then re-check button state.
-            maint_close = self._find_ui_elements(
-                xml, resource_id="closeButton")
-            if maint_close:
-                mcx, mcy = maint_close[0][0], maint_close[0][1]
-                log.info("UI_RST: Dismissing maintenance/promo banner "
-                         "at (%d,%d)", mcx, mcy)
-                subprocess.run(
-                    ["adb", "shell", "su", "-c",
-                     f"input tap {mcx} {mcy}"],
-                    capture_output=True, timeout=10)
-                time.sleep(4)
-                # Re-dump XML after banner dismissal — button may
-                # have become enabled once the overlay is gone.
-                xml_fresh = self._dump_ui_xml()
-                if xml_fresh:
-                    xml = xml_fresh
-                    fresh_btn = self._find_ui_elements(
-                        xml, resource_id="remoteStartButton")
-                    if fresh_btn:
-                        cx, cy = fresh_btn[0][0], fresh_btn[0][1]
-                        btn_attrs = fresh_btn[0][3]
-                        log.info("UI_RST: After banner dismiss — "
-                                 "enabled=%s clickable=%s",
-                                 btn_attrs.get("enabled"),
-                                 btn_attrs.get("clickable"))
+                # Dismiss the "Scheduled App Maintenance" / "Special offer"
+                # carousel banner if present — it may be blocking button
+                # enablement.  Dismiss FIRST, then re-check button state.
+                maint_close = self._find_ui_elements(
+                    xml, resource_id="closeButton")
+                if maint_close:
+                    mcx, mcy = maint_close[0][0], maint_close[0][1]
+                    log.info("UI_RST: Dismissing maintenance/promo banner "
+                             "at (%d,%d)", mcx, mcy)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input tap {mcx} {mcy}"],
+                        capture_output=True, timeout=10)
+                    time.sleep(4)
+                    # Re-dump XML after banner dismissal — button may
+                    # have become enabled once the overlay is gone.
+                    xml_fresh = self._dump_ui_xml()
+                    if xml_fresh:
+                        xml = xml_fresh
+                        fresh_btn = self._find_ui_elements(
+                            xml, resource_id="remoteStartButton")
+                        if fresh_btn:
+                            cx, cy = fresh_btn[0][0], fresh_btn[0][1]
+                            btn_attrs = fresh_btn[0][3]
+                            log.info("UI_RST: After banner dismiss — "
+                                     "enabled=%s clickable=%s",
+                                     btn_attrs.get("enabled"),
+                                     btn_attrs.get("clickable"))
 
-            # The VW app can mark dashboard command buttons as
-            # enabled="false" but clickable="true" while loading vehicle
-            # status.  A raw input tap on a disabled View doesn't reach
-            # the onClick listener — Android discards it and the tap
-            # falls through to the Owner's Manual link behind the button,
-            # opening Chrome.  Wait longer for the button to enable
-            # before resorting to Frida fallbacks.
-            button_enabled = btn_attrs.get("enabled") != "false"
+                # The VW app can mark dashboard command buttons as
+                # enabled="false" but clickable="true" while loading vehicle
+                # status.  A raw input tap on a disabled View doesn't reach
+                # the onClick listener — Android discards it and the tap
+                # falls through to the Owner's Manual link behind the button,
+                # opening Chrome.  Wait longer for the button to enable
+                # before resorting to Frida fallbacks.
+                button_enabled = btn_attrs.get("enabled") != "false"
 
-            if not button_enabled:
-                log.info("UI_RST: Button disabled (clickable=%s) — "
-                         "waiting up to 30s for enable...",
-                         btn_attrs.get("clickable"))
+                if not button_enabled:
+                    log.info("UI_RST: Button disabled (clickable=%s) — "
+                             "waiting up to 30s for enable...",
+                             btn_attrs.get("clickable"))
 
-                # Wait up to 30s for the button to enable itself
-                # (the app polls vehicle status and enables the button
-                # once it confirms remote start is available).
-                for wait_i in range(6):
-                    time.sleep(5)
-                    xml = self._dump_ui_xml()
-                    if not xml:
-                        continue
-                    # Also dismiss any banner that reappeared
-                    mc2 = self._find_ui_elements(
-                        xml, resource_id="closeButton")
-                    if mc2:
-                        subprocess.run(
-                            ["adb", "shell", "su", "-c",
-                             f"input tap {mc2[0][0]} {mc2[0][1]}"],
-                            capture_output=True, timeout=10)
-                        time.sleep(3)
-                        xml = self._dump_ui_xml() or xml
-                    check = self._find_ui_elements(
-                        xml, resource_id="remoteStartButton")
-                    if check and check[0][3].get("enabled") == "true":
-                        cx, cy = check[0][0], check[0][1]
-                        button_enabled = True
-                        log.info("UI_RST: Button enabled after %ds",
-                                 (wait_i + 1) * 5)
-                        break
+                    # Wait up to 30s for the button to enable itself
+                    # (the app polls vehicle status and enables the button
+                    # once it confirms remote start is available).
+                    for wait_i in range(6):
+                        time.sleep(5)
+                        xml = self._dump_ui_xml()
+                        if not xml:
+                            continue
+                        # Also dismiss any banner that reappeared
+                        mc2 = self._find_ui_elements(
+                            xml, resource_id="closeButton")
+                        if mc2:
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {mc2[0][0]} {mc2[0][1]}"],
+                                capture_output=True, timeout=10)
+                            time.sleep(3)
+                            xml = self._dump_ui_xml() or xml
+                        check = self._find_ui_elements(
+                            xml, resource_id="remoteStartButton")
+                        if check and check[0][3].get("enabled") == "true":
+                            cx, cy = check[0][0], check[0][1]
+                            button_enabled = True
+                            log.info("UI_RST: Button enabled after %ds",
+                                     (wait_i + 1) * 5)
+                            break
 
-            if button_enabled:
-                # Normal tap — button is enabled
-                log.info("UI_RST: Tapping Remote start at (%d,%d)",
-                         cx, cy)
-                subprocess.run(
-                    ["adb", "shell", "su", "-c",
-                     f"input tap {cx} {cy}"],
-                    capture_output=True, timeout=10)
-                time.sleep(5)
-            else:
-                # Button still disabled after 30s — try Frida fallbacks.
-                log.warning("UI_RST: Button still disabled after 30s — "
-                            "trying NavController direct navigation")
-                nav_ok = self._frida_navigate_to("remote")
-                if nav_ok:
-                    log.info("UI_RST: NavController navigation dispatched"
-                             " — waiting for screen...")
+                if button_enabled:
+                    # Normal tap — button is enabled
+                    log.info("UI_RST: Tapping Remote start at (%d,%d)",
+                             cx, cy)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input tap {cx} {cy}"],
+                        capture_output=True, timeout=10)
                     time.sleep(5)
                 else:
-                    log.warning("UI_RST: NavController failed — "
-                                "trying Frida performClick")
-                    frida_ok = self._frida_click_view("remoteStartButton")
-                    if frida_ok:
-                        log.info("UI_RST: Frida click dispatched — "
-                                 "waiting for bottom sheet...")
+                    # Button still disabled after 30s — try Frida fallbacks.
+                    log.warning("UI_RST: Button still disabled after 30s — "
+                                "trying NavController direct navigation")
+                    nav_ok = self._frida_navigate_to("remote")
+                    if nav_ok:
+                        log.info("UI_RST: NavController navigation dispatched"
+                                 " — waiting for screen...")
                         time.sleep(5)
                     else:
-                        log.warning("UI_RST: All Frida click methods "
-                                    "failed — trying enable-then-tap")
-                        self._frida_enable_view("remoteStartButton")
-                        time.sleep(1)
-                        subprocess.run(
-                            ["adb", "shell", "su", "-c",
-                             f"input tap {cx} {cy}"],
-                            capture_output=True, timeout=10)
-                        time.sleep(5)
+                        log.warning("UI_RST: NavController failed — "
+                                    "trying Frida performClick")
+                        frida_ok = self._frida_click_view("remoteStartButton")
+                        if frida_ok:
+                            log.info("UI_RST: Frida click dispatched — "
+                                     "waiting for bottom sheet...")
+                            time.sleep(5)
+                        else:
+                            log.warning("UI_RST: All Frida click methods "
+                                        "failed — trying enable-then-tap")
+                            self._frida_enable_view("remoteStartButton")
+                            time.sleep(1)
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {cx} {cy}"],
+                                capture_output=True, timeout=10)
+                            time.sleep(5)
 
             # Check if we landed in Chrome (disabled button tap opens
             # Owner's Manual in Chrome instead of the remote start
