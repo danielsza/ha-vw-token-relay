@@ -2374,11 +2374,61 @@ img{{max-width:100%;height:auto}}</style></head>
                      (am_result.stderr or "")[:200])
             time.sleep(5)
 
-            # Check foreground right after Garage launch
+            # Check foreground right after Garage launch — MUST be VW app
             self._wake_screen()
-            fg_garage = self._get_foreground_activity()
-            log.info("UI_RST: After Garage launch, foreground: %s",
-                     (fg_garage or "?")[:80])
+            vw_in_fg = False
+            for fg_try in range(4):
+                fg_garage = self._get_foreground_activity()
+                log.info("UI_RST: After Garage launch, foreground: %s",
+                         (fg_garage or "?")[:80])
+                if fg_garage and VW_PACKAGE in fg_garage:
+                    vw_in_fg = True
+                    break
+                log.warning("UI_RST: VW app NOT in foreground (attempt "
+                            "%d/4) — relaunching...", fg_try + 1)
+                # Try launching again
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-W", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities."
+                     "ForcedGarageActivity"],
+                    capture_output=True, timeout=30, text=True)
+                time.sleep(3)
+                self._wake_screen()
+
+            if not vw_in_fg:
+                # Last resort: force-stop competing app and try once more
+                log.warning("UI_RST: VW app still not in foreground "
+                            "after 4 tries — force-stopping competing "
+                            "app and retrying")
+                fg_final = self._get_foreground_activity() or ""
+                # Extract package name from activity string
+                if "/" in fg_final:
+                    competing_pkg = fg_final.split("/")[0].strip()
+                    # Only stop common competing packages
+                    if competing_pkg and "." in competing_pkg:
+                        subprocess.run(
+                            ["adb", "shell", "am", "force-stop",
+                             competing_pkg],
+                            capture_output=True, timeout=10)
+                        time.sleep(1)
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-W", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities."
+                     "ForcedGarageActivity"],
+                    capture_output=True, timeout=30, text=True)
+                time.sleep(5)
+                fg_garage = self._get_foreground_activity()
+                if fg_garage and VW_PACKAGE in fg_garage:
+                    vw_in_fg = True
+                    log.info("UI_RST: VW app now in foreground after "
+                             "force-stop of competing app")
+                else:
+                    log.error("UI_RST: CANNOT bring VW app to "
+                              "foreground — aborting remote start")
+                    return {"status": "error",
+                            "message": "VW app failed to come to "
+                                       "foreground"}
+
             self._dismiss_system_dialogs()
 
             # Find and tap Atlas in the Garage
