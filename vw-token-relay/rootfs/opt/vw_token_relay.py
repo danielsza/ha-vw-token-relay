@@ -2538,6 +2538,53 @@ img{{max-width:100%;height:auto}}</style></head>
                 self._dismiss_vw_interstitials()
                 self._dismiss_vw_alert_dialogs()
 
+                # On attempt 0, check the button state BEFORE scrolling.
+                # The swipe can disrupt the button's enabled state.
+                if attempt == 0:
+                    pre_xml = self._dump_ui_xml()
+                    if pre_xml:
+                        pre_btn = self._find_ui_elements(
+                            pre_xml, resource_id="remoteStartButton")
+                        if pre_btn and pre_btn[0][3].get(
+                                "enabled") == "true":
+                            log.info("UI_RST: Button already enabled "
+                                     "pre-scroll — skipping scroll")
+                            xml = pre_xml
+                            # Also dismiss any banner first
+                            mc_pre = self._find_ui_elements(
+                                pre_xml, resource_id="closeButton")
+                            if mc_pre:
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     f"input tap {mc_pre[0][0]} "
+                                     f"{mc_pre[0][1]}"],
+                                    capture_output=True, timeout=10)
+                                time.sleep(3)
+                                xml = self._dump_ui_xml() or xml
+                            # Skip the scroll — go straight to search
+                            # (xml is set, search loop below will find it)
+                            # Save XML for debugging
+                            try:
+                                with open(
+                                    "/share/debug_xml_attempt0.txt",
+                                    "w") as f:
+                                    f.write(xml)
+                            except Exception:
+                                pass
+                            self._screencap()
+                            # Jump to search
+                            for rid in search_rids:
+                                elems = self._find_ui_elements(
+                                    xml, resource_id=rid)
+                                if elems:
+                                    log.info("UI_RST: Found button via "
+                                             "resource_id=%s (pre-scroll, "
+                                             "attempt %d)", rid, attempt)
+                                    break
+                            if elems:
+                                break
+                            # Not found by rid — fall through to scroll
+
                 # Scroll UP to expand the collapsing AppBar toolbar.
                 # The Remote Start button is in homeCommandsView which
                 # gets compressed to 36px when the toolbar is collapsed.
@@ -2643,38 +2690,67 @@ img{{max-width:100%;height:auto}}</style></head>
             cx, cy = elems[0][0], elems[0][1]
             btn_attrs = elems[0][3]
 
-            # Dismiss the "Scheduled App Maintenance" carousel banner
-            # if present — it may be blocking button enablement.
+            # Dismiss the "Scheduled App Maintenance" / "Special offer"
+            # carousel banner if present — it may be blocking button
+            # enablement.  Dismiss FIRST, then re-check button state.
             maint_close = self._find_ui_elements(
                 xml, resource_id="closeButton")
             if maint_close:
                 mcx, mcy = maint_close[0][0], maint_close[0][1]
-                log.info("UI_RST: Dismissing maintenance banner "
+                log.info("UI_RST: Dismissing maintenance/promo banner "
                          "at (%d,%d)", mcx, mcy)
                 subprocess.run(
                     ["adb", "shell", "su", "-c",
                      f"input tap {mcx} {mcy}"],
                     capture_output=True, timeout=10)
-                time.sleep(3)
+                time.sleep(4)
+                # Re-dump XML after banner dismissal — button may
+                # have become enabled once the overlay is gone.
+                xml_fresh = self._dump_ui_xml()
+                if xml_fresh:
+                    xml = xml_fresh
+                    fresh_btn = self._find_ui_elements(
+                        xml, resource_id="remoteStartButton")
+                    if fresh_btn:
+                        cx, cy = fresh_btn[0][0], fresh_btn[0][1]
+                        btn_attrs = fresh_btn[0][3]
+                        log.info("UI_RST: After banner dismiss — "
+                                 "enabled=%s clickable=%s",
+                                 btn_attrs.get("enabled"),
+                                 btn_attrs.get("clickable"))
 
-            # The VW app marks ALL dashboard command buttons as
-            # enabled="false" but clickable="true". A raw input tap on a
-            # disabled View doesn't reach the onClick listener — Android
-            # discards it.  Use Frida to call performClick() directly,
-            # which bypasses the enabled check and triggers the listener.
+            # The VW app can mark dashboard command buttons as
+            # enabled="false" but clickable="true" while loading vehicle
+            # status.  A raw input tap on a disabled View doesn't reach
+            # the onClick listener — Android discards it and the tap
+            # falls through to the Owner's Manual link behind the button,
+            # opening Chrome.  Wait longer for the button to enable
+            # before resorting to Frida fallbacks.
             button_enabled = btn_attrs.get("enabled") != "false"
 
             if not button_enabled:
                 log.info("UI_RST: Button disabled (clickable=%s) — "
-                         "waiting up to 15s for enable...",
+                         "waiting up to 30s for enable...",
                          btn_attrs.get("clickable"))
 
-                # Brief wait in case the button enables itself
-                for wait_i in range(3):
+                # Wait up to 30s for the button to enable itself
+                # (the app polls vehicle status and enables the button
+                # once it confirms remote start is available).
+                for wait_i in range(6):
                     time.sleep(5)
                     xml = self._dump_ui_xml()
                     if not xml:
                         continue
+                    # Also dismiss any banner that reappeared
+                    mc2 = self._find_ui_elements(
+                        xml, resource_id="closeButton")
+                    if mc2:
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input tap {mc2[0][0]} {mc2[0][1]}"],
+                            capture_output=True, timeout=10)
+                        time.sleep(3)
+                        xml = self._dump_ui_xml() or xml
                     check = self._find_ui_elements(
                         xml, resource_id="remoteStartButton")
                     if check and check[0][3].get("enabled") == "true":
@@ -2694,18 +2770,15 @@ img{{max-width:100%;height:auto}}</style></head>
                     capture_output=True, timeout=10)
                 time.sleep(5)
             else:
-                # Button still disabled — try direct NavController
-                # navigation to the remote start destination, bypassing
-                # the button's disabled-state routing to Car Finder.
-                log.warning("UI_RST: Button disabled — trying "
-                            "NavController direct navigation")
+                # Button still disabled after 30s — try Frida fallbacks.
+                log.warning("UI_RST: Button still disabled after 30s — "
+                            "trying NavController direct navigation")
                 nav_ok = self._frida_navigate_to("remote")
                 if nav_ok:
                     log.info("UI_RST: NavController navigation dispatched"
                              " — waiting for screen...")
                     time.sleep(5)
                 else:
-                    # Fallback: Frida performClick (may go to Car Finder)
                     log.warning("UI_RST: NavController failed — "
                                 "trying Frida performClick")
                     frida_ok = self._frida_click_view("remoteStartButton")
@@ -2714,7 +2787,6 @@ img{{max-width:100%;height:auto}}</style></head>
                                  "waiting for bottom sheet...")
                         time.sleep(5)
                     else:
-                        # Try enabling the view via Frida then tapping
                         log.warning("UI_RST: All Frida click methods "
                                     "failed — trying enable-then-tap")
                         self._frida_enable_view("remoteStartButton")
@@ -2724,6 +2796,37 @@ img{{max-width:100%;height:auto}}</style></head>
                              f"input tap {cx} {cy}"],
                             capture_output=True, timeout=10)
                         time.sleep(5)
+
+            # Check if we landed in Chrome (disabled button tap opens
+            # Owner's Manual in Chrome instead of the remote start
+            # bottom sheet).  If so, go back to the VW app and fail
+            # with a clear error rather than parsing Chrome content.
+            fg_after = self._get_foreground_activity()
+            if fg_after and "chrome" in fg_after.lower():
+                log.warning("UI_RST: Landed in Chrome (Owner's Manual) "
+                            "— disabled button tap fell through. "
+                            "Going back to VW app.")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c", "input keyevent BACK"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+                # Re-launch VW app
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-W", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
+                    capture_output=True, timeout=30)
+                time.sleep(3)
+                self._screencap()
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                    json.dumps({
+                        "status": "error",
+                        "msg": "Remote start button was disabled — "
+                               "the vehicle may need to be locked "
+                               "first, or the app needs more time "
+                               "to load vehicle status."}),
+                    retain=False)
+                return False
 
             # Take a screenshot for debugging
             self._screencap()
