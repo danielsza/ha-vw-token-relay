@@ -2538,87 +2538,78 @@ img{{max-width:100%;height:auto}}</style></head>
                 self._dismiss_vw_interstitials()
                 self._dismiss_vw_alert_dialogs()
 
-                # On attempt 0, check the button state BEFORE scrolling.
-                # The swipe can disrupt the button's enabled state.
-                if attempt == 0:
-                    pre_xml = self._dump_ui_xml()
-                    if pre_xml:
-                        pre_btn = self._find_ui_elements(
-                            pre_xml, resource_id="remoteStartButton")
-                        if pre_btn and pre_btn[0][3].get(
-                                "enabled") == "true":
-                            log.info("UI_RST: Button already enabled "
-                                     "pre-scroll — skipping scroll")
+                # Check the button state BEFORE scrolling on every attempt.
+                # CRITICAL: scrolling (input swipe) causes the VW app to
+                # re-fetch vehicle status, which temporarily disables the
+                # remoteStartButton. The button can stay disabled for 30+
+                # seconds after a scroll. So we MUST check first and skip
+                # the scroll if the button is already visible.
+                skip_scroll = False
+                pre_xml = self._dump_ui_xml()
+                if pre_xml:
+                    pre_btn = self._find_ui_elements(
+                        pre_xml, resource_id="remoteStartButton")
+                    if pre_btn:
+                        btn_enabled = pre_btn[0][3].get("enabled")
+                        btn_bounds = pre_btn[0][3].get("bounds", "")
+                        log.info("UI_RST: Pre-scroll check — button found, "
+                                 "enabled=%s bounds=%s (attempt %d)",
+                                 btn_enabled, btn_bounds, attempt)
+                        if btn_enabled == "true":
+                            log.info("UI_RST: Button ENABLED pre-scroll — "
+                                     "skipping scroll to avoid disabling it")
+                            skip_scroll = True
                             xml = pre_xml
-                            # Also dismiss any banner first
-                            mc_pre = self._find_ui_elements(
-                                pre_xml, resource_id="closeButton")
-                            if mc_pre:
-                                subprocess.run(
-                                    ["adb", "shell", "su", "-c",
-                                     f"input tap {mc_pre[0][0]} "
-                                     f"{mc_pre[0][1]}"],
-                                    capture_output=True, timeout=10)
-                                time.sleep(3)
-                                xml = self._dump_ui_xml() or xml
-                            # Skip the scroll — go straight to search
-                            # (xml is set, search loop below will find it)
-                            # Save XML for debugging
-                            try:
-                                with open(
-                                    "/share/debug_xml_attempt0.txt",
-                                    "w") as f:
-                                    f.write(xml)
-                            except Exception:
-                                pass
-                            self._screencap()
-                            # Jump to search
-                            for rid in search_rids:
-                                elems = self._find_ui_elements(
-                                    xml, resource_id=rid)
-                                if elems:
-                                    log.info("UI_RST: Found button via "
-                                             "resource_id=%s (pre-scroll, "
-                                             "attempt %d)", rid, attempt)
-                                    break
-                            if elems:
-                                break
-                            # Not found by rid — fall through to scroll
+                        else:
+                            # Button found but disabled — scrolling would
+                            # make it worse. Skip scroll and wait instead.
+                            log.info("UI_RST: Button disabled pre-scroll — "
+                                     "skipping scroll (scroll disables it), "
+                                     "will wait for enable")
+                            skip_scroll = True
+                            xml = pre_xml
+                    else:
+                        log.info("UI_RST: Pre-scroll check — button NOT "
+                                 "found in XML (attempt %d), will scroll",
+                                 attempt)
+                else:
+                    log.warning("UI_RST: Pre-scroll XML dump failed "
+                                "(attempt %d)", attempt)
 
-                # Scroll UP to expand the collapsing AppBar toolbar.
-                # The Remote Start button is in homeCommandsView which
-                # gets compressed to 36px when the toolbar is collapsed.
-                # Swipe DOWN on screen = scroll content UP = expand toolbar.
-                log.info("UI_RST: Scrolling up to expand toolbar "
-                         "(attempt %d)...", attempt)
-                subprocess.run(
-                    ["adb", "shell", "su", "-c",
-                     "input swipe 360 300 360 1000 500"],
-                    capture_output=True, timeout=10)
-                time.sleep(2)
-                # Do it twice for good measure (slow phone)
-                subprocess.run(
-                    ["adb", "shell", "su", "-c",
-                     "input swipe 360 300 360 1000 500"],
-                    capture_output=True, timeout=10)
-                time.sleep(2)
-
-                if attempt >= 3:
-                    # On later attempts, try scrolling down instead
-                    log.info("UI_RST: Scrolling down (attempt %d)...", attempt)
+                if not skip_scroll:
+                    # Scroll UP to expand the collapsing AppBar toolbar.
+                    # Only do this when the button is not in the XML at all
+                    # (toolbar is collapsed and hiding the commands area).
+                    log.info("UI_RST: Scrolling up to expand toolbar "
+                             "(attempt %d)...", attempt)
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
-                         "input swipe 360 900 360 400 300"],
+                         "input swipe 360 300 360 1000 500"],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 360 300 360 1000 500"],
                         capture_output=True, timeout=10)
                     time.sleep(2)
 
-                xml = self._dump_ui_xml()
-                if not xml:
-                    log.error("UI_RST: Cannot get UI XML (attempt %d)", attempt)
-                    time.sleep(2)
-                    continue
+                    if attempt >= 3:
+                        log.info("UI_RST: Scrolling down (attempt %d)...",
+                                 attempt)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input swipe 360 900 360 400 300"],
+                            capture_output=True, timeout=10)
+                        time.sleep(2)
 
-                # On every attempt, save XML for debugging
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        log.error("UI_RST: Cannot get UI XML (attempt %d)",
+                                  attempt)
+                        time.sleep(2)
+                        continue
+
+                # Save XML for debugging
                 try:
                     with open(f"/share/debug_xml_attempt{attempt}.txt",
                               "w") as f:
@@ -2629,7 +2620,6 @@ img{{max-width:100%;height:auto}}</style></head>
                 except Exception:
                     pass
 
-                # Take screencap + copy with attempt number for debugging
                 self._screencap()
                 try:
                     import shutil
