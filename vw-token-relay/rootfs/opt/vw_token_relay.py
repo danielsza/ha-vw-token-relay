@@ -1212,13 +1212,56 @@ img{{max-width:100%;height:auto}}</style></head>
     def _api_request(self, method, url, body=None, vid=None, timeout=15, allow_pif_fix=True):
         """Make an API request with auto-retry on auth or server failure.
 
-        Retry strategy (two levels):
+        Retry strategy (three levels):
+          Level 0: If no token available, wait up to 10 minutes for one to
+                   appear (checking every 30s). This handles the case where
+                   a command arrives during a token outage (e.g. Frida recovery).
+                   Publishes a "queued" status so the caller knows to wait.
           Level 1: On 401/403 → wake the VW app for fresh tokens, retry once.
           Level 2: If Level 1 fails → trigger PIF update + reboot, wait for
                    phone to come back and new tokens, retry once more.
         On 5xx: retries once after a short delay.
         Returns (response_body_str, None) on success, (None, error_dict) on failure.
         """
+        # ── Level 0: Wait for token if none available ──
+        token = self._get_valid_token(vid)
+        if not token:
+            cmd_name = url.rsplit("/", 2)[-2] if "/" in url else "api"
+            log.info("CMD QUEUE: No valid token for %s — queuing, will retry up to 10 min...", cmd_name)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                json.dumps({"status": "queued", "cmd": cmd_name, "reason": "waiting_for_token",
+                            "max_wait_min": 10}),
+            )
+            # Wake app to trigger token refresh
+            self._wake_app()
+            # Poll for token every 30s, up to 10 minutes
+            wait_start = time.time()
+            max_wait = 600  # 10 minutes
+            while time.time() - wait_start < max_wait:
+                time.sleep(30)
+                token = self._get_valid_token(vid)
+                if token:
+                    elapsed = int(time.time() - wait_start)
+                    log.info("CMD QUEUE: Token available after %ds — executing %s", elapsed, cmd_name)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                        json.dumps({"status": "executing", "cmd": cmd_name, "waited_s": elapsed}),
+                    )
+                    break
+                # Periodically re-wake to nudge recovery
+                if int(time.time() - wait_start) % 120 == 0:
+                    log.info("CMD QUEUE: Still waiting for token (%.0fs)... re-waking app",
+                             time.time() - wait_start)
+                    self._wake_app()
+            if not token:
+                log.error("CMD QUEUE: No token after 10 min wait — giving up on %s", cmd_name)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                    json.dumps({"status": "failed", "cmd": cmd_name, "reason": "token_timeout_10min"}),
+                )
+                return None, {"error": "no_valid_token", "msg": "Token expired — no fresh token after 10 min wait"}
+
         max_retries = 1
         for attempt in range(max_retries + 1):
             token = self._get_valid_token(vid)
@@ -2250,6 +2293,31 @@ img{{max-width:100%;height:auto}}</style></head>
         vid = vehicle_id
         action = "Stop" if stop else "Start"
         log.info("═══ UI REMOTE %s ═══ vehicle=%s", action.upper(), vid)
+
+        # ── Wait for tokens if relay is recovering ──
+        # UI remote start needs the app and Frida to be healthy. If no tokens
+        # are available, the relay is likely mid-recovery. Wait up to 10 min
+        # for tokens to come back before driving the UI.
+        if not self._tokens_are_fresh():
+            log.info("UI_RST: No fresh tokens — queuing command, waiting up to 10 min...")
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                json.dumps({"status": "queued", "reason": "waiting_for_token",
+                            "max_wait_min": 10}), retain=False)
+            self._wake_app()
+            wait_start = time.time()
+            while time.time() - wait_start < 600:
+                time.sleep(30)
+                if self._tokens_are_fresh():
+                    elapsed = int(time.time() - wait_start)
+                    log.info("UI_RST: Tokens available after %ds — proceeding", elapsed)
+                    break
+                if int(time.time() - wait_start) % 120 == 0:
+                    self._wake_app()
+            if not self._tokens_are_fresh():
+                log.error("UI_RST: No tokens after 10 min — aborting")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                    json.dumps({"status": "failed", "reason": "token_timeout_10min"}), retain=False)
+                return False
 
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
             json.dumps({"status": f"ui_{action.lower()}_initiated"}), retain=False)
