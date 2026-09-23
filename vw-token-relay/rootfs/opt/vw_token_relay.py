@@ -2535,16 +2535,12 @@ img{{max-width:100%;height:auto}}</style></head>
                     self._wake_screen()
                     self._dismiss_system_dialogs()
 
-                self._dismiss_vw_interstitials()
-                self._dismiss_vw_alert_dialogs()
-
-                # Check the button state BEFORE scrolling on every attempt.
-                # CRITICAL: scrolling (input swipe) causes the VW app to
-                # re-fetch vehicle status, which temporarily disables the
-                # remoteStartButton. The button can stay disabled for 30+
-                # seconds after a scroll. So we MUST check first and skip
-                # the scroll if the button is already visible.
+                # CRITICAL: Check for the button BEFORE any UI interaction
+                # (interstitial/dialog dismissals, scrolling) which can
+                # collapse the toolbar and trigger a vehicle status re-fetch
+                # that disables the button for 30+ seconds.
                 skip_scroll = False
+                early_found = False
                 pre_xml = self._dump_ui_xml()
                 if pre_xml:
                     pre_btn = self._find_ui_elements(
@@ -2552,29 +2548,58 @@ img{{max-width:100%;height:auto}}</style></head>
                     if pre_btn:
                         btn_enabled = pre_btn[0][3].get("enabled")
                         btn_bounds = pre_btn[0][3].get("bounds", "")
-                        log.info("UI_RST: Pre-scroll check — button found, "
+                        log.info("UI_RST: Early check — button found, "
                                  "enabled=%s bounds=%s (attempt %d)",
                                  btn_enabled, btn_bounds, attempt)
                         if btn_enabled == "true":
-                            log.info("UI_RST: Button ENABLED pre-scroll — "
-                                     "skipping scroll to avoid disabling it")
-                            skip_scroll = True
+                            log.info("UI_RST: Button ENABLED — skipping "
+                                     "interstitials/scroll, clicking now")
+                            # Dismiss any promo banner that overlaps
+                            mc_pre = self._find_ui_elements(
+                                pre_xml, resource_id="closeButton")
+                            if mc_pre:
+                                log.info("UI_RST: Dismissing banner before "
+                                         "click at (%d,%d)",
+                                         mc_pre[0][0], mc_pre[0][1])
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     f"input tap {mc_pre[0][0]} "
+                                     f"{mc_pre[0][1]}"],
+                                    capture_output=True, timeout=10)
+                                time.sleep(4)
+                                # Re-dump to get fresh button position
+                                pre_xml = self._dump_ui_xml() or pre_xml
+                                pre_btn = self._find_ui_elements(
+                                    pre_xml, resource_id="remoteStartButton")
                             xml = pre_xml
+                            skip_scroll = True
+                            early_found = True
+                            elems = pre_btn
+                            if elems:
+                                log.info("UI_RST: Found button via "
+                                         "resource_id=remoteStartButton "
+                                         "(early check, attempt %d)", attempt)
+                                break  # skip to button-found handling
                         else:
-                            # Button found but disabled — scrolling would
-                            # make it worse. Skip scroll and wait instead.
-                            log.info("UI_RST: Button disabled pre-scroll — "
-                                     "skipping scroll (scroll disables it), "
-                                     "will wait for enable")
+                            # Button found but disabled — scrolling makes
+                            # it worse, skip scroll and wait for enable
+                            log.info("UI_RST: Button disabled early check — "
+                                     "skipping scroll (scroll disables it)")
                             skip_scroll = True
                             xml = pre_xml
                     else:
-                        log.info("UI_RST: Pre-scroll check — button NOT "
-                                 "found in XML (attempt %d), will scroll",
-                                 attempt)
+                        log.info("UI_RST: Early check — button NOT found "
+                                 "in XML (attempt %d)", attempt)
                 else:
-                    log.warning("UI_RST: Pre-scroll XML dump failed "
+                    log.warning("UI_RST: Early XML dump failed "
                                 "(attempt %d)", attempt)
+
+                # Only dismiss interstitials/dialogs if we didn't already
+                # find the button enabled (those dismissals can collapse
+                # the toolbar and disrupt button state)
+                if not early_found:
+                    self._dismiss_vw_interstitials()
+                    self._dismiss_vw_alert_dialogs()
 
                 if not skip_scroll:
                     # Scroll UP to expand the collapsing AppBar toolbar.
