@@ -438,6 +438,9 @@ class VWTokenRelay:
         self._pif_reboot_cooldown = None  # prevent reboot loops
         self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
 
+        # Silent-detach recovery tracking
+        self._last_recovery_time = None   # prevents recovery storm on slow phone
+
         # Phone health tracking
         self._phone_down_since = None     # when phone was first detected as down
         self._phone_down_notified = False # whether we already sent "phone down" alert
@@ -6164,14 +6167,24 @@ img{{max-width:100%;height:auto}}</style></head>
             # Android with no detach callback, or Frida internal state corruption).
             # Detect this by checking: session looks alive but no fresh token
             # has been captured in >8 minutes.
+            # IMPORTANT: After a recovery attempt, wait at least 6 minutes
+            # before trying again — the Moto G Pure is slow and needs time
+            # for React Native to init + render vehicle cards + make API calls.
+            # Without this cooldown, repeated force-restarts kill the app before
+            # it can produce a token ("recovery storm").
             elif self.session is not None and self._last_token_time:
                 silent_detach_age = (datetime.now() - self._last_token_time).total_seconds() / 60
-                if silent_detach_age > 8:
+                recovery_cooldown_ok = (
+                    self._last_recovery_time is None
+                    or (datetime.now() - self._last_recovery_time).total_seconds() > 360  # 6 min
+                )
+                if silent_detach_age > 8 and recovery_cooldown_ok:
                     log.warning(
                         "KEEPALIVE: Frida session alive but no fresh token "
                         "in %.0f min — likely silent detach. "
                         "Force-restarting app + reattaching Frida...",
                         silent_detach_age)
+                    self._last_recovery_time = datetime.now()
                     try:
                         # Invalidate the stale session
                         try:
@@ -6192,6 +6205,12 @@ img{{max-width:100%;height:auto}}</style></head>
                                       "will retry next cycle")
                     except Exception as e:
                         log.error("KEEPALIVE: Silent-detach recovery error: %s", e)
+                elif silent_detach_age > 8 and not recovery_cooldown_ok:
+                    cooldown_remaining = 360 - (datetime.now() - self._last_recovery_time).total_seconds()
+                    log.info(
+                        "KEEPALIVE: No fresh token in %.0f min but recovery "
+                        "cooldown active (%.0fs remaining) — waiting for app to produce token...",
+                        silent_detach_age, cooldown_remaining)
 
             with self._lock:
                 needs_refresh = False
