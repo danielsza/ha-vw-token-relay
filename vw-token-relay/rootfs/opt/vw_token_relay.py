@@ -2406,65 +2406,57 @@ img{{max-width:100%;height:auto}}</style></head>
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
-            # ── IMMEDIATE POST-ATLAS BUTTON CHECK ──
-            # Check for the button RIGHT NOW, before any UI interaction
-            # (dialog dismissals, tab checks, wake, screencap) that would
-            # collapse the toolbar and trigger a vehicle status re-fetch.
-            # Manual testing confirmed: 25-30s after tapping Atlas with
-            # NO other interactions, the button is at [35,833][685,945]
-            # with enabled="true".
-            imm_xml = self._dump_ui_xml()
+            # ── BLIND TAP AT KNOWN BUTTON POSITION ──
+            # Even a UI dump (uiautomator) can cause the toolbar to
+            # collapse, so skip all XML checks and directly tap the
+            # known button position. The remoteStartButton is at
+            # [35,833][685,945] center=(360,889) when the toolbar is
+            # expanded. If the button is there and enabled, this tap
+            # opens the bottom sheet. If not, the tap harmlessly hits
+            # the dashboard background and we detect it below.
             imm_btn_clicked = False
-            if imm_xml:
-                imm_btn = self._find_ui_elements(
-                    imm_xml, resource_id="remoteStartButton")
-                if imm_btn:
-                    imm_enabled = imm_btn[0][3].get("enabled")
-                    imm_bounds = imm_btn[0][3].get("bounds", "")
-                    log.info("UI_RST: IMMEDIATE post-Atlas check — "
-                             "button found, enabled=%s bounds=%s",
-                             imm_enabled, imm_bounds)
-                    if imm_enabled == "true":
-                        log.info("UI_RST: Button ENABLED immediately "
-                                 "after Atlas — clicking NOW")
-                        # Dismiss promo banner if present
-                        imm_close = self._find_ui_elements(
-                            imm_xml, resource_id="closeButton")
-                        if imm_close:
-                            log.info("UI_RST: Dismissing banner at "
-                                     "(%d,%d) before immediate click",
-                                     imm_close[0][0], imm_close[0][1])
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 f"input tap {imm_close[0][0]} "
-                                 f"{imm_close[0][1]}"],
-                                capture_output=True, timeout=10)
-                            time.sleep(4)
-                            # Re-dump for fresh button position
-                            imm_xml = self._dump_ui_xml() or imm_xml
-                            imm_btn = self._find_ui_elements(
-                                imm_xml,
-                                resource_id="remoteStartButton")
-                        if imm_btn:
-                            bx, by = imm_btn[0][0], imm_btn[0][1]
-                            log.info("UI_RST: Immediate click at "
-                                     "(%d,%d)", bx, by)
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 f"input tap {bx} {by}"],
-                                capture_output=True, timeout=10)
-                            imm_btn_clicked = True
-                    else:
-                        log.info("UI_RST: IMMEDIATE post-Atlas check — "
-                                 "button disabled, will skip scroll in "
-                                 "retry loop")
+            BLIND_BTN_X, BLIND_BTN_Y = 360, 889
+            log.info("UI_RST: BLIND TAP at known button position "
+                     "(%d,%d) — no UI dump to avoid collapsing toolbar",
+                     BLIND_BTN_X, BLIND_BTN_Y)
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"input tap {BLIND_BTN_X} {BLIND_BTN_Y}"],
+                capture_output=True, timeout=10)
+            time.sleep(5)
+
+            # Check if the blind tap worked — did a bottom sheet appear?
+            blind_xml = self._dump_ui_xml()
+            if blind_xml:
+                # Look for bottom sheet Start/Stop button
+                bs_start = self._find_ui_elements(
+                    blind_xml, text="Start")
+                bs_stop_btn = self._find_ui_elements(
+                    blind_xml, resource_id="stopEngineButton")
+                # Also check for the SPIN dialog or confirmation
+                bs_any = (bs_start or bs_stop_btn or
+                          self._find_ui_elements(
+                              blind_xml, text="Enter your") or
+                          self._find_ui_elements(
+                              blind_xml, resource_id="spinEditText"))
+                if bs_any:
+                    log.info("UI_RST: BLIND TAP opened bottom sheet! "
+                             "Skipping retry loop.")
+                    imm_btn_clicked = True
                 else:
-                    log.info("UI_RST: IMMEDIATE post-Atlas check — "
-                             "button NOT in XML (toolbar may already "
-                             "be collapsed)")
-            else:
-                log.warning("UI_RST: IMMEDIATE post-Atlas XML dump "
-                            "failed")
+                    # Check if we landed in Chrome (disabled button)
+                    blind_fg = self._get_foreground_activity()
+                    if blind_fg and "chrome" in blind_fg.lower():
+                        log.info("UI_RST: BLIND TAP hit disabled button "
+                                 "(Chrome opened). Going back.")
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input keyevent BACK"],
+                            capture_output=True, timeout=10)
+                        time.sleep(2)
+                    else:
+                        log.info("UI_RST: BLIND TAP did not open "
+                                 "bottom sheet — will try retry loop")
 
             if imm_btn_clicked:
                 # Skip all the dialog/tab/retry machinery — go straight
