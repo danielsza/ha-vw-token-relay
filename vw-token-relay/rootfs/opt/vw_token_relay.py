@@ -3462,8 +3462,8 @@ img{{max-width:100%;height:auto}}</style></head>
                 if "EntryAc" in fg:
                     log.info("NAV: On EntryActivity (splash screen) — "
                              "waiting for transition...")
-                    for _wait in range(6):          # up to ~18s
-                        time.sleep(3)
+                    for _wait in range(10):         # up to ~40s
+                        time.sleep(4)
                         fg2 = self._get_foreground_activity() or ""
                         if "ForcedGarageActivity" in fg2 or \
                            "MainActivity" in fg2:
@@ -3482,10 +3482,42 @@ img{{max-width:100%;height:auto}}</style></head>
                                      fg2.split("/")[-1][:30])
                             return self._navigate_to_vehicle(
                                 target_vid=target_vid)
-                    # If we get here, splash didn't transition — force
-                    # restart the app as a last resort
-                    log.warning("NAV: EntryActivity stuck — "
-                                "force-restarting app")
+                        # Every 3rd check, dump UI to see if there's
+                        # a dialog/button we need to tap
+                        if _wait % 3 == 2:
+                            entry_xml = self._dump_ui_xml()
+                            if entry_xml:
+                                self._dismiss_vw_alert_dialogs(
+                                    xml=entry_xml)
+                                self._dismiss_vw_interstitials(
+                                    xml=entry_xml)
+                                # Look for common buttons
+                                for btn_text in ("OK", "Continue",
+                                                 "Accept", "Update",
+                                                 "Later", "Skip",
+                                                 "Not now", "Close"):
+                                    btns = self._find_ui_elements(
+                                        entry_xml, text=btn_text)
+                                    if btns:
+                                        bx, by = btns[0][0], btns[0][1]
+                                        log.info(
+                                            "NAV: Entry screen has "
+                                            "'%s' button at (%d,%d) "
+                                            "— tapping", btn_text,
+                                            bx, by)
+                                        self._adb_tap(
+                                            bx, by,
+                                            label="NAV-entry-btn")
+                                        time.sleep(3)
+                                        break
+                                # Take a screencap for diagnostics
+                                log.info("NAV: Entry screen UI check "
+                                         "(attempt %d)", _wait + 1)
+                                self._screencap()
+                    else:
+                        # Loop completed without break — splash stuck
+                        log.warning("NAV: EntryActivity stuck — "
+                                    "force-restarting app")
                     subprocess.run(
                         ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                         capture_output=True, timeout=10)
