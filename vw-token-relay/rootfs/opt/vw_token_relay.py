@@ -2460,7 +2460,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(30)  # Long wait for dashboard to fully load
+                    time.sleep(12)  # Shorter wait — 30s caused toolbar to collapse
                 else:
                     log.warning("UI_RST: Atlas not found in Garage")
                     # Try tapping at known Atlas position anyway
@@ -2469,7 +2469,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         ["adb", "shell", "su", "-c",
                          "input tap 342 635"],
                         capture_output=True, timeout=10)
-                    time.sleep(30)
+                    time.sleep(12)
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
@@ -2484,35 +2484,36 @@ img{{max-width:100%;height:auto}}</style></head>
             imm_btn_clicked = False
             blind_xml = None
             BLIND_BTN_X, BLIND_BTN_Y = 360, 889
-            log.info("UI_RST: BLIND TAP at known button position "
-                     "(%d,%d) — no UI dump to avoid collapsing toolbar",
-                     BLIND_BTN_X, BLIND_BTN_Y)
-            subprocess.run(
-                ["adb", "shell", "su", "-c",
-                 f"input tap {BLIND_BTN_X} {BLIND_BTN_Y}"],
-                capture_output=True, timeout=10)
-            time.sleep(5)
 
-            # Check if the blind tap worked — did a bottom sheet appear?
-            blind_xml = self._dump_ui_xml()
-            if blind_xml:
-                # Look for bottom sheet Start/Stop button
-                bs_start = self._find_ui_elements(
-                    blind_xml, text="Start")
-                bs_stop_btn = self._find_ui_elements(
-                    blind_xml, resource_id="stopEngineButton")
-                # Also check for the SPIN dialog or confirmation
-                bs_any = (bs_start or bs_stop_btn or
-                          self._find_ui_elements(
-                              blind_xml, text="Enter your") or
-                          self._find_ui_elements(
-                              blind_xml, resource_id="spinEditText"))
-                if bs_any:
-                    log.info("UI_RST: BLIND TAP opened bottom sheet! "
-                             "Skipping retry loop.")
-                    imm_btn_clicked = True
-                else:
-                    # Check if we landed in Chrome (disabled button)
+            # Try blind tap up to 3 times with scroll-up between
+            for blind_attempt in range(3):
+                log.info("UI_RST: BLIND TAP attempt %d/3 at (%d,%d)",
+                         blind_attempt + 1, BLIND_BTN_X, BLIND_BTN_Y)
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"input tap {BLIND_BTN_X} {BLIND_BTN_Y}"],
+                    capture_output=True, timeout=10)
+                time.sleep(5)
+
+                # Check if the blind tap worked
+                blind_xml = self._dump_ui_xml()
+                if blind_xml:
+                    bs_start = self._find_ui_elements(
+                        blind_xml, text="Start")
+                    bs_stop_btn = self._find_ui_elements(
+                        blind_xml, resource_id="stopEngineButton")
+                    bs_any = (bs_start or bs_stop_btn or
+                              self._find_ui_elements(
+                                  blind_xml, text="Enter your") or
+                              self._find_ui_elements(
+                                  blind_xml, resource_id="spinEditText"))
+                    if bs_any:
+                        log.info("UI_RST: BLIND TAP opened bottom sheet! "
+                                 "(attempt %d)", blind_attempt + 1)
+                        imm_btn_clicked = True
+                        break
+
+                    # Check if Chrome opened (disabled button)
                     blind_fg = self._get_foreground_activity()
                     if blind_fg and "chrome" in blind_fg.lower():
                         log.info("UI_RST: BLIND TAP hit disabled button "
@@ -2522,9 +2523,23 @@ img{{max-width:100%;height:auto}}</style></head>
                              "input keyevent BACK"],
                             capture_output=True, timeout=10)
                         time.sleep(2)
-                    else:
-                        log.info("UI_RST: BLIND TAP did not open "
-                                 "bottom sheet — will try retry loop")
+                        # Don't retry — button is disabled
+                        break
+
+                if blind_attempt < 2 and not imm_btn_clicked:
+                    # Scroll up to re-expand the toolbar before retry
+                    log.info("UI_RST: Scrolling up to re-expand toolbar "
+                             "before blind tap retry...")
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 360 400 360 900 300"],
+                        capture_output=True, timeout=10)
+                    time.sleep(3)
+
+            if not imm_btn_clicked:
+                log.info("UI_RST: BLIND TAP did not open "
+                         "bottom sheet after 3 attempts — "
+                         "will try retry loop")
 
             if imm_btn_clicked:
                 # Skip all the dialog/tab/retry machinery — go straight
