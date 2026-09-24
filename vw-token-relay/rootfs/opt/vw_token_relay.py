@@ -2292,6 +2292,23 @@ img{{max-width:100%;height:auto}}</style></head>
         """
         vid = vehicle_id
         action = "Stop" if stop else "Start"
+
+        # Prevent concurrent UI remote start flows — each one drives
+        # the phone's UI and they'd collide if overlapping.
+        if not hasattr(self, '_ui_rst_lock'):
+            self._ui_rst_lock = threading.Lock()
+        if not self._ui_rst_lock.acquire(blocking=False):
+            log.warning("UI_RST: Another UI remote start flow is "
+                        "already running — ignoring duplicate")
+            return False
+        try:
+            return self._ui_remote_start_flow_inner(
+                vid, stop, dry_run, action)
+        finally:
+            self._ui_rst_lock.release()
+
+    def _ui_remote_start_flow_inner(self, vid, stop, dry_run, action):
+        """Inner implementation (called under _ui_rst_lock)."""
         log.info("═══ UI REMOTE %s ═══ vehicle=%s", action.upper(), vid)
 
         # ── Wait for tokens if relay is recovering ──
