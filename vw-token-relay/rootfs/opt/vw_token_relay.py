@@ -3459,9 +3459,11 @@ img{{max-width:100%;height:auto}}</style></head>
                 # It transitions to ForcedGarageActivity or MainActivity
                 # on its own.  Pressing BACK kills it and creates an
                 # infinite relaunch loop.  Wait for it to finish.
-                if "EntryAc" in fg:
-                    log.info("NAV: On EntryActivity (splash screen) — "
-                             "waiting for transition...")
+                if "EntryAc" in fg or "RoutingActivity" in fg:
+                    act_name = "EntryActivity" if "EntryAc" in fg \
+                        else "RoutingActivity"
+                    log.info("NAV: On %s (startup screen) — "
+                             "waiting for transition...", act_name)
                     for _wait in range(10):         # up to ~40s
                         time.sleep(4)
                         fg2 = self._get_foreground_activity() or ""
