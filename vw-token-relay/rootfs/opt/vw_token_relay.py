@@ -3578,6 +3578,14 @@ img{{max-width:100%;height:auto}}</style></head>
                     time.sleep(8)
                     return True
 
+                # ── AzsCallbackActivity is the OIDC login WebView ──
+                # Leave it alone — it's part of login/token exchange flow
+                if "AzsCall" in fg:
+                    log.info("NAV: On AzsCallbackActivity (login flow) — "
+                             "waiting for login to complete...")
+                    time.sleep(15)
+                    return True
+
                 # ── Other unknown VW activities — press BACK ──
                 log.info("NAV: On unknown VW activity (%s) — pressing BACK",
                          fg.split("/")[-1][:30] if "/" in fg else fg[-30:])
