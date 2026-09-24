@@ -6010,6 +6010,13 @@ img{{max-width:100%;height:auto}}</style></head>
         # Log response keys for debugging
         log.info("TOKEN_RESP: keys=%s len=%d",
                  list(body.keys())[:10], len(body_str))
+        # If error response, log the full error detail
+        if "error" in body:
+            log.warning("TOKEN_RESP ERROR: %s — %s",
+                        body.get("error"),
+                        body.get("error_description",
+                                 body.get("message", "no desc")))
+            log.debug("TOKEN_RESP ERROR full: %s", body_str[:500])
 
         # ── Normalize camelCase → snake_case (VW IDP convention) ──
         key_map = {
