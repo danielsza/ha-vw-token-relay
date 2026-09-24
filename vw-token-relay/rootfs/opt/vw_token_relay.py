@@ -437,6 +437,7 @@ class VWTokenRelay:
         self._last_token_time = None  # set on every fresh token capture
         self._pif_reboot_cooldown = None  # prevent reboot loops
         self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
+        self._entry_stuck_count = 0       # consecutive EntryActivity stuck events
 
         # Silent-detach recovery tracking
         self._last_recovery_time = None   # prevents recovery storm on slow phone
@@ -3471,6 +3472,7 @@ img{{max-width:100%;height:auto}}</style></head>
                            "MainActivity" in fg2:
                             log.info("NAV: Splash transitioned to %s",
                                      fg2.split("/")[-1][:30])
+                            self._entry_stuck_count = 0
                             return self._navigate_to_vehicle(
                                 target_vid=target_vid)
                         if VW_PACKAGE not in fg2:
@@ -3518,8 +3520,32 @@ img{{max-width:100%;height:auto}}</style></head>
                                 self._screencap()
                     else:
                         # Loop completed without break — splash stuck
-                        log.warning("NAV: EntryActivity stuck — "
-                                    "force-restarting app")
+                        self._entry_stuck_count += 1
+                        log.warning(
+                            "NAV: %s stuck (count=%d) — "
+                            "force-restarting app",
+                            act_name, self._entry_stuck_count)
+                        # After 2 consecutive stuck cycles, escalate
+                        # to clearing app data + auto_login
+                        if self._entry_stuck_count >= 2:
+                            log.warning(
+                                "NAV: %s stuck %d times — "
+                                "clearing app data to reset "
+                                "corrupted state",
+                                act_name, self._entry_stuck_count)
+                            subprocess.run(
+                                ["adb", "shell", "pm", "clear",
+                                 VW_PACKAGE],
+                                capture_output=True, timeout=15)
+                            log.info("NAV: App data cleared. "
+                                     "Triggering auto_login...")
+                            self._entry_stuck_count = 0
+                            time.sleep(3)
+                            # Trigger auto_login in background
+                            threading.Thread(
+                                target=self._auto_login,
+                                daemon=True).start()
+                            return True
                     subprocess.run(
                         ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                         capture_output=True, timeout=10)
