@@ -3453,9 +3453,52 @@ img{{max-width:100%;height:auto}}</style></head>
                 time.sleep(4)
                 return True
 
-            # If we're on some other VW activity, press back to try
-            # getting to a known screen
+            # If we're on some other VW activity, handle it
             if VW_PACKAGE in fg and not on_garage and not on_main:
+                # ── EntryActivity is the splash/loading screen ──
+                # It transitions to ForcedGarageActivity or MainActivity
+                # on its own.  Pressing BACK kills it and creates an
+                # infinite relaunch loop.  Wait for it to finish.
+                if "EntryAc" in fg:
+                    log.info("NAV: On EntryActivity (splash screen) — "
+                             "waiting for transition...")
+                    for _wait in range(6):          # up to ~18s
+                        time.sleep(3)
+                        fg2 = self._get_foreground_activity() or ""
+                        if "ForcedGarageActivity" in fg2 or \
+                           "MainActivity" in fg2:
+                            log.info("NAV: Splash transitioned to %s",
+                                     fg2.split("/")[-1][:30])
+                            return self._navigate_to_vehicle(
+                                target_vid=target_vid)
+                        if VW_PACKAGE not in fg2:
+                            # App closed itself — relaunch
+                            log.info("NAV: Splash disappeared — "
+                                     "relaunching app")
+                            break
+                        if "EntryAc" not in fg2:
+                            # Moved to some other activity
+                            log.info("NAV: Splash moved to %s",
+                                     fg2.split("/")[-1][:30])
+                            return self._navigate_to_vehicle(
+                                target_vid=target_vid)
+                    # If we get here, splash didn't transition — force
+                    # restart the app as a last resort
+                    log.warning("NAV: EntryActivity stuck — "
+                                "force-restarting app")
+                    subprocess.run(
+                        ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities."
+                         f"RoutingActivity"],
+                        capture_output=True, timeout=10)
+                    time.sleep(8)
+                    return True
+
+                # ── Other unknown VW activities — press BACK ──
                 log.info("NAV: On unknown VW activity (%s) — pressing BACK",
                          fg.split("/")[-1][:30] if "/" in fg else fg[-30:])
                 subprocess.run(
