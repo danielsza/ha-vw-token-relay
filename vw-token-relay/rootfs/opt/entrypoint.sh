@@ -114,17 +114,11 @@ echo "PIF auto-updater: DISABLED (manual via vw/cmd/update_pif)"
     fi
 ) &
 
-# ── Tiny HTTP file server for screenshots ──
-# Serves /share/ on ingress port so screenshots can be viewed via HA UI
+# ── Web Remote Viewer ──
+# Serves phone remote control UI on ingress port (replaces old VNC + file server)
 mkdir -p /share/vw-relay
-python3 -c "
-import http.server, socketserver, os
-os.chdir('/share')
-handler = http.server.SimpleHTTPRequestHandler
-with socketserver.TCPServer(('0.0.0.0', 8099), handler) as s:
-    s.serve_forever()
-" &
-echo "File server: listening on :8099 (serves /share/)"
+python3 /opt/web_remote.py &
+echo "Web Remote: Phone viewer on :8099 (ingress)"
 
 echo "============================================="
 echo "  VW Token Relay — Starting"
@@ -133,7 +127,7 @@ echo "  MQTT: ${MQTT_HOST}:${MQTT_PORT}"
 echo "  Topic: ${MQTT_TOPIC}"
 echo "  VW Package: ${VW_PACKAGE}"
 echo "  Log Level: ${LOG_LEVEL}"
-echo "  VNC: ${VNC_ENABLED} (port 5900)"
+echo "  Web Remote: :8099 (ingress)"
 echo "============================================="
 
 # Export config for the relay script to pick up
@@ -793,8 +787,8 @@ ensure_phone_ready() {
     # Keep screen on while plugged in (developer setting)
     adb shell "settings put global stay_on_while_plugged_in 3" 2>/dev/null || true
 
-    # Set up VNC server (droidVNC-NG) if enabled
-    setup_vnc
+    # VNC setup removed — replaced by web remote viewer on :8099
+    echo "Phone ready — web remote viewer available via ingress"
 }
 
 # ── Watchdog loop: auto-restart on crash/disconnect ──
