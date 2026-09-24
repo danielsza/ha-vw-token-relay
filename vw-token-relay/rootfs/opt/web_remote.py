@@ -237,7 +237,7 @@ function setStatus(msg, ok) {
 async function sendTap(x, y) {
     setStatus(`Tap ${x},${y}...`, true);
     try {
-        await fetch('/input', {
+        await fetch('input', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action: 'tap', x, y})
@@ -249,7 +249,7 @@ async function sendTap(x, y) {
 async function sendSwipe(x1, y1, x2, y2, dur) {
     setStatus(`Swipe ${x1},${y1} → ${x2},${y2}`, true);
     try {
-        await fetch('/input', {
+        await fetch('input', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action: 'swipe', x1, y1, x2, y2, duration: dur})
@@ -261,7 +261,7 @@ async function sendSwipe(x1, y1, x2, y2, dur) {
 async function sendLongPress(x, y, dur) {
     setStatus(`Long press ${x},${y} (${dur}ms)`, true);
     try {
-        await fetch('/input', {
+        await fetch('input', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action: 'longpress', x, y, duration: dur})
@@ -273,7 +273,7 @@ async function sendLongPress(x, y, dur) {
 async function sendKey(keycode) {
     setStatus(`Key ${keycode}...`, true);
     try {
-        await fetch('/input', {
+        await fetch('input', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action: 'key', keycode})
@@ -285,7 +285,7 @@ async function sendKey(keycode) {
 async function wake() {
     setStatus('Waking screen...', true);
     try {
-        await fetch('/input', {
+        await fetch('input', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action: 'wake'})
@@ -304,7 +304,7 @@ function refreshNow() {
     newImg.onerror = () => {
         setStatus('Screenshot failed', false);
     };
-    newImg.src = '/screenshot?t=' + ts;
+    newImg.src = 'screenshot?t=' + ts;
 }
 
 function startRefresh() {

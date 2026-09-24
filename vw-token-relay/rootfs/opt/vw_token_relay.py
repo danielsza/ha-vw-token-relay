@@ -6309,6 +6309,8 @@ img{{max-width:100%;height:auto}}</style></head>
             log.info("Frida: %s", payload["msg"])
 
         elif msg_type == "token_response":
+            log.info("TOKEN_RESP from URL: %s %s",
+                     payload.get("method", "?"), payload.get("url", "?"))
             self._store_tokens_from_response(payload["body"], payload.get("requestBody"))
             self._publish_tokens()
 
