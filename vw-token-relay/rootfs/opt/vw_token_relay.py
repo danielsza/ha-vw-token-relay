@@ -3498,7 +3498,8 @@ img{{max-width:100%;height:auto}}</style></head>
                                 self._dismiss_vw_interstitials(
                                     xml=entry_xml)
                                 # Look for common buttons
-                                for btn_text in ("OK", "Continue",
+                                for btn_text in ("Log in", "OK",
+                                                 "Continue",
                                                  "Accept", "Update",
                                                  "Later", "Skip",
                                                  "Not now", "Close"):
