@@ -439,6 +439,7 @@ class VWTokenRelay:
         self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
         self._entry_stuck_count = 0       # consecutive EntryActivity stuck events
         self._last_clear_data_time = None # cooldown for pm clear escalation
+        self._login_flow_active = None   # timestamp when AzsCallbackActivity seen
 
         # Silent-detach recovery tracking
         self._last_recovery_time = None   # prevents recovery storm on slow phone
@@ -3579,10 +3580,14 @@ img{{max-width:100%;height:auto}}</style></head>
                     return True
 
                 # ── AzsCallbackActivity is the OIDC login WebView ──
-                # Leave it alone — it's part of login/token exchange flow
+                # Leave it alone — it's part of login/token exchange flow.
+                # Set a flag so the keepalive loop doesn't force-restart
+                # the app while the user is logging in.
                 if "AzsCall" in fg:
+                    self._login_flow_active = datetime.now()
                     log.info("NAV: On AzsCallbackActivity (login flow) — "
-                             "waiting for login to complete...")
+                             "waiting for login to complete (suppressing "
+                             "force-restart for 5 min)...")
                     time.sleep(15)
                     return True
 
@@ -6750,7 +6755,23 @@ img{{max-width:100%;height:auto}}</style></head>
 
                 if self._tokens_are_fresh():
                     no_token_count = 0
+                    self._login_flow_active = None  # login succeeded
                     continue
+
+                # ── Check if login flow is active — don't kill it ──
+                if self._login_flow_active:
+                    login_age = (datetime.now() - self._login_flow_active
+                                 ).total_seconds()
+                    if login_age < 300:  # 5 minutes
+                        log.info("Login flow active (%.0fs ago) — "
+                                 "suppressing force-restart to let "
+                                 "login complete", login_age)
+                        time.sleep(30)
+                        continue
+                    else:
+                        log.warning("Login flow stale (%.0fs ago) — "
+                                    "clearing flag", login_age)
+                        self._login_flow_active = None
 
                 # ── Step 2: force-restart the app + reattach Frida (~35s) ──
                 no_token_count += 1
