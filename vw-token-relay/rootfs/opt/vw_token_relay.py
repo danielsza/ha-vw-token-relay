@@ -438,6 +438,7 @@ class VWTokenRelay:
         self._pif_reboot_cooldown = None  # prevent reboot loops
         self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
         self._entry_stuck_count = 0       # consecutive EntryActivity stuck events
+        self._last_clear_data_time = None # cooldown for pm clear escalation
 
         # Silent-detach recovery tracking
         self._last_recovery_time = None   # prevents recovery storm on slow phone
@@ -3527,25 +3528,44 @@ img{{max-width:100%;height:auto}}</style></head>
                             act_name, self._entry_stuck_count)
                         # After 2 consecutive stuck cycles, escalate
                         # to clearing app data + auto_login
+                        # (with 30-minute cooldown to prevent loops)
                         if self._entry_stuck_count >= 2:
-                            log.warning(
-                                "NAV: %s stuck %d times — "
-                                "clearing app data to reset "
-                                "corrupted state",
-                                act_name, self._entry_stuck_count)
-                            subprocess.run(
-                                ["adb", "shell", "pm", "clear",
-                                 VW_PACKAGE],
-                                capture_output=True, timeout=15)
-                            log.info("NAV: App data cleared. "
-                                     "Triggering auto_login...")
-                            self._entry_stuck_count = 0
-                            time.sleep(3)
-                            # Trigger auto_login in background
-                            threading.Thread(
-                                target=self._auto_login,
-                                daemon=True).start()
-                            return True
+                            now = datetime.now()
+                            cooldown_ok = (
+                                self._last_clear_data_time is None
+                                or (now - self._last_clear_data_time
+                                    ).total_seconds() > 1800)
+                            if cooldown_ok:
+                                log.warning(
+                                    "NAV: %s stuck %d times — "
+                                    "clearing app data to reset "
+                                    "corrupted state",
+                                    act_name,
+                                    self._entry_stuck_count)
+                                subprocess.run(
+                                    ["adb", "shell", "pm", "clear",
+                                     VW_PACKAGE],
+                                    capture_output=True, timeout=15)
+                                self._last_clear_data_time = now
+                                log.info("NAV: App data cleared. "
+                                         "Triggering auto_login...")
+                                self._entry_stuck_count = 0
+                                time.sleep(3)
+                                # Trigger auto_login in background
+                                threading.Thread(
+                                    target=self._auto_login,
+                                    daemon=True).start()
+                                return True
+                            else:
+                                mins_ago = int(
+                                    (now - self._last_clear_data_time
+                                     ).total_seconds() / 60)
+                                log.warning(
+                                    "NAV: %s stuck but clear_data "
+                                    "cooldown active (%dm ago). "
+                                    "Just force-restarting.",
+                                    act_name, mins_ago)
+                                self._entry_stuck_count = 0
                     subprocess.run(
                         ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                         capture_output=True, timeout=10)
@@ -5392,19 +5412,42 @@ img{{max-width:100%;height:auto}}</style></head>
             log.info("AUTO_LOGIN: Waiting 30s for app to load and make API calls...")
             time.sleep(30)
 
-            # Check if we got a fresh token
-            if self.global_token:
-                log.info("AUTO_LOGIN: SUCCESS — got fresh token!")
+            # Check if we got a fresh token (check expiry, not just presence)
+            now = datetime.now()
+            token_fresh = (self.global_expiry and
+                           self.global_expiry > now)
+            if token_fresh:
+                log.info("AUTO_LOGIN: SUCCESS — fresh token! "
+                         "(exp %s)", self.global_expiry.strftime("%H:%M"))
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/auto_login",
-                    json.dumps({"status": "success", "msg": "Fresh token captured"}),
+                    json.dumps({"status": "success",
+                                "msg": "Fresh token captured"}),
                 )
             else:
-                log.warning("AUTO_LOGIN: No token captured yet.")
+                log.warning("AUTO_LOGIN: Token still expired "
+                            "(exp %s). Trying direct IDP refresh...",
+                            self.global_expiry.strftime("%H:%M")
+                            if self.global_expiry else "none")
+                # Try direct refresh with captured code_verifier
+                if self.refresh_token and self.code_verifier:
+                    if self._direct_idp_refresh():
+                        log.info("AUTO_LOGIN: Direct IDP refresh "
+                                 "succeeded!")
+                    else:
+                        log.warning("AUTO_LOGIN: Direct IDP refresh "
+                                    "also failed")
+                elif self.code_verifier:
+                    log.warning("AUTO_LOGIN: Have code_verifier but "
+                                "no refresh_token — can't refresh")
+                else:
+                    log.warning("AUTO_LOGIN: No code_verifier or "
+                                "refresh_token captured")
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/auto_login",
-                    json.dumps({"status": "no_token",
-                                "msg": "Login may have failed — check addon logs"}),
+                    json.dumps({"status": "no_fresh_token",
+                                "msg": "Login completed but token "
+                                       "not refreshed"}),
                 )
 
         except Exception as e:
@@ -5962,7 +6005,11 @@ img{{max-width:100%;height:auto}}</style></head>
         try:
             body = json.loads(body_str)
         except json.JSONDecodeError:
+            log.debug("TOKEN_RESP: not JSON: %s", body_str[:200])
             return
+        # Log response keys for debugging
+        log.info("TOKEN_RESP: keys=%s len=%d",
+                 list(body.keys())[:10], len(body_str))
 
         # ── Normalize camelCase → snake_case (VW IDP convention) ──
         key_map = {
