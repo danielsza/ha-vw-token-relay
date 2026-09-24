@@ -2465,6 +2465,7 @@ img{{max-width:100%;height:auto}}</style></head>
             # opens the bottom sheet. If not, the tap harmlessly hits
             # the dashboard background and we detect it below.
             imm_btn_clicked = False
+            blind_xml = None
             BLIND_BTN_X, BLIND_BTN_Y = 360, 889
             log.info("UI_RST: BLIND TAP at known button position "
                      "(%d,%d) — no UI dump to avoid collapsing toolbar",
@@ -2950,13 +2951,23 @@ img{{max-width:100%;height:auto}}</style></head>
                 return False
 
             # Take a screenshot for debugging
-            self._screencap()
+            if not imm_btn_clicked:
+                self._screencap()
 
             # Step 4: Dismiss any system dialog that appeared
-            self._dismiss_system_dialogs()
+            if not imm_btn_clicked:
+                self._dismiss_system_dialogs()
 
             # Step 5: Look for the bottom sheet with Start/Stop buttons
-            xml = self._dump_ui_xml()
+            # When blind tap already opened the bottom sheet, reuse the
+            # XML from that check — a FRESH dump can collapse the bottom
+            # sheet or cause it to dismiss.
+            if imm_btn_clicked and blind_xml:
+                xml = blind_xml
+                log.info("UI_RST: Reusing blind-tap XML (%d bytes) "
+                         "for bottom sheet search", len(xml))
+            else:
+                xml = self._dump_ui_xml()
             if not xml:
                 log.error("UI_RST: Cannot get UI XML after tapping "
                           "Remote start")
@@ -3021,13 +3032,26 @@ img{{max-width:100%;height:auto}}</style></head>
                     return False
 
             # Look for the action button (Start or Stop)
-            action_elems = self._find_ui_elements(xml, text=action)
+            # First try resource IDs (more specific, avoids substring
+            # matching "Start" inside "Remote start")
+            rid = ("secondCommandTextView" if action == "Start"
+                   else "firstCommandTextView")
+            action_elems = self._find_ui_elements(xml, resource_id=rid)
             if not action_elems:
-                # Try resource IDs from the bottom sheet
-                rid = "secondCommandTextView" if action == "Start" else "firstCommandTextView"
-                action_elems = self._find_ui_elements(xml, resource_id=rid)
+                # Fall back to text search but filter out the dashboard
+                # remoteStartButton (which contains "Remote start" and
+                # sits at Y~889). Bottom sheet buttons are below Y=1000.
+                all_start = self._find_ui_elements(xml, text=action)
+                action_elems = [e for e in all_start if e[1] > 950]
+                if not action_elems and all_start:
+                    # If nothing below Y=950, use whatever we found
+                    log.warning("UI_RST: No '%s' button below Y=950 "
+                                "— using first match at (%d,%d)",
+                                action, all_start[0][0], all_start[0][1])
+                    action_elems = all_start
             if not action_elems:
-                log.error("UI_RST: Cannot find '%s' button in bottom sheet", action)
+                log.error("UI_RST: Cannot find '%s' button in "
+                          "bottom sheet", action)
                 self._screencap()
                 return False
 
