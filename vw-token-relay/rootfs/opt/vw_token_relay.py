@@ -5733,6 +5733,12 @@ img{{max-width:100%;height:auto}}</style></head>
             self._wake_screen()
             time.sleep(1)
 
+            # Stop the VW app from relaunching and stealing focus while we drive
+            # the Settings UI. Re-enabled in the finally block.
+            _adb_cmd(f"pm disable {VW_PACKAGE}")
+            _adb_cmd("input keyevent KEYCODE_HOME")
+            time.sleep(1)
+
             # ── Phase 1: Remove existing Google account ──
             log.info("GOOGLE_REFRESH: Phase 1 — Removing existing Google account")
 
@@ -5743,37 +5749,33 @@ img{{max-width:100%;height:auto}}</style></head>
             if account_check.strip() == "0":
                 log.info("GOOGLE_REFRESH: No Google account to remove, skipping to add")
             else:
-                # Open Accounts settings
-                _adb_cmd("am start -a android.settings.SYNC_SETTINGS")
+                # Open "Passwords & accounts" directly (SYNC_SETTINGS opens the
+                # Google Account hub on Android 12, which has no Remove button).
+                _adb_cmd("am start -n com.android.settings/"
+                         "com.android.settings.Settings\\$AccountDashboardActivity")
                 time.sleep(3)
 
-                # Find and tap "Google" in the accounts list
-                xml = self._dump_ui_xml()
-                elems = self._find_ui_elements(xml, text="Google")
-                if elems:
-                    cx, cy, _, _ = elems[0]
-                    _tap(cx, cy, "Google account entry")
-                else:
-                    log.warning("GOOGLE_REFRESH: 'Google' not found in accounts, trying text search")
-                    # Try content-desc
-                    elems = self._find_ui_elements(xml, content_desc="Google")
-                    if elems:
-                        cx, cy, _, _ = elems[0]
-                        _tap(cx, cy, "Google account (content-desc)")
-                    else:
-                        log.warning("GOOGLE_REFRESH: Falling back to known position for Google entry")
-                        _tap(360, 400, "Google account (fallback)")
-                time.sleep(2)
-
-                # Now we should see the account email — tap it
+                # Tap the account row (email under "Accounts for Owner"). There can
+                # be a matching email in the Passwords section higher up, so choose
+                # the LOWEST matching row (the accounts section is below passwords).
                 xml = self._dump_ui_xml()
                 elems = self._find_ui_elements(xml, text=self.google_email)
                 if elems:
-                    cx, cy, _, _ = elems[0]
+                    elems.sort(key=lambda e: e[1])  # by cy ascending
+                    cx, cy, _, _ = elems[-1]
                     _tap(cx, cy, f"account {self.google_email}")
                 else:
-                    log.info("GOOGLE_REFRESH: Email not found in UI, tapping first item")
-                    _tap(360, 400, "first account item (fallback)")
+                    log.warning("GOOGLE_REFRESH: account row not found — scrolling")
+                    _adb_cmd("input swipe 360 1200 360 500 300")
+                    time.sleep(1)
+                    xml = self._dump_ui_xml()
+                    elems = self._find_ui_elements(xml, text=self.google_email)
+                    if elems:
+                        elems.sort(key=lambda e: e[1])
+                        cx, cy, _, _ = elems[-1]
+                        _tap(cx, cy, f"account {self.google_email} (after scroll)")
+                    else:
+                        _tap(326, 1005, "account row (fallback)")
                 time.sleep(2)
 
                 # Find and tap "Remove account" button
@@ -6003,6 +6005,11 @@ img{{max-width:100%;height:auto}}</style></head>
             except Exception:
                 pass
         finally:
+            # Re-enable the VW app so the relay can resume token capture.
+            try:
+                _adb_cmd(f"pm enable {VW_PACKAGE}")
+            except Exception:
+                pass
             # Always resume normal operation, even on error/return.
             self._maintenance.clear()
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "off", retain=True)
