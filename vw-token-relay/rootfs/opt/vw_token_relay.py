@@ -5734,8 +5734,10 @@ img{{max-width:100%;height:auto}}</style></head>
             time.sleep(1)
 
             # Stop the VW app from relaunching and stealing focus while we drive
-            # the Settings UI. Re-enabled in the finally block.
+            # the Settings UI. Disable AND force-stop — a lingering EntryActivity
+            # window keeps focus over Settings otherwise. Re-enabled in finally.
             _adb_cmd(f"pm disable {VW_PACKAGE}")
+            _adb_cmd(f"am force-stop {VW_PACKAGE}")
             _adb_cmd("input keyevent KEYCODE_HOME")
             time.sleep(1)
 
