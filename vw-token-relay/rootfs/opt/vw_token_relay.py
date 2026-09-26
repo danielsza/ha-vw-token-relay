@@ -484,6 +484,15 @@ class VWTokenRelay:
         self._lock = threading.RLock()
         self._running = True
 
+        # Maintenance mode: when set, the keepalive/auto-login loop pauses
+        # touching the screen so long-running UI tasks (e.g. Google account
+        # refresh) can drive Settings without the loop relaunching the VW app.
+        self._maintenance = threading.Event()
+        # 2FA relay: a verification code supplied by the user via the web UI
+        # (published to vw/cmd/twofa_code) during a Google account refresh.
+        self._twofa_code = None
+        self._twofa_event = threading.Event()
+
     # ── MQTT ────────────────────────────────────────────────────────
     def _setup_mqtt(self):
         # paho-mqtt v2 requires callback_api_version
@@ -589,6 +598,20 @@ class VWTokenRelay:
             threading.Thread(target=self._auto_login, daemon=True).start()
         elif cmd == "refresh_google":
             threading.Thread(target=self._refresh_google_account, daemon=True).start()
+        elif cmd == "maintenance":
+            if payload.strip().lower() in ("on", "1", "true", "start", "enable"):
+                self._maintenance.set()
+                log.info("MAINTENANCE: enabled — keepalive/auto-login paused")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "on", retain=True)
+            else:
+                self._maintenance.clear()
+                log.info("MAINTENANCE: disabled — normal operation resumed")
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "off", retain=True)
+        elif cmd == "twofa_code":
+            code = payload.strip()
+            self._twofa_code = code
+            self._twofa_event.set()
+            log.info("2FA: verification code received (%d chars) — relaying to phone", len(code))
         elif cmd == "adb_tap":
             # Tap arbitrary coordinates: payload = "x,y" e.g. "360,1439"
             try:
@@ -5674,6 +5697,13 @@ img{{max-width:100%;height:auto}}</style></head>
             return
 
         log.info("GOOGLE_REFRESH: ====== Starting Google account refresh ======")
+        # Pause the keepalive/auto-login loop so it doesn't relaunch the VW app
+        # and steal the screen while we drive Settings.
+        self._maintenance.set()
+        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "on", retain=True)
+        # Reset any stale 2FA code from a previous run.
+        self._twofa_code = None
+        self._twofa_event.clear()
         self.mqttc.publish(
             f"{MQTT_TOPIC_PREFIX}/google_refresh",
             json.dumps({"status": "started"}))
@@ -5862,11 +5892,31 @@ img{{max-width:100%;height:auto}}</style></head>
             log.info("GOOGLE_REFRESH: Password entered, waiting for result")
             time.sleep(10)
 
-            # Handle post-login screens (I agree, Don't back up, etc.)
-            for screen_attempt in range(5):
+            # Handle post-login screens (2FA, I agree, Don't back up, etc.)
+            for screen_attempt in range(8):
                 xml = self._dump_ui_xml()
                 if not xml:
                     time.sleep(3)
+                    continue
+
+                # ── 2-Step Verification / "Verify it's you" challenge ──
+                twofa_texts = [
+                    "2-Step Verification", "2-step Verification", "2-step verification",
+                    "Verify it's you", "Verify it’s you", "Enter code", "Enter the code",
+                    "verification code", "Get a verification code", "Enter your code",
+                    "Couldn't verify", "Couldn’t verify", "Confirm your recovery",
+                    "Enter a code", "G-",
+                ]
+                if any(self._find_ui_elements(xml, text=t) for t in twofa_texts):
+                    code = self._await_twofa_code(xml, _adb_cmd, _tap)
+                    if code is None:
+                        self.mqttc.publish(
+                            f"{MQTT_TOPIC_PREFIX}/google_refresh",
+                            json.dumps({"status": "error",
+                                        "reason": "2fa timeout — no code entered in time"}))
+                        _adb_cmd("input keyevent KEYCODE_HOME")
+                        return
+                    time.sleep(6)  # let Google validate the code, then re-scan
                     continue
 
                 # Check for "I agree" button
@@ -5952,6 +6002,64 @@ img{{max-width:100%;height:auto}}</style></head>
                 _adb_cmd("input keyevent KEYCODE_HOME")
             except Exception:
                 pass
+        finally:
+            # Always resume normal operation, even on error/return.
+            self._maintenance.clear()
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "off", retain=True)
+            log.info("GOOGLE_REFRESH: maintenance released — normal operation resumed")
+
+    def _await_twofa_code(self, xml, _adb_cmd, _tap, timeout=420):
+        """Block until the user supplies a verification code via the web UI
+        (published to vw/cmd/twofa_code), then type it into the phone's
+        challenge screen. Returns the code, or None on timeout."""
+        log.warning("GOOGLE_REFRESH: 2FA / verify-it's-you challenge detected — "
+                    "requesting code from user")
+        self.mqttc.publish(
+            f"{MQTT_TOPIC_PREFIX}/google_refresh",
+            json.dumps({
+                "status": "2fa_required",
+                "message": ("Google is asking for a 2-step verification code. "
+                            "Open the relay web UI and enter the code from your "
+                            "authenticator app or SMS."),
+            }))
+        # Critical notification (an HA automation forwards vw/notify to push).
+        self.mqttc.publish(
+            f"{MQTT_TOPIC_PREFIX}/notify",
+            json.dumps({
+                "priority": "critical",
+                "title": "VW Relay: 2FA code needed",
+                "message": ("Google 2-step verification is blocking the account "
+                            "refresh. Enter the code in the relay web UI now."),
+            }))
+        self._twofa_code = None
+        self._twofa_event.clear()
+        log.info("GOOGLE_REFRESH: waiting up to %ds for a 2FA code from the web UI...",
+                 timeout)
+        got = self._twofa_event.wait(timeout=timeout)
+        if not got or not self._twofa_code:
+            log.error("GOOGLE_REFRESH: timed out waiting for 2FA code")
+            return None
+        code = self._twofa_code
+        self._twofa_code = None
+        # Tap a likely code input field, then type the code.
+        elems = (self._find_ui_elements(xml, resource_id="idvPin")
+                 or self._find_ui_elements(xml, resource_id="totpPin")
+                 or self._find_ui_elements(xml, resource_id="code")
+                 or self._find_ui_elements(xml, resource_id="pin"))
+        if elems:
+            cx, cy, _, _ = elems[0]
+            _tap(cx, cy, "2FA code field")
+        else:
+            _tap(360, 500, "2FA code field (fallback)")
+        time.sleep(1)
+        _adb_cmd(f"input text {code}")
+        time.sleep(0.5)
+        _adb_cmd("input keyevent 66")  # Enter
+        log.info("GOOGLE_REFRESH: 2FA code entered, submitting")
+        self.mqttc.publish(
+            f"{MQTT_TOPIC_PREFIX}/google_refresh",
+            json.dumps({"status": "2fa_submitted"}))
+        return code
 
     def _update_pif(self):
         """Run the Play Integrity fingerprint updater script."""
@@ -6600,6 +6708,12 @@ img{{max-width:100%;height:auto}}</style></head>
 
         while self._running:
             time.sleep(180)  # 3 minutes — keep tokens fresh for CC MQTT consumer
+
+            # ── Maintenance mode: pause all screen-touching recovery so a
+            #    long-running UI task (Google account refresh) can run alone.
+            if self._maintenance.is_set():
+                log.info("KEEPALIVE: maintenance mode active — skipping cycle")
+                continue
 
             # ── Phone health check (early detection) ──
             phone_health = self._check_phone_health()

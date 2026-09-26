@@ -31,6 +31,38 @@ _screenshot_cache = None
 _screenshot_time = 0
 SCREENSHOT_CACHE_MS = 800  # min ms between screencaps
 
+
+def _mqtt_config():
+    """Read MQTT connection details from the add-on options (env fallback)."""
+    host = os.environ.get('MQTT_HOST', 'core-mosquitto')
+    port = int(os.environ.get('MQTT_PORT', '1883'))
+    user = os.environ.get('MQTT_USER', '')
+    pw = os.environ.get('MQTT_PASS', '')
+    try:
+        with open('/data/options.json') as f:
+            opts = json.load(f)
+        host = opts.get('mqtt_host', host)
+        port = int(opts.get('mqtt_port', port))
+        user = opts.get('mqtt_user', user)
+        pw = opts.get('mqtt_pass', pw)
+    except Exception:
+        pass
+    return host, port, user, pw
+
+
+def publish_mqtt(topic, payload):
+    """One-shot MQTT publish (used to relay a 2FA code to the main process)."""
+    try:
+        import paho.mqtt.publish as mqtt_publish
+        host, port, user, pw = _mqtt_config()
+        auth = {'username': user, 'password': pw} if user else None
+        mqtt_publish.single(topic, payload=payload, hostname=host, port=port,
+                            auth=auth, client_id='vw-web-remote')
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[web_remote] mqtt publish failed: {e}\n")
+        return False
+
 def take_screenshot():
     """Take a screenshot via ADB and return PNG bytes."""
     global _screenshot_cache, _screenshot_time
@@ -154,7 +186,40 @@ h1 { font-size: 14px; color: #888; margin: 4px 0; }
 </div>
 <div class="status" id="status">Connecting...</div>
 
+<div class="twofa-box" style="margin-top:10px;padding:10px;border:1px solid #444;border-radius:6px;background:#221;max-width:360px;">
+    <div style="font-size:13px;color:#eb0;margin-bottom:6px;">🔐 Google 2FA code</div>
+    <div style="font-size:11px;color:#999;margin-bottom:6px;">
+        If an account refresh is waiting on 2-step verification, type the code from
+        your authenticator/SMS here and press Send.
+    </div>
+    <div style="display:flex;gap:6px;">
+        <input id="twofaCode" type="text" inputmode="numeric" autocomplete="one-time-code"
+               placeholder="123456"
+               style="flex:1;padding:8px;border-radius:4px;border:1px solid #555;background:#111;color:#eee;font-size:16px;letter-spacing:2px;">
+        <button onclick="sendTwofa()"
+                style="background:#2a2a4a;border:1px solid #444;color:#ddd;padding:8px 14px;border-radius:4px;cursor:pointer;">Send</button>
+    </div>
+    <div id="twofaStatus" style="font-size:11px;color:#6a6;margin-top:5px;"></div>
+</div>
+
 <script>
+async function sendTwofa() {
+    const el = document.getElementById('twofaCode');
+    const st = document.getElementById('twofaStatus');
+    const code = (el.value || '').trim();
+    if (!code) { st.textContent = 'Enter a code first.'; return; }
+    st.textContent = 'Sending...';
+    try {
+        const r = await fetch('twofa', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({code})
+        });
+        const j = await r.json();
+        st.textContent = j.sent ? '✓ Code sent to phone.' : ('Failed: ' + (j.error || 'unknown'));
+        if (j.sent) el.value = '';
+    } catch(e) { st.textContent = 'Error: ' + e; }
+}
 const img = document.getElementById('screen');
 const frame = document.getElementById('phoneFrame');
 const statusEl = document.getElementById('status');
@@ -460,6 +525,20 @@ class RemoteHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     self._send_json({'error': f'unknown action: {action}'}, 400)
 
+            except Exception as e:
+                self._send_json({'error': str(e)}, 500)
+        elif path == '/twofa':
+            # User-supplied 2-step verification code → relay to main process,
+            # which types it into the phone during a Google account refresh.
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = json.loads(self.rfile.read(length)) if length else {}
+                code = str(body.get('code', '')).strip()
+                if not code:
+                    self._send_json({'error': 'no code provided'}, 400)
+                    return
+                ok = publish_mqtt('vw/cmd/twofa_code', code)
+                self._send_json({'ok': ok, 'sent': bool(ok)})
             except Exception as e:
                 self._send_json({'error': str(e)}, 500)
         else:
