@@ -159,3 +159,49 @@ this is the current known-good rebuild procedure.
   host must re-authorize its ADB key (phone was wiped) before the relay resumes.
 - Still to restore: sideload myVW (`com.vw.carnet.releaseca`) + 32-bit arm Frida
   server, re-pair ADB from the relay add-on, sign in Google, then verify VW login.
+
+---
+
+## Sept 26 2026 (cont.) — the DEVICE wall is SERVER-SIDE (definitive)
+
+After restoring BASIC, spent hours trying to reach DEVICE. Key findings,
+now definitive:
+
+### The `<A13` fingerprint rule (from r/androidroot + XDA PIFork thread)
+- **Google now detects, server-side, any PIF fingerprint from a device that
+  launched with Android 13 or newer.** Pixel 9/10/11 (and any A13+ initial)
+  → `NO_INTEGRITY`. This is why every Pixel 9 (tokay) attempt gave NO.
+- Fix: use a device profile whose INITIAL Android was <13. Pixel 6 (oriole,
+  A12, `DEVICE_INITIAL_SDK_INT=31`) moved the verdict **NO → BASIC**. Pixel 6a
+  (bluejay) is the community favourite. Set a real old-device fingerprint +
+  spoof a recent `SECURITY_PATCH` (2026-09) + `DEVICE_INITIAL_SDK_INT=31`.
+- PIFork's whole purpose is fixing "**<A13 verdicts**". autopif4 only fetches
+  Pixel **Canary** prints, which are all A13+ now → useless for this; set the
+  `<A13` fingerprint manually (flash.android.com build API gives real strings).
+
+### On-device attestation is PERFECT — verified with KeyAttestation (vvb2060)
+- Chains to **Google hardware attestation root**.
+- **Bootloader is locked** (TrickyStore spoof working).
+- **Security level: TrustedEnvironment** (TEE — correct, no StrongBox mismatch).
+- Keybox **not revoked** (also confirmed against Google's CRL: 0 hits).
+- Switched keystore backend to **TrickyStore-OSS v3.1.0 (beakthoven)** — the
+  thread's current recommendation. No change: still BASIC.
+
+### Conclusion: DEVICE is blocked purely SERVER-SIDE
+With a flawless local attestation (Google root, locked, TEE, unrevoked) AND a
+valid `<A13` fingerprint, Play Integrity STILL returns only `MEETS_BASIC`.
+That means **Google's backend is rejecting the (public) keybox itself** — an
+internal PI blocklist beyond the public CRL. The `ddex` and `yurikey` public
+keyboxes are both server-flagged. RKP is not the cause (no `remote_provisioning`
+device_config on this A12 device). This matches the live, community-wide
+Sept 2026 breakage (XDA PIFork thread p.80-82, r/androidroot "sudden wallet
+loss"): even users with full STRONG can't transact; the one working fingerprint
+is a guarded, daily-changing target; "basically we are fucked".
+
+**No on-device change can fix a server-side keybox flag.** The only levers are:
+(1) a keybox Google's backend has NOT flagged (fresh/private — public sources
+are exhausted), or (2) the backend enforcement easing. The phone is left in the
+optimal state so DEVICE flips automatically the moment a good keybox appears:
+- TrickyStore-OSS + `<A13` Pixel 6 fingerprint + Google account signed in
+- TrickyStore-autofetch rotating keyboxes every 6h w/ CRL checks
+- Verified working relay MQTT/ADB pipe; SPIC + KeyAttestation installed for checks
