@@ -5753,8 +5753,13 @@ img{{max-width:100%;height:auto}}</style></head>
             else:
                 # Open "Passwords & accounts" directly (SYNC_SETTINGS opens the
                 # Google Account hub on Android 12, which has no Remove button).
-                _adb_cmd("am start -n com.android.settings/"
-                         "com.android.settings.Settings\\$AccountDashboardActivity")
+                # The activity name contains a '$' that does not survive the
+                # adb->su->sh escaping layers reliably, so base64-wrap the launch.
+                import base64 as _b64
+                _launch = ("am start -n 'com.android.settings/"
+                           "com.android.settings.Settings$AccountDashboardActivity'")
+                _enc = _b64.b64encode(_launch.encode()).decode()
+                _adb_cmd(f"echo {_enc} | base64 -d | sh")
                 time.sleep(3)
 
                 # Tap the account row (email under "Accounts for Owner"). There can
