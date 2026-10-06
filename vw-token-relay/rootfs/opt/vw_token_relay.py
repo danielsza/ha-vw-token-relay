@@ -950,6 +950,38 @@ class VWTokenRelay:
                     f"{MQTT_TOPIC_PREFIX}/download_push",
                     json.dumps({"error": str(e)}), retain=False)
 
+        elif cmd == "container_push":
+            # Push a LOCAL file (inside the addon container) to the phone via ADB
+            # payload = JSON {"local_path": "/data/stock_boot.img", "remote_path": "/sdcard/Download/stock_boot.img"}
+            try:
+                data = json.loads(payload)
+                local_path = data["local_path"]
+                remote_path = data["remote_path"]
+                import os as _os
+                if not _os.path.exists(local_path):
+                    raise FileNotFoundError(f"Local file not found: {local_path}")
+                sz = _os.path.getsize(local_path)
+                log.info("CONTAINER_PUSH: Pushing %s (%d bytes) -> %s", local_path, sz, remote_path)
+                r = subprocess.run(
+                    ["adb", "push", local_path, remote_path],
+                    capture_output=True, text=True, timeout=120)
+                log.info("CONTAINER_PUSH: rc=%d stdout=%s stderr=%s",
+                         r.returncode, r.stdout.strip()[:500], r.stderr.strip()[:300])
+                result = {
+                    "local_path": local_path, "remote_path": remote_path,
+                    "size": sz, "rc": r.returncode,
+                    "stdout": r.stdout.strip()[:500],
+                    "stderr": r.stderr.strip()[:500],
+                }
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/container_push",
+                    json.dumps(result), retain=False)
+            except Exception as e:
+                log.error("CONTAINER_PUSH: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/container_push",
+                    json.dumps({"error": str(e)}), retain=False)
+
         elif cmd == "adb_pull":
             # Pull a file from the phone to /share/: payload = JSON {"path": "/phone/path"}
             # Optionally "dest": filename override in /share/
