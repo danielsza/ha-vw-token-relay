@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
     adb \
+    fastboot \
     jq \
     socat \
     && python3 -m venv /opt/venv \
@@ -21,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Force layer invalidation — change this string to bust Docker cache
-RUN echo "force-rebuild-20260916-0030" > /tmp/.build_marker
+RUN echo "force-rebuild-20261005-fastboot" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /

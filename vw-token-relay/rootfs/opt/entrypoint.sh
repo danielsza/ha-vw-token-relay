@@ -730,7 +730,57 @@ wake_screen() {
     fi
 }
 
+# ── Fastboot auto-flash ──
+# If phone is in fastboot mode and a patched boot image exists in /share/,
+# flash it automatically and reboot to Android before proceeding.
+check_fastboot_flash() {
+    if ! command -v fastboot >/dev/null 2>&1; then
+        return 0
+    fi
+
+    FASTBOOT_DEV=$(fastboot devices 2>/dev/null | grep -c "fastboot")
+    if [ "${FASTBOOT_DEV}" -eq 0 ]; then
+        return 0
+    fi
+
+    echo "======================================"
+    echo "  FASTBOOT DEVICE DETECTED"
+    echo "======================================"
+    echo "Fastboot: $(fastboot devices 2>/dev/null)"
+
+    BOOT_IMG="/share/new-boot.img"
+    if [ ! -f "${BOOT_IMG}" ]; then
+        echo "Fastboot: No boot image at ${BOOT_IMG} — rebooting phone to Android"
+        fastboot reboot 2>&1 || true
+        sleep 20
+        return 0
+    fi
+
+    IMG_SIZE=$(stat -c%s "${BOOT_IMG}" 2>/dev/null || echo 0)
+    echo "Fastboot: Found ${BOOT_IMG} (${IMG_SIZE} bytes)"
+    echo "Fastboot: Flashing to boot_a..."
+    fastboot flash boot_a "${BOOT_IMG}" 2>&1
+    FLASH_RC=$?
+
+    if [ ${FLASH_RC} -eq 0 ]; then
+        echo "Fastboot: Flash SUCCESSFUL"
+        mv "${BOOT_IMG}" "${BOOT_IMG}.flashed" 2>/dev/null || true
+        echo "Fastboot: Rebooting to Android..."
+        fastboot reboot 2>&1 || true
+        sleep 20
+        echo "Fastboot: Reboot issued — ADB should appear shortly"
+    else
+        echo "Fastboot: Flash FAILED (rc=${FLASH_RC})"
+        echo "Fastboot: Rebooting phone anyway..."
+        fastboot reboot 2>&1 || true
+        sleep 20
+    fi
+}
+
 ensure_phone_ready() {
+    # Check for fastboot-mode phone BEFORE starting ADB
+    check_fastboot_flash
+
     # Reset ADB server to re-detect USB devices after container restart
     echo "Resetting ADB server..."
     adb kill-server 2>/dev/null || true
