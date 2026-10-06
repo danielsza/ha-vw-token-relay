@@ -982,6 +982,49 @@ class VWTokenRelay:
                     f"{MQTT_TOPIC_PREFIX}/container_push",
                     json.dumps({"error": str(e)}), retain=False)
 
+        elif cmd == "fastboot_cmd":
+            # Run a fastboot command: payload = JSON {"args": "boot /share/new-boot.img"}
+            # or {"args": "flash boot_a /data/stock_boot.img"}
+            # or {"args": "devices"} etc.
+            # Used for MTK devices that need 'fastboot boot' (temp boot) for Magisk
+            try:
+                data = json.loads(payload)
+                fb_args = data["args"]
+                timeout_s = int(data.get("timeout", 120))
+                log.info("FASTBOOT_CMD: Running: fastboot %s (timeout=%ds)", fb_args[:200], timeout_s)
+                # Check for fastboot device first
+                dev_check = subprocess.run(
+                    ["fastboot", "devices"],
+                    capture_output=True, text=True, timeout=10)
+                log.info("FASTBOOT_CMD: devices=%s", dev_check.stdout.strip()[:200])
+                args_list = ["fastboot"] + fb_args.split()
+                r = subprocess.run(
+                    args_list,
+                    capture_output=True, text=True, timeout=timeout_s)
+                result = {
+                    "args": fb_args[:200],
+                    "stdout": r.stdout.strip()[:2000],
+                    "stderr": r.stderr.strip()[:1000],
+                    "rc": r.returncode,
+                    "devices": dev_check.stdout.strip()[:200],
+                }
+                log.info("FASTBOOT_CMD: rc=%d stdout=%s stderr=%s",
+                         r.returncode, r.stdout.strip()[:500], r.stderr.strip()[:300])
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/fastboot_cmd",
+                    json.dumps(result), retain=False)
+            except subprocess.TimeoutExpired:
+                log.error("FASTBOOT_CMD: Timeout after %ds", timeout_s)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/fastboot_cmd",
+                    json.dumps({"error": "timeout", "args": fb_args[:200]}),
+                    retain=False)
+            except Exception as e:
+                log.error("FASTBOOT_CMD: Failed: %s", e)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/fastboot_cmd",
+                    json.dumps({"error": str(e)}), retain=False)
+
         elif cmd == "adb_pull":
             # Pull a file from the phone to /share/: payload = JSON {"path": "/phone/path"}
             # Optionally "dest": filename override in /share/
