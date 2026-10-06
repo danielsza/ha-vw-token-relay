@@ -120,6 +120,18 @@ mkdir -p /share/vw-relay
 python3 /opt/web_remote.py &
 echo "Web Remote: Phone viewer on :8099 (ingress)"
 
+# ── Persist boot images from /share/ to /data/ ──
+# /share/ may not survive container restarts; /data/ does.
+(
+    while true; do
+        if [ -f "/share/new-boot.img" ]; then
+            cp /share/new-boot.img /data/new-boot.img 2>/dev/null && \
+                echo "Boot image persisted: /share/ -> /data/"
+        fi
+        sleep 10
+    done
+) &
+
 echo "============================================="
 echo "  VW Token Relay — Starting"
 echo "============================================="
@@ -748,9 +760,12 @@ check_fastboot_flash() {
     echo "======================================"
     echo "Fastboot: $(fastboot devices 2>/dev/null)"
 
-    BOOT_IMG="/share/new-boot.img"
+    BOOT_IMG="/data/new-boot.img"
     if [ ! -f "${BOOT_IMG}" ]; then
-        echo "Fastboot: No boot image at ${BOOT_IMG} — rebooting phone to Android"
+        BOOT_IMG="/share/new-boot.img"
+    fi
+    if [ ! -f "${BOOT_IMG}" ]; then
+        echo "Fastboot: No boot image at /data/ or /share/ — rebooting phone to Android"
         fastboot reboot 2>&1 || true
         sleep 20
         return 0
@@ -765,6 +780,7 @@ check_fastboot_flash() {
     if [ ${FLASH_RC} -eq 0 ]; then
         echo "Fastboot: Flash SUCCESSFUL"
         mv "${BOOT_IMG}" "${BOOT_IMG}.flashed" 2>/dev/null || true
+        rm -f /data/new-boot.img /share/new-boot.img 2>/dev/null || true
         echo "Fastboot: Rebooting to Android..."
         fastboot reboot 2>&1 || true
         sleep 20
