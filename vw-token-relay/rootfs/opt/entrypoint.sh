@@ -765,18 +765,35 @@ check_fastboot_flash() {
         BOOT_IMG="/share/new-boot.img"
     fi
     if [ ! -f "${BOOT_IMG}" ]; then
-        echo "Fastboot: No boot image at /data/ or /share/"
-        echo "Fastboot: Switching active slot to b (stock recovery)..."
-        fastboot set_active b 2>&1
-        SLOT_RC=$?
-        if [ ${SLOT_RC} -eq 0 ]; then
-            echo "Fastboot: Slot switched to b — rebooting to stock Android"
+        echo "Fastboot: No boot image found — downloading stock boot.img from Motorola firmware..."
+        echo "Fastboot: Switching to slot a first..."
+        fastboot set_active a 2>&1 || true
+        /opt/venv/bin/python3 -c "
+import urllib.request, struct, zlib, sys
+URL='https://mirrors.lolinet.com/firmware/lenomola/2024/lamu/official/RETEU/fastboot_lamu_g_user_15_VVTA35.51-137_7eabca_release-keys.zip'
+# boot.img: offset 17577023, compressed 14550207 bytes, DEFLATE
+DATA_OFF=17577023; COMP_SZ=14550207
+print('Downloading stock boot.img (14.5 MB compressed)...',flush=True)
+req=urllib.request.Request(URL)
+req.add_header('Range',f'bytes={DATA_OFF}-{DATA_OFF+COMP_SZ-1}')
+resp=urllib.request.urlopen(req,timeout=120)
+data=resp.read()
+print(f'Downloaded {len(data)} bytes, decompressing...',flush=True)
+img=zlib.decompress(data,-15)
+print(f'Decompressed: {len(img)} bytes',flush=True)
+with open('/data/stock_boot.img','wb') as f: f.write(img)
+print('Saved /data/stock_boot.img',flush=True)
+" 2>&1
+        DL_RC=$?
+        if [ ${DL_RC} -eq 0 ] && [ -f "/data/stock_boot.img" ]; then
+            BOOT_IMG="/data/stock_boot.img"
+            echo "Fastboot: Stock boot.img downloaded successfully"
         else
-            echo "Fastboot: Slot switch failed (rc=${SLOT_RC}) — rebooting anyway"
+            echo "Fastboot: Download failed (rc=${DL_RC}) — rebooting phone"
+            fastboot reboot 2>&1 || true
+            sleep 20
+            return 0
         fi
-        fastboot reboot 2>&1 || true
-        sleep 20
-        return 0
     fi
 
     IMG_SIZE=$(stat -c%s "${BOOT_IMG}" 2>/dev/null || echo 0)
@@ -788,6 +805,8 @@ check_fastboot_flash() {
     if [ ${FLASH_RC} -eq 0 ]; then
         echo "Fastboot: Flash SUCCESSFUL"
         mv "${BOOT_IMG}" "${BOOT_IMG}.flashed" 2>/dev/null || true
+        rm -f /data/new-boot.img /share/new-boot.img 2>/dev/null || true
+        fastboot set_active a 2>&1 || true
         rm -f /data/new-boot.img /share/new-boot.img 2>/dev/null || true
         echo "Fastboot: Rebooting to Android..."
         fastboot reboot 2>&1 || true
