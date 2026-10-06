@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
-        frida==16.5.9 \
-        frida-tools==13.6.1 \
+        frida==17.21.0 \
+        frida-tools==14.11.0 \
         paho-mqtt \
         PyJWT \
         cryptography \
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Force layer invalidation — change this string to bust Docker cache
-RUN echo "force-rebuild-20261005-fastboot" > /tmp/.build_marker
+RUN echo "force-rebuild-20261006-frida17" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /

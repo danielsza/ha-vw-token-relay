@@ -14,7 +14,7 @@ Architecture:
   Phone (VW app + Frida) --USB--> This script --MQTT--> Home Assistant
 
 Requirements (on the machine with USB to phone):
-    pip3 install frida==16.5.9 frida-tools==13.6.1 paho-mqtt
+    pip3 install frida==17.21.0 frida-tools==14.11.0 paho-mqtt
 
 Usage:
     python3 vw_token_relay.py --mqtt-host <HA_IP> [--mqtt-port 1883]
@@ -41,7 +41,7 @@ from urllib.error import HTTPError
 try:
     import frida
 except ImportError:
-    print("Install frida: pip3 install frida==16.5.9 frida-tools==13.6.1")
+    print("Install frida: pip3 install frida==17.21.0 frida-tools==14.11.0")
     sys.exit(1)
 
 try:
@@ -73,8 +73,8 @@ VW_API_HEADERS = {
     "x-app-uuid": "ff11f6c3-d7b8-4a93-aac7-475783fab95b",
     "x-user-country": "CA",
     "x-app-version": "2026.6.12-9207",
-    "x-app-device-model": "moto g pure",
-    "x-app-device-os": "31",
+    "x-app-device-model": "moto g15 power",
+    "x-app-device-os": "36",
     "x-user-locale": "en-CA",
     "Content-Type": "application/json;charset=UTF-8",
 }
