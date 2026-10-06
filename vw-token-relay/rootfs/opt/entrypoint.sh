@@ -765,7 +765,15 @@ check_fastboot_flash() {
         BOOT_IMG="/share/new-boot.img"
     fi
     if [ ! -f "${BOOT_IMG}" ]; then
-        echo "Fastboot: No boot image at /data/ or /share/ — rebooting phone to Android"
+        echo "Fastboot: No boot image at /data/ or /share/"
+        echo "Fastboot: Switching active slot to b (stock recovery)..."
+        fastboot set_active b 2>&1
+        SLOT_RC=$?
+        if [ ${SLOT_RC} -eq 0 ]; then
+            echo "Fastboot: Slot switched to b — rebooting to stock Android"
+        else
+            echo "Fastboot: Slot switch failed (rc=${SLOT_RC}) — rebooting anyway"
+        fi
         fastboot reboot 2>&1 || true
         sleep 20
         return 0
