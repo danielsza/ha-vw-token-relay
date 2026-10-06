@@ -3443,14 +3443,21 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("NAV: On Garage — looking for vehicle cards")
                 cards = self._find_ui_elements(
                     xml, resource_id="vehicleNameTextView")
+                vins = []
+                if cards:
+                    vins = self._find_ui_elements(
+                        xml, resource_id="vehicleVinTextView")
+                else:
+                    # Compose fallback: newer VW app has no resource IDs
+                    log.info("NAV: No legacy resource IDs — "
+                             "trying Compose detection")
+                    cards, vins = self._find_compose_vehicle_cards(xml)
+
                 if cards:
                     # If target_vid specified, try to find matching card
                     # Otherwise tap the first card
                     tap_card = cards[0]
-                    if target_vid and len(cards) > 1:
-                        # Check VIN text elements near each card
-                        vins = self._find_ui_elements(
-                            xml, resource_id="vehicleVinTextView")
+                    if target_vid and len(cards) > 1 and vins:
                         for i, vin_elem in enumerate(vins):
                             vin_text = vin_elem[3].get("text", "")
                             if target_vid[:8] in vin_text or \
@@ -4861,6 +4868,8 @@ img{{max-width:100%;height:auto}}</style></head>
             # Step 2: Look for vehicle cards in the Garage
             # ForcedGarageActivity shows vehiclesRecyclerView with cards
             # containing vehicleNameTextView (e.g., "2024 Atlas", "2025 ID. Buzz 1st Edition")
+            # Newer Compose-based VW app has no resource IDs — also check
+            # by VIN pattern via _find_compose_vehicle_cards.
             picker_searches = [
                 # Search for vehicle names (Garage screen)
                 {"text": "Atlas"},
@@ -4868,7 +4877,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 {"text": "Buzz"},
                 {"text": "ID. Buzz"},
                 {"text": "2025 ID. Buzz"},
-                # Search by resource IDs
+                # Search by resource IDs (legacy)
                 {"resource_id": "vehicleNameTextView"},
                 {"resource_id": "vehiclesRecyclerView"},
                 {"resource_id": "vehicle"},
@@ -4893,6 +4902,20 @@ img{{max-width:100%;height:auto}}</style></head>
                         found_current = (cx, cy, bounds, attrs)
                         log.info("SWITCH: Found CURRENT vehicle at (%d,%d) %s text='%s'",
                                  cx, cy, bounds, attrs.get("text", "")[:40])
+
+            # Compose fallback: use VIN-based card detection
+            if not found_target and not found_current:
+                compose_cards, _ = self._find_compose_vehicle_cards(xml)
+                for cx, cy, bounds, attrs in compose_cards:
+                    txt = attrs.get("text", "").lower()
+                    if target_name.lower() in txt:
+                        found_target = (cx, cy, bounds, attrs)
+                        log.info("SWITCH: Compose found TARGET '%s' at (%d,%d)",
+             0:                 target_name, cx, cy)
+                    elif any(v in txt for v in ["buzz", "atlas"]):
+                        found_current = (cx, cy, bounds, attrs)
+                        log.info("SWITCH: Compose found CURRENT at (%d,%d) text='%s'",
+                                 cx, cy, attrs.get("text", "")[:40])
 
             # If target vehicle is directly visible, tap it
             if found_target:
@@ -5151,6 +5174,114 @@ img{{max-width:100%;height:auto}}</style></head>
         results.sort(key=lambda r: (0 if r[4] else 1))
         # Strip the exact flag from results for backward compat
         return [(cx, cy, bounds, attrs) for cx, cy, bounds, attrs, _ in results]
+
+    def _find_compose_vehicle_cards(self, xml_str):
+        """Find vehicle cards in Compose-based Garage UI (no resource IDs).
+
+        Newer VW app versions use Jetpack Compose which renders TextViews
+        with empty resource-id. This method finds vehicle cards by:
+        1. Locating TextViews whose text matches VIN pattern (17 chars)
+        2. Finding the clickable parent View that contains each VIN
+        3. Finding the vehicle name TextView inside each parent
+
+        Returns (cards, vins) where each is a list of (cx, cy, bounds, attrs)
+        tuples compatible with _find_ui_elements output.
+        """
+        import xml.etree.ElementTree as ET
+        import re
+
+        cards = []
+        vins_found = []
+
+        if not xml_str:
+            return cards, vins_found
+
+        try:
+            root = ET.fromstring(xml_str)
+        except ET.ParseError:
+            return cards, vins_found
+
+        vin_pattern = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
+        bounds_re = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
+
+        text_nodes = []     # (text, x1, y1, x2, y2, attrs)
+        clickable_views = []  # (x1, y1, x2, y2, attrs)
+
+        for node in root.iter("node"):
+            attrs = node.attrib
+            text_val = attrs.get("text", "")
+            cls = attrs.get("class", "")
+            clickable = attrs.get("clickable", "false")
+            bounds_str = attrs.get("bounds", "")
+
+            m = bounds_re.match(bounds_str)
+            if not m:
+                continue
+            x1, y1, x2, y2 = (int(m.group(1)), int(m.group(2)),
+                               int(m.group(3)), int(m.group(4)))
+
+            if text_val and "TextView" in cls:
+                text_nodes.append((text_val, x1, y1, x2, y2, attrs))
+
+            if clickable == "true" and "View" in cls:
+                clickable_views.append((x1, y1, x2, y2, attrs))
+
+        # Find VIN text nodes
+        vin_nodes = [(t, x1, y1, x2, y2, a)
+                     for t, x1, y1, x2, y2, a in text_nodes
+                     if vin_pattern.match(t)]
+
+        if not vin_nodes:
+            log.debug("COMPOSE: No VIN-pattern TextViews found")
+            return cards, vins_found
+
+        log.info("COMPOSE: Found %d VIN(s): %s",
+                 len(vin_nodes),
+                 ", ".join(v[0] for v in vin_nodes))
+
+        for vin_text, vx1, vy1, vx2, vy2, vin_attrs in vin_nodes:
+            # Find smallest clickable view containing this VIN
+            parent = None
+            parent_area = float('inf')
+            for cx1, cy1, cx2, cy2, c_attrs in clickable_views:
+                if cx1 <= vx1 and cy1 <= vy1 and cx2 >= vx2 and cy2 >= vy2:
+                    area = (cx2 - cx1) * (cy2 - cy1)
+                    if area < parent_area:
+                        parent = (cx1, cy1, cx2, cy2, c_attrs)
+                        parent_area = area
+
+            if parent:
+                px1, py1, px2, py2, p_attrs = parent
+                # Find vehicle name: non-VIN text inside the same parent
+                name_text = "?"
+                for t, tx1, ty1, tx2, ty2, _ in text_nodes:
+                    if (not vin_pattern.match(t)
+                            and t.lower() not in ("log out", "")
+                            and px1 <= tx1 and py1 <= ty1
+                            and px2 >= tx2 and py2 >= ty2):
+                        name_text = t
+                        break
+
+                pcx = (px1 + px2) // 2
+                pcy = (py1 + py2) // 2
+                card_attrs = dict(p_attrs)
+                card_attrs["text"] = name_text
+                cards.append((pcx, pcy,
+                              p_attrs.get("bounds", ""), card_attrs))
+
+                vcx = (vx1 + vx2) // 2
+                vcy = (vy1 + vy2) // 2
+                vin_a = dict(vin_attrs)
+                vins_found.append((vcx, vcy,
+                                   vin_attrs.get("bounds", ""), vin_a))
+
+                log.info("COMPOSE: Card '%s' VIN=%s at (%d,%d)",
+                         name_text, vin_text, pcx, pcy)
+            else:
+                log.warning("COMPOSE: No clickable parent for VIN %s",
+                            vin_text)
+
+        return cards, vins_found
 
     def _log_dashboard_buttons(self, xml_str):
         """Log all clickable/visible elements on the dashboard for debugging."""
