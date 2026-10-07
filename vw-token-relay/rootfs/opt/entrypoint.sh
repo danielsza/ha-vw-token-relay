@@ -860,10 +860,39 @@ ensure_phone_ready() {
         echo "ADB key persist failed (non-fatal)"
     fi
 
-    # Force-restart frida-server (don't trust stale PIDs after phone reboot)
-    echo "Starting frida-server on phone..."
+    # ── Frida server version check + auto-upgrade ──
+    FRIDA_CLIENT_VER=$(/opt/venv/bin/python3 -c "import frida; print(frida.__version__)" 2>/dev/null || echo "unknown")
+    echo "Frida client version: ${FRIDA_CLIENT_VER}"
+
+    # Kill any existing frida-server
     adb shell "su -c 'killall frida-server'" 2>/dev/null || true
     sleep 1
+
+    # Check server version on phone
+    FRIDA_SERVER_VER=$(adb shell "su -c '/data/local/tmp/frida-server --version'" 2>/dev/null | tr -d '\r\n' || echo "")
+    echo "Frida server version on phone: ${FRIDA_SERVER_VER:-not found}"
+
+    if [ "${FRIDA_SERVER_VER}" != "${FRIDA_CLIENT_VER}" ] && [ "${FRIDA_CLIENT_VER}" != "unknown" ]; then
+        echo "Frida version mismatch (client=${FRIDA_CLIENT_VER}, server=${FRIDA_SERVER_VER}) — upgrading server..."
+        FRIDA_URL="https://github.com/frida/frida/releases/download/${FRIDA_CLIENT_VER}/frida-server-${FRIDA_CLIENT_VER}-android-arm64.xz"
+        echo "Downloading frida-server ${FRIDA_CLIENT_VER}..."
+        if wget -q -O /tmp/frida-server.xz "${FRIDA_URL}" 2>/dev/null ||            /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('${FRIDA_URL}', '/tmp/frida-server.xz')" 2>/dev/null; then
+            xz -d -f /tmp/frida-server.xz
+            chmod +x /tmp/frida-server
+            echo "Pushing frida-server ${FRIDA_CLIENT_VER} to phone..."
+            adb push /tmp/frida-server /data/local/tmp/frida-server
+            adb shell "su -c 'chmod 755 /data/local/tmp/frida-server'"
+            rm -f /tmp/frida-server
+            NEW_VER=$(adb shell "su -c '/data/local/tmp/frida-server --version'" 2>/dev/null | tr -d '\r\n')
+            echo "Frida server upgraded: ${FRIDA_SERVER_VER:-none} → ${NEW_VER}"
+        else
+            echo "WARNING: Failed to download frida-server ${FRIDA_CLIENT_VER} — using existing"
+        fi
+    else
+        echo "Frida server version matches client (${FRIDA_CLIENT_VER})"
+    fi
+
+    echo "Starting frida-server on phone..."
     adb shell "su -c '/data/local/tmp/frida-server -D &'" 2>/dev/null || true
     sleep 3
 

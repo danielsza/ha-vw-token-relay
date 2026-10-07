@@ -14,7 +14,7 @@ Architecture:
   Phone (VW app + Frida) --USB--> This script --MQTT--> Home Assistant
 
 Requirements (on the machine with USB to phone):
-    pip3 install frida==17.21.0 frida-tools==14.11.0 paho-mqtt
+    pip3 install frida==17.22.2 frida-tools==14.11.0 paho-mqtt
 
 Usage:
     python3 vw_token_relay.py --mqtt-host <HA_IP> [--mqtt-port 1883]
@@ -41,7 +41,7 @@ from urllib.error import HTTPError
 try:
     import frida
 except ImportError:
-    print("Install frida: pip3 install frida==17.21.0 frida-tools==14.11.0")
+    print("Install frida: pip3 install frida==17.22.2 frida-tools==14.11.0")
     sys.exit(1)
 
 try:
@@ -84,25 +84,31 @@ FRIDA_SCRIPT = r"""
 'use strict';
 
 var _javaRetries = 0;
-function _tryJavaPerform(fn) {
+var _maxRetries = 20;
+
+function _waitForJava(fn) {
     _javaRetries++;
-    var jType = typeof Java;
-    var jAvail = (jType !== 'undefined') ? Java.available : false;
-    send({ type: 'status', msg: 'JAVA_DIAG attempt=' + _javaRetries + ' typeof=' + jType + ' available=' + jAvail });
-    try {
-        Java.perform(fn);
-        send({ type: 'status', msg: 'JAVA_DIAG Java.perform() returned OK on attempt ' + _javaRetries });
-    } catch (e) {
-        if (_javaRetries < 40) {
-            send({ type: 'status', msg: 'JAVA_DIAG Java.perform() threw (attempt ' + _javaRetries + '/40): ' + e });
-            setTimeout(function() { _tryJavaPerform(fn); }, 500);
-        } else {
-            send({ type: 'status', msg: 'FATAL: Java hooks failed after 40 attempts: ' + e });
+    if (typeof Java !== 'undefined' && Java.available) {
+        send({ type: 'status', msg: 'Java bridge available (attempt ' + _javaRetries + ')' });
+        try {
+            Java.perform(fn);
+            send({ type: 'status', msg: 'Java.perform() OK — hooks installed' });
+        } catch (e) {
+            send({ type: 'status', msg: 'Java.perform() error: ' + e });
         }
+        return;
+    }
+    if (_javaRetries <= _maxRetries) {
+        if (_javaRetries === 1 || _javaRetries % 5 === 0) {
+            send({ type: 'status', msg: 'Waiting for Java bridge (attempt ' + _javaRetries + '/' + _maxRetries + ')...' });
+        }
+        setTimeout(function() { _waitForJava(fn); }, 500);
+    } else {
+        send({ type: 'status', msg: 'FATAL: Java bridge not available after ' + _maxRetries + ' attempts (typeof Java=' + (typeof Java) + ')' });
     }
 }
 
-_tryJavaPerform(function () {
+_waitForJava(function () {
     var Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
     var JLong  = Java.use('java.lang.Long');
     var PEEK   = JLong.parseLong('131072');
@@ -6820,48 +6826,72 @@ img{{max-width:100%;height:auto}}</style></head>
             return False
 
     def _attach_frida(self):
-        """Attach to the VW app via USB."""
+        """Attach to the VW app via USB using spawn gating.
+
+        Spawn gating loads the Frida script while the process is still
+        suspended, giving the Java bridge a chance to initialize alongside
+        ART rather than attaching to an already-running process where ART
+        memory layout detection can fail (Android 16+).
+        """
         log.info("Looking for USB device...")
         self.device = frida.get_usb_device(timeout=10)
         log.info("Device: %s", self.device.name)
 
-        pid = None
+        # ── Kill any existing VW app instance ──
+        # Spawn gating requires a fresh process so Frida can attach
+        # before ART fully initializes.
         try:
             for app in self.device.enumerate_applications():
-                if app.identifier == VW_PACKAGE:
-                    pid = app.pid
+                if app.identifier == VW_PACKAGE and app.pid:
+                    log.info("Killing existing VW app (PID %d) for spawn gating...", app.pid)
+                    self.device.kill(app.pid)
+                    time.sleep(2)
                     break
         except Exception:
             pass
 
-        if not pid:
-            try:
-                for proc in self.device.enumerate_processes():
-                    if VW_PACKAGE in (proc.name, getattr(proc, 'identifier', '')):
-                        pid = proc.pid
-                        break
-            except Exception as e:
-                log.warning("enumerate_processes failed (phone still booting?): %s", e)
-                pass
+        # Also try force-stop via ADB to be thorough
+        try:
+            subprocess.run(
+                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                capture_output=True, timeout=5,
+            )
+            time.sleep(1)
+        except Exception:
+            pass
 
-        if not pid:
-            log.warning("VW app not running. Attempting to launch...")
+        # ── Spawn gating: spawn suspended → attach → load → resume ──
+        log.info("Spawning VW app (suspended)...")
+        try:
+            pid = self.device.spawn([VW_PACKAGE])
+        except Exception as e:
+            log.error("Cannot spawn VW app: %s", e)
+            return False
+
+        log.info("Attaching to suspended PID %d...", pid)
+        try:
+            self.session = self.device.attach(pid)
+        except Exception as e:
+            log.error("Cannot attach to PID %d: %s", pid, e)
             try:
-                pid = self.device.spawn([VW_PACKAGE])
                 self.device.resume(pid)
-                time.sleep(8)
-            except Exception as e:
-                log.error("Cannot start VW app: %s", e)
-                return False
+            except Exception:
+                pass
+            return False
 
-        log.info("Attaching to PID %d...", pid)
-        self.session = self.device.attach(pid)
         self.session.on("detached", self._on_detached)
 
+        log.info("Loading Frida script (process still suspended)...")
         self.script = self.session.create_script(FRIDA_SCRIPT)
         self.script.on("message", self._on_message)
         self.script.load()
-        log.info("Frida script loaded — hooks active")
+
+        log.info("Resuming PID %d — Java bridge will init with ART...", pid)
+        self.device.resume(pid)
+
+        # Give the app time to finish launching and ART to initialize
+        time.sleep(8)
+        log.info("Frida script loaded — waiting for hooks...")
         return True
 
     def _on_detached(self, reason, crash):
