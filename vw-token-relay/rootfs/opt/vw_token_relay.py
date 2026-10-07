@@ -83,27 +83,64 @@ VW_API_HEADERS = {
 FRIDA_SCRIPT = r"""
 'use strict';
 
+// ── Wait for ART runtime then install hooks ──
+// On Android 16+, the Java bridge global may not exist until
+// libart.so is fully loaded. We poll with a long window.
 var _javaRetries = 0;
-var _maxRetries = 20;
+var _maxRetries = 60;  // 60 x 500ms = 30 seconds
+
+function _checkModules() {
+    // Log what modules are loaded for diagnostics
+    try {
+        var mods = Process.enumerateModules();
+        var artMod = null;
+        var names = [];
+        for (var i = 0; i < mods.length; i++) {
+            var n = mods[i].name;
+            if (n.indexOf('art') !== -1 || n.indexOf('java') !== -1 || n.indexOf('dex') !== -1) {
+                names.push(n);
+            }
+            if (n === 'libart.so') artMod = mods[i];
+        }
+        send({ type: 'status', msg: 'ART modules: ' + (names.length > 0 ? names.join(', ') : 'none found') + ' (total: ' + mods.length + ' modules)' });
+        return artMod !== null;
+    } catch (e) {
+        send({ type: 'status', msg: 'Module enum error: ' + e });
+        return false;
+    }
+}
 
 function _waitForJava(fn) {
     _javaRetries++;
-    if (typeof Java !== 'undefined' && Java.available) {
-        send({ type: 'status', msg: 'Java bridge available (attempt ' + _javaRetries + ')' });
-        try {
-            Java.perform(fn);
-            send({ type: 'status', msg: 'Java.perform() OK — hooks installed' });
-        } catch (e) {
-            send({ type: 'status', msg: 'Java.perform() error: ' + e });
-        }
-        return;
+
+    // First attempt: log loaded modules for diagnostics
+    if (_javaRetries === 1) {
+        _checkModules();
     }
+
+    if (typeof Java !== 'undefined') {
+        if (Java.available) {
+            send({ type: 'status', msg: 'Java bridge available (attempt ' + _javaRetries + ')' });
+            try {
+                Java.perform(fn);
+                send({ type: 'status', msg: 'Java.perform() OK — hooks installed' });
+            } catch (e) {
+                send({ type: 'status', msg: 'Java.perform() error: ' + e });
+            }
+            return;
+        } else {
+            send({ type: 'status', msg: 'Java exists but not yet available (attempt ' + _javaRetries + ')' });
+        }
+    }
+
     if (_javaRetries <= _maxRetries) {
-        if (_javaRetries === 1 || _javaRetries % 5 === 0) {
-            send({ type: 'status', msg: 'Waiting for Java bridge (attempt ' + _javaRetries + '/' + _maxRetries + ')...' });
+        if (_javaRetries === 1 || _javaRetries % 10 === 0) {
+            send({ type: 'status', msg: 'Waiting for Java bridge (attempt ' + _javaRetries + '/' + _maxRetries + ', typeof=' + (typeof Java) + ')...' });
+            if (_javaRetries % 10 === 0) _checkModules();
         }
         setTimeout(function() { _waitForJava(fn); }, 500);
     } else {
+        _checkModules();
         send({ type: 'status', msg: 'FATAL: Java bridge not available after ' + _maxRetries + ' attempts (typeof Java=' + (typeof Java) + ')' });
     }
 }
@@ -6886,12 +6923,13 @@ img{{max-width:100%;height:auto}}</style></head>
         self.script.on("message", self._on_message)
         self.script.load()
 
-        log.info("Resuming PID %d — Java bridge will init with ART...", pid)
+        log.info("Resuming PID %d — ART will initialize now...", pid)
         self.device.resume(pid)
 
-        # Give the app time to finish launching and ART to initialize
-        time.sleep(8)
-        log.info("Frida script loaded — waiting for hooks...")
+        # The script polls for Java bridge availability (up to 30s).
+        # ART needs time to fully initialize after resume.
+        time.sleep(5)
+        log.info("Process resumed — script is polling for Java bridge...")
         return True
 
     def _on_detached(self, reason, crash):
