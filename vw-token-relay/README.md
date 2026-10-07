@@ -127,15 +127,13 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 
 ## Phone Setup Guide
 
-1. **Unlock bootloader** — `fastboot oem unlock`
-2. **Root with Magisk** — flash patched boot.img via fastboot
+1. **Unlock bootloader** — `fastboot oem unlock` (Qualcomm/standard). For MediaTek devices (e.g., Moto G15 Power), use [kaeru](https://github.com/R0rt1z2/kaeru) instead — see the [XDA kaeru thread](https://xdaforums.com/t/kaeru-arbitrary-code-execution-on-mediatek-bootloaders.4729227/). After bootloader unlock, flash a custom ROM like LineageOS for best results.
+2. **Root with Magisk** — patch the boot image with Magisk and flash via fastboot. On Android 13+ devices, patch `init_boot.img` (not `boot.img` — boot contains only the kernel, init_boot has the ramdisk). On older devices, patch `boot.img`.
 3. **Enable Zygisk** — Magisk → Settings → Enable Zygisk (built-in to Magisk 28.1+)
 4. **Install Shamiko** — Magisk → Modules → Install Shamiko. Hides root from Google Play Services and the VW app via DenyList.
-5. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix. Configure it with the device's own fingerprint (extract from stock build.prop before unlocking the bootloader)
+5. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix. Configure it with the device's own fingerprint (extracted from stock firmware before rooting)
 6. **Configure DenyList** — Magisk Settings → Enable DenyList. Add `com.google.android.gms` and the VW app.
 7. **Install Frida server** — download `frida-server-17.22.2-android-arm64` (or `-arm` for 32-bit) from [Frida releases](https://github.com/frida/frida/releases). Push to `/data/local/tmp/frida-server`, chmod +x. The add-on starts it automatically via ADB.
-
-> **MediaTek devices (e.g., Moto G15 Power):** The bootloader can be unlocked using [kaeru](https://github.com/R0rt1z2/kaeru). See the [XDA kaeru thread](https://xdaforums.com/t/kaeru-arbitrary-code-execution-on-mediatek-bootloaders.4729227/) for device-specific guides. After bootloader unlock, flash a custom ROM like LineageOS for best results.
 
 > **Android 16 note:** Frida 17+ decoupled the Java bridge from core — the agent uses `frida-compile` to bundle `frida-java-bridge` as an ESM import. Native SSL hooks (`Interceptor.attach` on BoringSSL) are used instead of Java-level `.implementation` hooks to avoid ART GC crashes (SIGSEGV in `CodeInfo::DecodeGcMasksOnly`). This is handled automatically by the add-on.
 8. **Install myVW** — sideload APK, log in, grant all permissions
@@ -177,7 +175,7 @@ The relay was originally developed on a Moto G Pure (XT2163-4, `ellis`, armeabi-
 
 **MEETS_STRONG_INTEGRITY** achieved on a rooted Moto G15 Power (LineageOS 23.2 / Android 16) with no keybox. Key factors:
 
-1. **Device's own fingerprint** — extracted from the phone's stock firmware before unlocking the bootloader. No autopif rotation, no Canary fingerprint — the real device fingerprint passes PI natively.
+1. **Device's own fingerprint** — extracted from the phone's stock firmware before rooting. No autopif rotation, no Canary fingerprint — the real device fingerprint passes PI natively.
 2. **No keybox needed** — neither hardware nor software keybox is required. Tricky Store is not used.
 3. **Fresh Google account credentials** — stale Google credentials cause Finsky to throw `IntegrityException` and fall back to basic-only mode. If PI drops to BASIC, remove the Google account and re-add it.
 4. **Shamiko + PIF (Magisk's built-in Zygisk)** — Shamiko hides root from Google Play Services and the VW app. No Tricky Store needed. DenyList enabled with `com.google.android.gms` and the VW app added.
