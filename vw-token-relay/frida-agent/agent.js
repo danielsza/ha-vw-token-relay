@@ -1,16 +1,22 @@
 import Java from "frida-java-bridge";
 
-// ── VW Token Relay — Frida Agent ──
-// Hooks OkHttp3 BridgeInterceptor to capture OAuth + API traffic.
-// Requires frida-compile to bundle frida-java-bridge (decoupled in Frida 17+).
+// ── VW Token Relay — Frida Agent v3 (GC-Safe via registerClass) ──
 //
-// CAPTURE-AND-UNHOOK pattern:
-// ART's GC on Android 16 crashes when walking the stack through Frida's
-// replaced method implementations (null CodeInfo in DecodeGcMasksOnly).
-// GC typically runs ~15-20s after process start. We install hooks, capture
-// the initial token burst, then restore the original implementation BEFORE
-// the first GC cycle. The Python relay calls rpc.rehook() briefly before
-// each keepalive wake to grab fresh tokens.
+// APPROACH: Instead of hooking existing Java methods with .implementation
+// (which corrupts ART CodeInfo metadata → GC crash on Android 16), this
+// agent creates a FRESH OkHttp Interceptor class via Java.registerClass.
+//
+// Why this is GC-safe:
+//   .implementation changes an existing method's entry point. The ArtMethod
+//   still has kAccNative=0, so GC tries to decode CodeInfo for the old
+//   compiled code at the new trampoline address → crash.
+//
+//   Java.registerClass creates a new DEX with native methods from birth.
+//   The ArtMethod has kAccNative=1, GC sees a native frame, skips CodeInfo
+//   lookup entirely → no crash.
+//
+// The interceptor is injected into OkHttpClient instances via reflection.
+// No existing methods are modified. Hooks are permanent (no unhook needed).
 
 // Known API path prefixes
 var API_PATHS = [
@@ -73,159 +79,193 @@ function getRequestBody(req) {
     }
 }
 
-// ── Hook state ──
-var _Bridge = null;          // Java.use handle (reusable across hook/unhook)
-var _origIntercept = null;   // original .implementation ref
-var _hooked = false;
-var _tokenCaptured = false;
-var _unhookTimer = null;
-var _autoUnhookMs = 12000;   // unhook 12s after install (well before GC at ~15-20s)
-var _captureUnhookMs = 3000; // unhook 3s after first token capture
-
-function unhookInterceptor() {
-    if (!_hooked || !_Bridge) return;
-    try {
-        Java.performNow(function () {
-            _Bridge.intercept.implementation = _origIntercept;
-        });
-    } catch (e) {
-        // If performNow fails, try direct assignment
-        try { _Bridge.intercept.implementation = _origIntercept; } catch(e2) {}
-    }
-    _hooked = false;
-    if (_unhookTimer) {
-        clearTimeout(_unhookTimer);
-        _unhookTimer = null;
-    }
-    send({ type: 'status', msg: 'Hooks removed (original implementation restored) — safe from GC crash' });
-}
+// ── Injection state ──
+var _injected = false;
+var _injectedCount = 0;
+var _retryCount = 0;
+var _maxRetries = 10;
+var _tokenInterceptorInstance = null;
 
 function installHooks() {
     if (!Java.available) {
-        send({ type: 'status', msg: 'Java bridge imported but not available — retrying in 500ms' });
+        send({ type: 'status', msg: 'Java bridge not available yet — retrying in 500ms' });
         setTimeout(installHooks, 500);
         return;
     }
 
     Java.perform(function () {
-        _Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
-        var JLong = Java.use('java.lang.Long');
-        var PEEK = JLong.parseLong('131072');
-        var API_PEEK = JLong.parseLong('32768');
+        try {
+            var JLong = Java.use('java.lang.Long');
+            var PEEK = JLong.parseLong('131072');    // 128KB for token responses
+            var API_PEEK = JLong.parseLong('32768'); // 32KB for API responses
 
-        // Save original implementation for restoration
-        _origIntercept = _Bridge.intercept.implementation;
-        _tokenCaptured = false;
+            // ── Step 1: Register a custom OkHttp Interceptor class ──
+            // This creates a NEW class with native methods — no ART corruption!
+            var InterceptorIface = Java.use('okhttp3.Interceptor');
 
-        _Bridge.intercept.implementation = function (chain) {
-            var resp;
-            try {
-                var req = chain.request();
-                var url = req.url().toString();
-                var method = req.method();
-                resp = this.intercept(chain);
+            var TokenCapture = Java.registerClass({
+                name: 'com.frida.vw.TokenCapture',
+                implements: [InterceptorIface],
+                methods: {
+                    intercept: [{
+                        returnType: 'okhttp3.Response',
+                        argumentTypes: ['okhttp3.Interceptor$Chain'],
+                        implementation: function (chain) {
+                            var req = chain.request();
+                            var resp;
+                            try {
+                                resp = chain.proceed(req);
+                            } catch (proceedErr) {
+                                // Let OkHttp handle network errors normally
+                                throw proceedErr;
+                            }
 
-                // ── Authorization headers → fresh access tokens ──
-                var hdrs = req.headers();
-                for (var i = 0; i < hdrs.size(); i++) {
-                    if (hdrs.name(i) === 'Authorization') {
-                        var val = hdrs.value(i);
-                        if (val.length > 50) {
-                            send({ type: 'auth_header', url: url, token: val.substring(7) });
-                            scheduleUnhookAfterCapture();
+                            try {
+                                var url = req.url().toString();
+                                var method = req.method();
+
+                                // ── Authorization headers → fresh access tokens ──
+                                var hdrs = req.headers();
+                                for (var i = 0; i < hdrs.size(); i++) {
+                                    if (hdrs.name(i) === 'Authorization') {
+                                        var val = hdrs.value(i);
+                                        if (val.length > 50) {
+                                            send({ type: 'auth_header', url: url, token: val.substring(7) });
+                                        }
+                                        break;
+                                    }
+                                }
+
+                                // ── OIDC token responses ──
+                                if (url.indexOf('/oidc/') !== -1) {
+                                    try {
+                                        var reqBody = getRequestBody(req);
+                                        send({ type: 'token_response', url: url, method: method,
+                                               requestBody: reqBody, body: resp.peekBody(PEEK).string() });
+                                    } catch (e) {}
+                                }
+
+                                // ── idToken from URL query params ──
+                                if (url.indexOf('idToken=') !== -1) {
+                                    send({ type: 'id_token_url', url: url });
+                                }
+
+                                // ── Known API responses ──
+                                if (isApiUrl(url)) {
+                                    try {
+                                        send({ type: 'api_response', url: url, method: method,
+                                               body: resp.peekBody(API_PEEK).string() });
+                                    } catch (e) {}
+                                }
+                            } catch (outerErr) {
+                                send({ type: 'hook_error', error: '' + outerErr });
+                            }
+
+                            return resp;
                         }
-                        break;
-                    }
+                    }]
                 }
+            });
 
-                // ── OIDC token responses ──
-                if (url.indexOf('/oidc/') !== -1) {
-                    try {
-                        var reqBody = getRequestBody(req);
-                        send({ type: 'token_response', url: url, method: method,
-                               requestBody: reqBody, body: resp.peekBody(PEEK).string() });
-                        scheduleUnhookAfterCapture();
-                    } catch (e) {}
-                    return resp;
-                }
+            _tokenInterceptorInstance = TokenCapture.$new();
+            send({ type: 'status', msg: 'TokenCapture interceptor class registered (native ArtMethod — GC-safe)' });
 
-                // ── idToken from URL query params ──
-                if (url.indexOf('idToken=') !== -1) {
-                    send({ type: 'id_token_url', url: url });
-                    scheduleUnhookAfterCapture();
-                }
+            // ── Step 2: Inject into OkHttpClient instances ──
+            injectInterceptor(_tokenInterceptorInstance);
 
-                // ── Known API responses ──
-                if (isApiUrl(url)) {
-                    try {
-                        send({ type: 'api_response', url: url, method: method,
-                               body: resp.peekBody(API_PEEK).string() });
-                    } catch (e) {}
-                }
-            } catch (outerErr) {
-                send({ type: 'hook_error', error: '' + outerErr });
-            }
-            return resp;
-        };
-
-        _hooked = true;
-        send({ type: 'status', msg: 'Hooks installed — token + API capture active' });
-
-        // Safety net: auto-unhook after _autoUnhookMs even if no tokens captured,
-        // to prevent GC crash
-        _unhookTimer = setTimeout(function () {
-            if (_hooked) {
-                send({ type: 'status', msg: 'Auto-unhook timer fired (no crash window) — removing hooks' });
-                unhookInterceptor();
-            }
-        }, _autoUnhookMs);
+        } catch (e) {
+            send({ type: 'hook_error', error: 'Hook setup failed: ' + e + '\n' + e.stack });
+        }
     });
 }
 
-function scheduleUnhookAfterCapture() {
-    if (_tokenCaptured) return; // already scheduled
-    _tokenCaptured = true;
+function injectInterceptor(interceptor) {
+    Java.perform(function () {
+        _injectedCount = 0;
 
-    // Clear the safety-net timer and set a shorter post-capture timer
-    if (_unhookTimer) {
-        clearTimeout(_unhookTimer);
-        _unhookTimer = null;
-    }
+        Java.choose('okhttp3.OkHttpClient', {
+            onMatch: function (client) {
+                try {
+                    var clientClass = client.getClass();
+                    var field = clientClass.getDeclaredField('interceptors');
+                    field.setAccessible(true);
+                    var currentList = field.get(client);
 
-    _unhookTimer = setTimeout(function () {
-        if (_hooked) {
-            send({ type: 'status', msg: 'Post-capture unhook — tokens grabbed, removing hooks to prevent GC crash' });
-            unhookInterceptor();
-        }
-    }, _captureUnhookMs);
+                    // Check if our interceptor is already injected
+                    var javaList = Java.cast(currentList, Java.use('java.util.List'));
+                    for (var i = 0; i < javaList.size(); i++) {
+                        var existing = javaList.get(i);
+                        if (existing !== null && existing.getClass().getName() === 'com.frida.vw.TokenCapture') {
+                            // Already injected, skip
+                            _injectedCount++;
+                            return;
+                        }
+                    }
+
+                    // Build new list: existing interceptors + ours at the end
+                    var ArrayList = Java.use('java.util.ArrayList');
+                    var newList = ArrayList.$new();
+                    for (var j = 0; j < javaList.size(); j++) {
+                        newList.add(javaList.get(j));
+                    }
+                    newList.add(interceptor);
+
+                    // Replace the field value (works even on final fields with setAccessible)
+                    field.set(client, Java.cast(newList, Java.use('java.util.List')));
+                    _injectedCount++;
+                } catch (e) {
+                    send({ type: 'hook_error', error: 'OkHttpClient injection failed: ' + e });
+                }
+            },
+            onComplete: function () {
+                if (_injectedCount > 0) {
+                    _injected = true;
+                    send({ type: 'status', msg: 'Interceptor injected into ' + _injectedCount + ' OkHttpClient(s) — PERMANENT, no unhook needed!' });
+                } else {
+                    _retryCount++;
+                    if (_retryCount <= _maxRetries) {
+                        send({ type: 'status', msg: 'No OkHttpClient found yet (attempt ' + _retryCount + '/' + _maxRetries + ') — retrying in 2s' });
+                        setTimeout(function () {
+                            injectInterceptor(interceptor);
+                        }, 2000);
+                    } else {
+                        send({ type: 'hook_error', error: 'Could not find OkHttpClient after ' + _maxRetries + ' attempts' });
+                    }
+                }
+            }
+        });
+    });
 }
 
-send({ type: 'status', msg: 'Java bridge module loaded via ESM import' });
+send({ type: 'status', msg: 'Agent v3 loaded — Java.registerClass approach (GC-safe)' });
 installHooks();
 
 // ── RPC exports ──
+// rehook/unhook are no-ops since our interceptor is permanent and GC-safe.
+// listKeystoreAliases, readSharedPrefs, signWithKeystore use Java.performNow
+// which does NOT modify ArtMethods — completely safe.
 rpc.exports = {
-    // Re-enable hooks briefly (called by Python relay before keepalive wake)
     rehook: function () {
-        if (_hooked) return JSON.stringify({ status: 'already_hooked' });
-        try {
-            installHooks();
-            return JSON.stringify({ status: 'hooks_reinstalled' });
-        } catch (e) {
-            return JSON.stringify({ status: 'error', error: e.toString() });
+        // No-op: our interceptor is permanent, no need to reinstall
+        if (!_injected && _tokenInterceptorInstance) {
+            // But if not yet injected, try again
+            try {
+                injectInterceptor(_tokenInterceptorInstance);
+                return JSON.stringify({ status: 'retry_injection', injected: _injected, count: _injectedCount });
+            } catch (e) {
+                return JSON.stringify({ status: 'retry_failed', error: e.toString() });
+            }
         }
+        return JSON.stringify({ status: 'interceptor_permanent', injected: _injected, count: _injectedCount });
     },
 
-    // Explicitly remove hooks
     unhook: function () {
-        if (!_hooked) return JSON.stringify({ status: 'not_hooked' });
-        unhookInterceptor();
-        return JSON.stringify({ status: 'unhooked' });
+        // No-op: no need to unhook — interceptor is GC-safe
+        return JSON.stringify({ status: 'interceptor_permanent', msg: 'GC-safe — no unhook needed' });
     },
 
-    // Check hook state
     hookStatus: function () {
-        return JSON.stringify({ hooked: _hooked, tokenCaptured: _tokenCaptured });
+        return JSON.stringify({ hooked: _injected, injectedClients: _injectedCount, approach: 'registerClass_v3' });
     },
 
     listKeystoreAliases: function () {
