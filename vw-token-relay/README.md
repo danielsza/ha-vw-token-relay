@@ -6,7 +6,7 @@ Captures Play Integrity tokens and OAuth credentials from the VW myVW app via Fr
 
 VW's North American API requires every request to carry a Play Integrity–attested token. This is already enforced in the US and is expected to roll out to Canada. The official myVW app passes Google's device attestation check; a headless Python connector cannot. This add-on bridges the gap: a rooted Android phone runs the real myVW app, Frida hooks intercept the attested tokens in real-time, and MQTT delivers them to CarConnectivity or Home Assistant automations. Without this (or a similar relay), the [VW NA connector](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na) cannot authenticate.
 
-**Note:** Tested on the Canadian endpoint. As of October 2026, the phone achieves **MEETS_STRONG_INTEGRITY** — the highest Play Integrity level — on a Moto G15 Power running LineageOS 23.2 (Android 16) with Magisk 30.7. This should satisfy both the Canadian and US endpoints. See [Play Integrity Result](#play-integrity-result) below.
+**Note:** Tested on the Canadian endpoint. As of October 2026, the phone achieves **MEETS_STRONG_INTEGRITY** — the highest Play Integrity level — on a Moto G15 Power running LineageOS 23.2 (Android 16) with Magisk 30.7, using the device's own fingerprint (no keybox needed). This should satisfy both the Canadian and US endpoints. See [Play Integrity Result](#play-integrity-result) below.
 
 ## Architecture
 
@@ -21,8 +21,8 @@ A rooted Android phone runs the official myVW app. Frida's native `Interceptor.a
 - Rooted Android phone with:
   - Magisk (28.1+)
   - ReZygisk module (replaces Magisk's built-in Zygisk)
-  - Play Integrity Fix (PIF) module — osm0sis variant with autopif fingerprint rotation
-  - Tricky Store module (software keybox sufficient — no hardware keybox needed)
+  - Shamiko module (hides root from Google Play Services and the VW app)
+  - Play Integrity Fix (PIF) module — configured with the device's own fingerprint (extracted before rooting)
   - myVW app installed and logged in
   - USB debugging enabled
   - Frida server running (`frida-server-17.22.2-android-arm64` recommended — must match your `frida-tools` version)
@@ -66,7 +66,7 @@ The UI-driven path is the only way to do remote start. The relay navigates the V
 ### Play Integrity Auto-Fix
 - Monitors token freshness (PIF health check every ~20 min)
 - If tokens go stale (>45 min), escalates through three levels:
-  1. **Level 1:** Updates PIF fingerprint (autopif) + reboots phone with boot-loop protection
+  1. **Level 1:** Updates PIF fingerprint + reboots phone with boot-loop protection
   2. **Level 2:** Removes and re-adds the Google account on the phone (fixes stale Finsky credentials that cause PI to drop to BASIC). Requires `google_email` and `google_password` in config.
   3. **Level 3+:** Notifies user, keeps retrying PIF updates
 - Unlocks screen after reboot (wake + dismiss-keyguard + swipe + home)
@@ -131,8 +131,8 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 1. **Unlock bootloader** — `fastboot oem unlock`
 2. **Root with Magisk** — flash patched boot.img via fastboot
 3. **Install ReZygisk** — Magisk → Modules → Install ReZygisk (replaces Magisk's built-in Zygisk)
-4. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix (osm0sis variant with autopif)
-5. **Install Tricky Store** — Magisk → Modules → Install Tricky Store (software keybox is sufficient)
+4. **Install Shamiko** — Magisk → Modules → Install Shamiko. Hides root from Google Play Services and the VW app via DenyList.
+5. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix. Configure it with the device's own fingerprint (extract from stock build.prop before unlocking the bootloader)
 6. **Configure DenyList** — Magisk Settings → Enable DenyList. Add `com.google.android.gms` and the VW app.
 7. **Install Frida server** — download `frida-server-17.22.2-android-arm64` (or `-arm` for 32-bit) from [Frida releases](https://github.com/frida/frida/releases). Push to `/data/local/tmp/frida-server`, chmod +x. The add-on starts it automatically via ADB.
 
@@ -142,7 +142,7 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 8. **Install myVW** — sideload APK, log in, grant all permissions
 9. **Enable USB debugging** — Developer Options → USB Debugging
 10. **Keep screen on** — `adb shell settings put global stay_on_while_plugged_in 3`
-11. **Verify PI** — test with SPIC (`com.henrikherzig.playintegritychecker`); must show `MEETS_DEVICE_INTEGRITY` or higher. BASIC alone may not be sufficient — VW US requires DEVICE, and VW Canada may enforce it as well. With the Pixel 9a Canary fingerprint + software keybox, MEETS_STRONG_INTEGRITY is achievable. If PI drops to BASIC after a while, remove and re-add the Google account on the phone (stale credentials cause Finsky to fall back to basic-only mode).
+11. **Verify PI** — test with SPIC (`com.henrikherzig.playintegritychecker`); must show `MEETS_DEVICE_INTEGRITY` or higher. BASIC alone may not be sufficient — VW US requires DEVICE, and VW Canada may enforce it as well. With the device's own fingerprint, MEETS_STRONG_INTEGRITY is achievable — no keybox needed. If PI drops to BASIC after a while, remove and re-add the Google account on the phone (stale credentials cause Finsky to fall back to basic-only mode).
 
 ## Reference Setup (known-good)
 
@@ -152,8 +152,8 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 | OS | LineageOS 23.2 (Android 16, SDK 36) |
 | Root | Magisk v30.7 |
 | Zygisk | ReZygisk (replaces Magisk's built-in Zygisk) |
-| PIF module | Play Integrity Fix (osm0sis variant with autopif fingerprint rotation) |
-| Tricky Store | Latest (software keybox — no hardware keybox needed) |
+| Hide root | Shamiko (hides root from GMS and VW app) |
+| PIF module | Play Integrity Fix — device's own fingerprint (extracted from stock before rooting) |
 | Frida server | 17.22.2-android-arm64 |
 | Frida agent | v3.1 — native SSL hooks via `Interceptor.attach` (GC-safe on Android 16) |
 | myVW package | `com.vw.carnet.releaseca` (Canada) |
@@ -176,12 +176,13 @@ The relay was originally developed on a Moto G Pure (XT2163-4, `ellis`, armeabi-
 
 ![SPIC showing MEETS_STRONG_INTEGRITY](https://raw.githubusercontent.com/danielsza/ha-vw-token-relay/main/docs/spic-strong-integrity.png)
 
-**MEETS_STRONG_INTEGRITY** achieved on a rooted Moto G15 Power (LineageOS 23.2 / Android 16) with a software keybox. Key factors:
+**MEETS_STRONG_INTEGRITY** achieved on a rooted Moto G15 Power (LineageOS 23.2 / Android 16) with no keybox. Key factors:
 
-1. **PIF fingerprint** — autopif rotates through known-good Canary fingerprints automatically
-2. **Fresh Google account credentials** — stale Google credentials cause Finsky to throw `IntegrityException` and fall back to basic-only mode. If PI drops to BASIC, remove the Google account and re-add it.
-3. **ReZygisk + Tricky Store + PIF** — no Shamiko needed. DenyList enabled with `com.google.android.gms` and the VW app added.
-4. **MTK bootloader unlock via kaeru** — required for Moto G15 Power (MediaTek SoC). See [kaeru on GitHub](https://github.com/R0rt1z2/kaeru).
+1. **Device's own fingerprint** — extracted from the phone's stock firmware before unlocking the bootloader. No autopif rotation, no Canary fingerprint — the real device fingerprint passes PI natively.
+2. **No keybox needed** — neither hardware nor software keybox is required. Tricky Store is not used.
+3. **Fresh Google account credentials** — stale Google credentials cause Finsky to throw `IntegrityException` and fall back to basic-only mode. If PI drops to BASIC, remove the Google account and re-add it.
+4. **ReZygisk + Shamiko + PIF** — Shamiko hides root from Google Play Services and the VW app. No Tricky Store needed. DenyList enabled with `com.google.android.gms` and the VW app added.
+5. **MTK bootloader unlock via kaeru** — required for Moto G15 Power (MediaTek SoC). See [kaeru on GitHub](https://github.com/R0rt1z2/kaeru).
 
 ## Region Notes
 
@@ -190,7 +191,7 @@ Tested on Canadian endpoint (`b-h-s.spr.ca00.p.con-veh.net`). The US endpoint us
 ## Troubleshooting
 
 - **"No tokens received"** — check that Frida server is running on the phone (`adb shell su -c "ps | grep frida"`), the VW app is logged in, and USB debugging is enabled.
-- **Tokens go stale after a few hours** — PIF fingerprint may have been revoked. The add-on auto-recovers, but if `vw/pif_health` stays `critical`, manually update the PIF module's fingerprint list.
+- **Tokens go stale after a few hours** — PIF fingerprint may have been revoked or expired. The add-on monitors this, but if `vw/pif_health` stays `critical`, check the PIF module configuration.
 - **Remote start fails with "device pairing required"** — first-time remote start requires pairing the phone with VW's server. Use `vw/cmd/ui_remote_start` to trigger the pairing flow through the app UI.
 - **"Media Storage keeps stopping" dialog** — common on Moto G Pure. The relay auto-dismisses this, but if it persists, clear Media Storage data in Android settings.
 - **Screen stays locked after reboot** — the add-on unlocks the screen automatically (wake → dismiss-keyguard → swipe → home). If this fails, ensure the phone has no PIN/pattern lock set.
