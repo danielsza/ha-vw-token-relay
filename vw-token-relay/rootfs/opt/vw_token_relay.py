@@ -83,7 +83,15 @@ VW_API_HEADERS = {
 FRIDA_SCRIPT = r"""
 'use strict';
 
-Java.perform(function () {
+function _waitForJava(fn) {
+    if (typeof Java !== 'undefined' && Java.available) {
+        Java.perform(fn);
+    } else {
+        setTimeout(function () { _waitForJava(fn); }, 250);
+    }
+}
+
+_waitForJava(function () {
     var Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
     var JLong  = Java.use('java.lang.Long');
     var PEEK   = JLong.parseLong('131072');
@@ -6830,7 +6838,7 @@ img{{max-width:100%;height:auto}}</style></head>
             try:
                 pid = self.device.spawn([VW_PACKAGE])
                 self.device.resume(pid)
-                time.sleep(3)
+                time.sleep(8)
             except Exception as e:
                 log.error("Cannot start VW app: %s", e)
                 return False
