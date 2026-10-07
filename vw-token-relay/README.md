@@ -6,7 +6,7 @@ Captures Play Integrity tokens and OAuth credentials from the VW myVW app via Fr
 
 VW's North American API requires every request to carry a Play Integrity–attested token. This is already enforced in the US and is expected to roll out to Canada. The official myVW app passes Google's device attestation check; a headless Python connector cannot. This add-on bridges the gap: a rooted Android phone runs the real myVW app, Frida hooks intercept the attested tokens in real-time, and MQTT delivers them to CarConnectivity or Home Assistant automations. Without this (or a similar relay), the [VW NA connector](https://github.com/zackcornelius/CarConnectivity-connector-volkswagen-na) cannot authenticate.
 
-**Note:** Tested on the Canadian endpoint. As of September 2026, the phone achieves **MEETS_STRONG_INTEGRITY** — the highest Play Integrity level — with a software keybox and Pixel 9a Canary fingerprint. This should satisfy both the Canadian and US endpoints. See [Play Integrity Result](#play-integrity-result) below.
+**Note:** Tested on the Canadian endpoint. As of October 2026, the phone achieves **MEETS_STRONG_INTEGRITY** — the highest Play Integrity level — on a Moto G15 Power running LineageOS 23.2 (Android 16) with Magisk 30.7. This should satisfy both the Canadian and US endpoints. See [Play Integrity Result](#play-integrity-result) below.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ VW's North American API requires every request to carry a Play Integrity–attes
 Phone (VW app + Frida) ──USB/ADB──▸ This add-on ──MQTT──▸ Home Assistant / CarConnectivity
 ```
 
-A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `BridgeInterceptor` to capture Play Integrity and OAuth tokens in real-time. Tokens are published to MQTT, where CarConnectivity or HA automations consume them.
+A rooted Android phone runs the official myVW app. Frida's native `Interceptor.attach` hooks BoringSSL's `SSL_write`/`SSL_read` at the C level to capture OAuth tokens from HTTP traffic. ALPN negotiation is forced to HTTP/1.1 for parseable traffic. This approach is **GC-safe on Android 16** — no ART method structs are modified, avoiding the SIGSEGV crashes that occur with Java-level `.implementation` hooks. Tokens are published to MQTT, where CarConnectivity or HA automations consume them.
 
 ## Requirements
 
@@ -25,7 +25,7 @@ A rooted Android phone runs the official myVW app. Frida hooks OkHttp3's `Bridge
   - Tricky Store module (software keybox sufficient — no hardware keybox needed)
   - myVW app installed and logged in
   - USB debugging enabled
-  - Frida server running (`frida-server-16.5.9-android-arm64` or `android-arm` for 32-bit firmware)
+  - Frida server running (`frida-server-17.22.2-android-arm64` recommended — must match your `frida-tools` version)
 - USB connection from phone to HA host
 - Mosquitto MQTT broker on HA
 
@@ -77,6 +77,26 @@ The UI-driven path is the only way to do remote start. The relay navigates the V
 - Publishes errors to `vw/error`, `vw/pif_health`, `vw/pif_update`, `vw/auto_login`
 - Designed to pair with HA automations for iOS/Android push notifications
 
+## Frida Agent — Native SSL Hooks (v3.1)
+
+The Frida agent captures tokens by hooking BoringSSL at the native (C) level rather than at Java. This is critical for Android 16 compatibility:
+
+| Approach | How | Android 16 |
+|----------|-----|------------|
+| Java `.implementation` | Replaces ART method entry points | **Crashes** — GC walks corrupted `CodeInfo` metadata → SIGSEGV at ~20s |
+| `Java.registerClass` | Registers new Java class via JNI | **Crashes** — null pointer in `art::JNI::CallObjectMethod` at ~4s |
+| **Native `Interceptor.attach`** | Patches first instruction of C functions | **Works** — no ART structs modified, GC-safe |
+
+The agent hooks three BoringSSL functions:
+
+- **`SSL_set_alpn_protos`** — Strips `h2` from ALPN negotiation, forcing HTTP/1.1 so traffic is parseable as plain text
+- **`SSL_write`** — Captures outgoing HTTP requests (method, path, Host, Authorization headers)
+- **`SSL_read`** — Captures incoming HTTP responses, handles chunked transfer encoding and gzip decompression via native zlib
+
+Java is used **only** for RPC exports (`readSharedPrefs`, `signWithKeystore`) via `Java.performNow` — one-shot JNI calls that don't modify ART method structs.
+
+The agent is compiled with `frida-compile` to bundle `frida-java-bridge` (required since Frida 17 decoupled it from core). Frida globals (`Module`, etc.) are accessed via `Process.enumerateModules()` to avoid shadowing by the bundler.
+
 ## Quickstart
 
 1. Root your Android phone and pass Play Integrity (see Phone Setup Guide below)
@@ -114,7 +134,11 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 4. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix (osm0sis variant with autopif)
 5. **Install Tricky Store** — Magisk → Modules → Install Tricky Store (software keybox is sufficient)
 6. **Configure DenyList** — Magisk Settings → Enable DenyList. Add `com.google.android.gms` and the VW app.
-7. **Install Frida server** — push to `/data/local/tmp/frida-server`, chmod +x, start with su. Use the `arm64` or `arm` binary matching your device's ABI (check `ro.product.cpu.abilist`).
+7. **Install Frida server** — download `frida-server-17.22.2-android-arm64` (or `-arm` for 32-bit) from [Frida releases](https://github.com/frida/frida/releases). Push to `/data/local/tmp/frida-server`, chmod +x. The add-on starts it automatically via ADB.
+
+> **MediaTek devices (e.g., Moto G15 Power):** The bootloader can be unlocked using [kaeru](https://github.com/R0rt1z2/kaeru). See the [XDA kaeru thread](https://xdaforums.com/t/kaeru-arbitrary-code-execution-on-mediatek-bootloaders.4729227/) for device-specific guides. After bootloader unlock, flash a custom ROM like LineageOS for best results.
+
+> **Android 16 note:** Frida 17+ decoupled the Java bridge from core — the agent uses `frida-compile` to bundle `frida-java-bridge` as an ESM import. Native SSL hooks (`Interceptor.attach` on BoringSSL) are used instead of Java-level `.implementation` hooks to avoid ART GC crashes (SIGSEGV in `CodeInfo::DecodeGcMasksOnly`). This is handled automatically by the add-on.
 8. **Install myVW** — sideload APK, log in, grant all permissions
 9. **Enable USB debugging** — Developer Options → USB Debugging
 10. **Keep screen on** — `adb shell settings put global stay_on_while_plugged_in 3`
@@ -124,18 +148,22 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 
 | Component | Version / Detail |
 |-----------|-----------------|
-| Phone | Motorola Moto G Pure XT2163-4 (`ellis`, 720×1600, arm64) |
-| Android | 12 (upgraded from stock 11 — PI did not pass on 11) |
-| Magisk | 28.1+ |
-| ReZygisk | Latest (replaces Magisk's built-in Zygisk) |
-| PIF module | osm0sis Play Integrity Fix v18.0-lsposed with autopif fingerprint rotation |
+| Phone | Motorola Moto G15 Power (`lamu`, MediaTek, arm64) |
+| OS | LineageOS 23.2 (Android 16, SDK 36) |
+| Root | Magisk v30.7 |
+| Zygisk | ReZygisk (replaces Magisk's built-in Zygisk) |
+| PIF module | Play Integrity Fix (osm0sis variant with autopif fingerprint rotation) |
 | Tricky Store | Latest (software keybox — no hardware keybox needed) |
-| Frida server | 16.5.9-android-arm (32-bit — Moto G Pure is armeabi-v7a only) |
+| Frida server | 17.22.2-android-arm64 |
+| Frida agent | v3.1 — native SSL hooks via `Interceptor.attach` (GC-safe on Android 16) |
 | myVW package | `com.vw.carnet.releaseca` (Canada) |
-| PI verdict | **MEETS_STRONG_INTEGRITY** (verified with SPIC — see screenshot below) |
-| PIF fingerprint | Pixel 9a (`tegu_beta`) Canary — `google/tegu_beta/tegu:CANARY/ZP11.260717.006/16004061:user/release-keys` |
-| HA host | HP mini PC (x86, USB connection to phone) |
+| PI verdict | **MEETS_STRONG_INTEGRITY** |
+| HA host | Home Assistant OS on HP mini PC (x86, USB connection to phone) |
 | MQTT broker | Mosquitto (HA add-on) |
+
+### Previous Setup
+
+The relay was originally developed on a Moto G Pure (XT2163-4, `ellis`, armeabi-v7a, Android 12) with Frida 16.5.9. That device was bricked during bootloader experiments. The current Moto G15 Power uses a MediaTek SoC — bootloader unlock was achieved using [kaeru](https://github.com/R0rt1z2/kaeru) (an ARMv7 payload for MediaTek LK bootloaders). See the [XDA thread](https://xdaforums.com/t/kaeru-arbitrary-code-execution-on-mediatek-bootloaders.4729227/) for guides on MTK bootloader unlocking.
 
 ## Tested Vehicles
 
@@ -148,13 +176,12 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 
 ![SPIC showing MEETS_STRONG_INTEGRITY](https://raw.githubusercontent.com/danielsza/ha-vw-token-relay/main/docs/spic-strong-integrity.png)
 
-**MEETS_STRONG_INTEGRITY** achieved on a rooted Moto G Pure with a software keybox. Key factors:
+**MEETS_STRONG_INTEGRITY** achieved on a rooted Moto G15 Power (LineageOS 23.2 / Android 16) with a software keybox. Key factors:
 
-1. **Pixel 9a Canary fingerprint** — `google/tegu_beta/tegu:CANARY/ZP11.260717.006/16004061:user/release-keys` with `DEVICE_INITIAL_SDK_INT=32` and `SECURITY_PATCH=2026-08-05`
+1. **PIF fingerprint** — autopif rotates through known-good Canary fingerprints automatically
 2. **Fresh Google account credentials** — stale Google credentials cause Finsky to throw `IntegrityException` and fall back to basic-only mode. If PI drops to BASIC, remove the Google account and re-add it.
-3. **ReZygisk + Tricky Store + PIF** — no Shamiko needed. DenyList enabled but empty (not required for these modules).
-
-Previously achieved BASIC_INTEGRITY only (see `docs/spic-basic-integrity.png` for comparison). The upgrade to STRONG was achieved by switching from a Pixel 6 Canary fingerprint to Pixel 9a Canary and refreshing the Google account credentials on the phone.
+3. **ReZygisk + Tricky Store + PIF** — no Shamiko needed. DenyList enabled with `com.google.android.gms` and the VW app added.
+4. **MTK bootloader unlock via kaeru** — required for Moto G15 Power (MediaTek SoC). See [kaeru on GitHub](https://github.com/R0rt1z2/kaeru).
 
 ## Region Notes
 
@@ -167,3 +194,6 @@ Tested on Canadian endpoint (`b-h-s.spr.ca00.p.con-veh.net`). The US endpoint us
 - **Remote start fails with "device pairing required"** — first-time remote start requires pairing the phone with VW's server. Use `vw/cmd/ui_remote_start` to trigger the pairing flow through the app UI.
 - **"Media Storage keeps stopping" dialog** — common on Moto G Pure. The relay auto-dismisses this, but if it persists, clear Media Storage data in Android settings.
 - **Screen stays locked after reboot** — the add-on unlocks the screen automatically (wake → dismiss-keyguard → swipe → home). If this fails, ensure the phone has no PIN/pattern lock set.
+- **SIGSEGV crash ~20s after Frida attach (Android 16)** — this is the ART GC crash caused by Java-level `.implementation` hooks. The v3.1 agent avoids this entirely with native SSL hooks. If you see this, ensure you're running v1.28.3+ of the add-on.
+- **`Module.findExportByName is not a function`** — frida-compile's bundler shadows Frida's `Module` global. Fixed in v1.28.3 by using `Process.enumerateModules()` instead.
+- **`Java is not defined` (Frida 17+)** — Frida 17 decoupled the Java bridge. The add-on uses `frida-compile` to bundle it automatically. If you see this error, the compiled agent isn't being loaded — check the build log.
