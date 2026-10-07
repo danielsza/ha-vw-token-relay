@@ -6919,9 +6919,25 @@ img{{max-width:100%;height:auto}}</style></head>
         self.session.on("detached", self._on_detached)
 
         log.info("Loading Frida script (process still suspended)...")
-        self.script = self.session.create_script(FRIDA_SCRIPT)
-        self.script.on("message", self._on_message)
-        self.script.load()
+        # Try V8 runtime first — QuickJS may fail to load the Java bridge
+        # on Android 16+. Fall back to default if V8 isn't available.
+        for runtime in ("v8", "qjs", None):
+            try:
+                kwargs = {}
+                if runtime:
+                    kwargs["runtime"] = runtime
+                    log.info("Trying %s runtime...", runtime.upper())
+                else:
+                    log.info("Trying default runtime...")
+                self.script = self.session.create_script(FRIDA_SCRIPT, **kwargs)
+                self.script.on("message", self._on_message)
+                self.script.load()
+                log.info("Script loaded with %s runtime", runtime or "default")
+                break
+            except Exception as e:
+                log.warning("Runtime %s failed: %s", runtime or "default", e)
+                if runtime is None:
+                    raise  # Last resort failed
 
         log.info("Resuming PID %d — ART will initialize now...", pid)
         self.device.resume(pid)
