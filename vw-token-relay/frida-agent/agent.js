@@ -1,22 +1,25 @@
 import Java from "frida-java-bridge";
 
-// ── Frida globals (prevent shadowing by Node/bundler) ──
-var FridaModule = globalThis.Module;
-var FridaInterceptor = globalThis.Interceptor;
-var FridaMemory = globalThis.Memory;
-var FridaNativeFunction = globalThis.NativeFunction;
-var FridaNativeCallback = globalThis.NativeCallback;
-var FridaProcess = globalThis.Process;
-var fridaPtr = globalThis.ptr;
+// ── Frida globals ──
+// Module is shadowed by the bundler's Node.js polyfill.
+// Use Process (Frida-specific, never shadowed) to find native exports.
+function findNativeExport(name) {
+    var mods = Process.enumerateModules();
+    for (var i = 0; i < mods.length; i++) {
+        var addr = mods[i].findExportByName(name);
+        if (addr) return addr;
+    }
+    return null;
+}
 
 // ── VW Token Relay — Frida Agent v3.1 (Native SSL Hooks) ──
 //
-// Hooks BoringSSL's SSL_write/SSL_read via FridaInterceptor.attach (native C
+// Hooks BoringSSL's SSL_write/SSL_read via Interceptor.attach (native C
 // function patching). Forces HTTP/1.1 by modifying ALPN negotiation.
 // Parses HTTP/1.1 traffic at the TLS layer to capture tokens.
 //
 // Why this is GC-safe:
-//   FridaInterceptor.attach patches the first instruction of NATIVE functions
+//   Interceptor.attach patches the first instruction of NATIVE functions
 //   (SSL_write, SSL_read, etc.) — no ART method structs touched, no
 //   CodeInfo corruption, no GC crash.
 //
@@ -53,8 +56,8 @@ var _alpnForced = false;
 
 // ── Install native SSL hooks ──
 function installNativeHooks() {
-    var SSL_write = FridaModule.findExportByName(null, 'SSL_write');
-    var SSL_read  = FridaModule.findExportByName(null, 'SSL_read');
+    var SSL_write = findNativeExport('SSL_write');
+    var SSL_read  = findNativeExport('SSL_read');
 
     if (!SSL_write || !SSL_read) {
         send({ type: 'hook_error', error: 'Cannot find SSL_write/SSL_read exports' });
@@ -64,9 +67,9 @@ function installNativeHooks() {
     // ── Force HTTP/1.1 via ALPN ──
     // This makes all connections use plain-text HTTP/1.1 instead of binary
     // HTTP/2, so we can parse traffic as simple text.
-    var SSL_set_alpn = FridaModule.findExportByName(null, 'SSL_set_alpn_protos');
+    var SSL_set_alpn = findNativeExport('SSL_set_alpn_protos');
     if (SSL_set_alpn) {
-        FridaInterceptor.attach(SSL_set_alpn, {
+        Interceptor.attach(SSL_set_alpn, {
             onEnter: function (args) {
                 try {
                     var protosLen = args[2].toInt32();
@@ -84,10 +87,10 @@ function installNativeHooks() {
                     }
                     if (hasH2) {
                         // Replace with http/1.1 only: \x08http/1.1
-                        var h11 = FridaMemory.alloc(9);
+                        var h11 = Memory.alloc(9);
                         h11.writeByteArray([0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31]);
                         args[1] = h11;
-                        args[2] = fridaPtr(9);
+                        args[2] = ptr(9);
                         this._mem = h11; // prevent GC
                         _alpnForced = true;
                     }
@@ -100,7 +103,7 @@ function installNativeHooks() {
     }
 
     // ── Hook SSL_write: capture outgoing HTTP requests ──
-    FridaInterceptor.attach(SSL_write, {
+    Interceptor.attach(SSL_write, {
         onEnter: function (args) {
             var num = args[2].toInt32();
             if (num < 16 || num > 65536) return; // skip tiny/huge writes
@@ -168,7 +171,7 @@ function installNativeHooks() {
     });
 
     // ── Hook SSL_read: capture incoming HTTP responses ──
-    FridaInterceptor.attach(SSL_read, {
+    Interceptor.attach(SSL_read, {
         onEnter: function (args) {
             this._ssl = args[0];
             this._buf = args[1];
@@ -337,31 +340,31 @@ function dechunk(raw) {
 
 // ── Native gzip decompression via zlib ──
 function nativeGunzip(fullResp, bodyStartOffset) {
-    var inflateInit2Ptr = FridaModule.findExportByName(null, 'inflateInit2_');
-    var inflatePtr      = FridaModule.findExportByName(null, 'inflate');
-    var inflateEndPtr   = FridaModule.findExportByName(null, 'inflateEnd');
+    var inflateInit2Ptr = findNativeExport('inflateInit2_');
+    var inflatePtr      = findNativeExport('inflate');
+    var inflateEndPtr   = findNativeExport('inflateEnd');
 
     if (!inflateInit2Ptr || !inflatePtr || !inflateEndPtr) {
         throw new Error('zlib not found');
     }
 
-    var inflateInit2 = new FridaNativeFunction(inflateInit2Ptr, 'int', ['pointer', 'int', 'pointer', 'int']);
-    var inflateF     = new FridaNativeFunction(inflatePtr,      'int', ['pointer', 'int']);
-    var inflateEnd   = new FridaNativeFunction(inflateEndPtr,   'int', ['pointer']);
+    var inflateInit2 = new NativeFunction(inflateInit2Ptr, 'int', ['pointer', 'int', 'pointer', 'int']);
+    var inflateF     = new NativeFunction(inflatePtr,      'int', ['pointer', 'int']);
+    var inflateEnd   = new NativeFunction(inflateEndPtr,   'int', ['pointer']);
 
     // Extract raw body bytes
     var bodyStr = fullResp.substring(bodyStartOffset);
     var inLen = bodyStr.length;
-    var inBuf = FridaMemory.alloc(inLen);
+    var inBuf = Memory.alloc(inLen);
     inBuf.writeUtf8String(bodyStr);
 
     // Output buffer (4x input)
     var outLen = inLen * 4;
     if (outLen < 16384) outLen = 16384;
-    var outBuf = FridaMemory.alloc(outLen);
+    var outBuf = Memory.alloc(outLen);
 
     // z_stream struct (112 bytes on arm64)
-    var stream = FridaMemory.alloc(128);
+    var stream = Memory.alloc(128);
     stream.writeByteArray(new Array(128).fill(0));
 
     // z_stream fields: next_in(ptr), avail_in(uint), total_in(ulong),
@@ -372,7 +375,7 @@ function nativeGunzip(fullResp, bodyStartOffset) {
     stream.add(24).writeU32(outLen);                     // avail_out
 
     // ZLIB version string
-    var zlibVer = FridaMemory.allocUtf8String('1.2.11');
+    var zlibVer = Memory.allocUtf8String('1.2.11');
 
     // inflateInit2_(stream, windowBits=15+16=31 for gzip, version, stream_size)
     var ret = inflateInit2(stream, 31, zlibVer, 128);
