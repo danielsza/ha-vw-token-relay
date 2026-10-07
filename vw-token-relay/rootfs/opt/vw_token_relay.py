@@ -86,11 +86,15 @@ FRIDA_SCRIPT = r"""
 var _javaRetries = 0;
 function _tryJavaPerform(fn) {
     _javaRetries++;
+    var jType = typeof Java;
+    var jAvail = (jType !== 'undefined') ? Java.available : false;
+    send({ type: 'status', msg: 'JAVA_DIAG attempt=' + _javaRetries + ' typeof=' + jType + ' available=' + jAvail });
     try {
         Java.perform(fn);
+        send({ type: 'status', msg: 'JAVA_DIAG Java.perform() returned OK on attempt ' + _javaRetries });
     } catch (e) {
         if (_javaRetries < 40) {
-            send({ type: 'status', msg: 'Java not ready (attempt ' + _javaRetries + '/40): ' + e });
+            send({ type: 'status', msg: 'JAVA_DIAG Java.perform() threw (attempt ' + _javaRetries + '/40): ' + e });
             setTimeout(function() { _tryJavaPerform(fn); }, 500);
         } else {
             send({ type: 'status', msg: 'FATAL: Java hooks failed after 40 attempts: ' + e });
