@@ -476,6 +476,9 @@ rpc.exports = {
 };
 """
 
+# Path to compiled Frida agent (bundled frida-java-bridge for Frida 17+)
+COMPILED_AGENT_PATH = "/opt/compiled_agent.js"
+
 
 class VWTokenRelay:
     def __init__(self, mqtt_host, mqtt_port=1883, mqtt_user=None, mqtt_pass=None,
@@ -6919,33 +6922,30 @@ img{{max-width:100%;height:auto}}</style></head>
         self.session.on("detached", self._on_detached)
 
         log.info("Loading Frida script (process still suspended)...")
-        # Try V8 runtime first — QuickJS may fail to load the Java bridge
-        # on Android 16+. Fall back to default if V8 isn't available.
-        for runtime in ("v8", "qjs", None):
-            try:
-                kwargs = {}
-                if runtime:
-                    kwargs["runtime"] = runtime
-                    log.info("Trying %s runtime...", runtime.upper())
-                else:
-                    log.info("Trying default runtime...")
-                self.script = self.session.create_script(FRIDA_SCRIPT, **kwargs)
-                self.script.on("message", self._on_message)
-                self.script.load()
-                log.info("Script loaded with %s runtime", runtime or "default")
-                break
-            except Exception as e:
-                log.warning("Runtime %s failed: %s", runtime or "default", e)
-                if runtime is None:
-                    raise  # Last resort failed
+        # Load compiled agent (bundles frida-java-bridge for Frida 17+)
+        # Fall back to inline script if compiled agent not found.
+        import os as _os
+        if _os.path.isfile(COMPILED_AGENT_PATH):
+            with open(COMPILED_AGENT_PATH, "r") as _f:
+                script_source = _f.read()
+            log.info("Using compiled agent (%d bytes, bundled frida-java-bridge)",
+                     len(script_source))
+        else:
+            script_source = FRIDA_SCRIPT
+            log.warning("Compiled agent not found at %s — using inline script",
+                        COMPILED_AGENT_PATH)
+
+        self.script = self.session.create_script(script_source, runtime="v8")
+        self.script.on("message", self._on_message)
+        self.script.load()
+        log.info("Script loaded")
 
         log.info("Resuming PID %d — ART will initialize now...", pid)
         self.device.resume(pid)
 
-        # The script polls for Java bridge availability (up to 30s).
-        # ART needs time to fully initialize after resume.
+        # Give the app time to initialize after resume.
         time.sleep(5)
-        log.info("Process resumed — script is polling for Java bridge...")
+        log.info("Process resumed — hooks should be installing...")
         return True
 
     def _on_detached(self, reason, crash):

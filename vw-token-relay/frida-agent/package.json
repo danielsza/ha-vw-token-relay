@@ -1,0 +1,9 @@
+{
+  "name": "vw-frida-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Frida agent for VW token capture — compiled with frida-java-bridge",
+  "dependencies": {
+    "frida-java-bridge": "*"
+  }
+}
