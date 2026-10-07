@@ -19,8 +19,7 @@ A rooted Android phone runs the official myVW app. Frida's native `Interceptor.a
 ## Requirements
 
 - Rooted Android phone with:
-  - Magisk (28.1+)
-  - ReZygisk module (replaces Magisk's built-in Zygisk)
+  - Magisk (28.1+) with Zygisk enabled in settings
   - Shamiko module (hides root from Google Play Services and the VW app)
   - Play Integrity Fix (PIF) module — configured with the device's own fingerprint (extracted before rooting)
   - myVW app installed and logged in
@@ -130,7 +129,7 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 
 1. **Unlock bootloader** — `fastboot oem unlock`
 2. **Root with Magisk** — flash patched boot.img via fastboot
-3. **Install ReZygisk** — Magisk → Modules → Install ReZygisk (replaces Magisk's built-in Zygisk)
+3. **Enable Zygisk** — Magisk → Settings → Enable Zygisk (built-in to Magisk 28.1+)
 4. **Install Shamiko** — Magisk → Modules → Install Shamiko. Hides root from Google Play Services and the VW app via DenyList.
 5. **Install PIF module** — Magisk → Modules → Install Play Integrity Fix. Configure it with the device's own fingerprint (extract from stock build.prop before unlocking the bootloader)
 6. **Configure DenyList** — Magisk Settings → Enable DenyList. Add `com.google.android.gms` and the VW app.
@@ -151,7 +150,7 @@ Add-on settings (Settings → Add-ons → VW Token Relay → Configuration):
 | Phone | Motorola Moto G15 Power (`lamu`, MediaTek, arm64) |
 | OS | LineageOS 23.2 (Android 16, SDK 36) |
 | Root | Magisk v30.7 |
-| Zygisk | ReZygisk (replaces Magisk's built-in Zygisk) |
+| Zygisk | Magisk's built-in Zygisk (enabled in settings) |
 | Hide root | Shamiko (hides root from GMS and VW app) |
 | PIF module | Play Integrity Fix — device's own fingerprint (extracted from stock before rooting) |
 | Frida server | 17.22.2-android-arm64 |
@@ -181,7 +180,7 @@ The relay was originally developed on a Moto G Pure (XT2163-4, `ellis`, armeabi-
 1. **Device's own fingerprint** — extracted from the phone's stock firmware before unlocking the bootloader. No autopif rotation, no Canary fingerprint — the real device fingerprint passes PI natively.
 2. **No keybox needed** — neither hardware nor software keybox is required. Tricky Store is not used.
 3. **Fresh Google account credentials** — stale Google credentials cause Finsky to throw `IntegrityException` and fall back to basic-only mode. If PI drops to BASIC, remove the Google account and re-add it.
-4. **ReZygisk + Shamiko + PIF** — Shamiko hides root from Google Play Services and the VW app. No Tricky Store needed. DenyList enabled with `com.google.android.gms` and the VW app added.
+4. **Shamiko + PIF (Magisk's built-in Zygisk)** — Shamiko hides root from Google Play Services and the VW app. No Tricky Store needed. DenyList enabled with `com.google.android.gms` and the VW app added.
 5. **MTK bootloader unlock via kaeru** — required for Moto G15 Power (MediaTek SoC). See [kaeru on GitHub](https://github.com/R0rt1z2/kaeru).
 
 ## Region Notes
