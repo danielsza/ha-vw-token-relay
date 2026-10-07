@@ -508,6 +508,7 @@ class VWTokenRelay:
 
         # Silent-detach recovery tracking
         self._last_recovery_time = None   # prevents recovery storm on slow phone
+        self._keepalive_recovering = False  # set during keepalive recovery to suppress _on_detached reattach loop
 
         # Phone health tracking
         self._phone_down_since = None     # when phone was first detected as down
@@ -6987,6 +6988,15 @@ img{{max-width:100%;height:auto}}</style></head>
         self.session = None
         self.script = None
 
+        # ── Keepalive is already recovering ──
+        # If the keepalive thread triggered this detach (by nulling the
+        # session) or is in the middle of its own recovery, don't start
+        # a competing reattach loop — the keepalive handles it.
+        if self._keepalive_recovering:
+            log.info("Detach during keepalive recovery — skipping reattach "
+                     "loop (keepalive thread is handling it)")
+            return
+
         # ── Expected ART GC crash (Android 16) ──
         # Frida's .implementation replacement corrupts ART CodeInfo metadata.
         # The GC crashes ~22s after spawn even after hooks are removed.
@@ -7065,6 +7075,19 @@ img{{max-width:100%;height:auto}}</style></head>
         return False
 
     # ── Keep-alive loop ─────────────────────────────────────────────
+    def _keepalive_loop_safe(self):
+        """Wrapper ensuring the keepalive thread never dies silently.
+        If _keepalive_loop crashes from an unhandled exception, log it
+        and restart the loop after a brief pause."""
+        while self._running:
+            try:
+                self._keepalive_loop()
+                break  # normal exit (self._running went False)
+            except Exception as e:
+                log.error("KEEPALIVE: Thread crashed — restarting in 10s: %s",
+                          e, exc_info=True)
+                time.sleep(10)
+
     def _keepalive_loop(self):
         """Every 5 minutes, check token freshness.  When stale, recover
         aggressively: wake → force-restart → re-login with short waits
@@ -7186,11 +7209,14 @@ img{{max-width:100%;height:auto}}</style></head>
                         silent_detach_age)
                     self._last_recovery_time = datetime.now()
                     try:
-                        # Invalidate the stale session
-                        try:
-                            self.session.detach()
-                        except Exception:
-                            pass
+                        # Set flag BEFORE nulling session so _on_detached
+                        # skips its own reattach loop (avoids race condition
+                        # where two threads both call _attach_frida).
+                        self._keepalive_recovering = True
+                        # Invalidate the stale session — do NOT call
+                        # session.detach() as that fires _on_detached in a
+                        # separate Frida thread which starts a competing
+                        # 12-attempt reattach loop.  Just null out the refs.
                         self.session = None
                         self.script = None
                         # Full restart: force-stop app, reattach Frida, relaunch
@@ -7205,6 +7231,8 @@ img{{max-width:100%;height:auto}}</style></head>
                                       "will retry next cycle")
                     except Exception as e:
                         log.error("KEEPALIVE: Silent-detach recovery error: %s", e)
+                    finally:
+                        self._keepalive_recovering = False
                 elif silent_detach_age > 8 and not recovery_cooldown_ok:
                     cooldown_remaining = 360 - (datetime.now() - self._last_recovery_time).total_seconds()
                     log.info(
@@ -7259,17 +7287,20 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.warning("No fresh tokens after wake — force-restarting "
                             "VW app + reattaching Frida (attempt %d)",
                             no_token_count)
-                # Invalidate stale Frida session before killing the process
-                try:
-                    if self.session:
-                        self.session.detach()
-                except Exception:
-                    pass
+                # Invalidate stale Frida session before killing the process.
+                # Do NOT call session.detach() — it fires _on_detached in a
+                # separate thread which starts a competing reattach loop.
+                # Set recovery flag so any stale _on_detached callback skips
+                # its own reattach loop.
+                self._keepalive_recovering = True
                 self.session = None
                 self.script = None
-                # Use _wake_app_full_restart which handles force-stop,
-                # relaunch, Frida reattach, and navigation
-                self._wake_app_full_restart()
+                try:
+                    # Use _wake_app_full_restart which handles force-stop,
+                    # relaunch, Frida reattach, and navigation
+                    self._wake_app_full_restart()
+                finally:
+                    self._keepalive_recovering = False
 
                 if self._tokens_are_fresh():
                     log.info("Token flow recovered after force-restart")
@@ -7427,7 +7458,7 @@ img{{max-width:100%;height:auto}}</style></head>
             log.warning("Running WITHOUT Frida — MQTT commands available but no token capture")
         else:
             # Start keepalive thread only if Frida is connected
-            t = threading.Thread(target=self._keepalive_loop, daemon=True)
+            t = threading.Thread(target=self._keepalive_loop_safe, daemon=True)
             t.start()
 
         log.info("=" * 60)
