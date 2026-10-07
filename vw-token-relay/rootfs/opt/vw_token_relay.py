@@ -83,15 +83,22 @@ VW_API_HEADERS = {
 FRIDA_SCRIPT = r"""
 'use strict';
 
-function _waitForJava(fn) {
-    if (typeof Java !== 'undefined' && Java.available) {
+var _javaRetries = 0;
+function _tryJavaPerform(fn) {
+    _javaRetries++;
+    try {
         Java.perform(fn);
-    } else {
-        setTimeout(function () { _waitForJava(fn); }, 250);
+    } catch (e) {
+        if (_javaRetries < 40) {
+            send({ type: 'status', msg: 'Java not ready (attempt ' + _javaRetries + '/40): ' + e });
+            setTimeout(function() { _tryJavaPerform(fn); }, 500);
+        } else {
+            send({ type: 'status', msg: 'FATAL: Java hooks failed after 40 attempts: ' + e });
+        }
     }
 }
 
-_waitForJava(function () {
+_tryJavaPerform(function () {
     var Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
     var JLong  = Java.use('java.lang.Long');
     var PEEK   = JLong.parseLong('131072');
