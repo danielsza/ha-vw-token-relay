@@ -6948,6 +6948,32 @@ img{{max-width:100%;height:auto}}</style></head>
         log.info("Process resumed — hooks should be installing...")
         return True
 
+
+    def _rehook_frida(self):
+        """Briefly reinstall Frida hooks so the next app wake captures tokens.
+
+        The capture-and-unhook agent auto-removes hooks after capture (or after
+        12 s safety timer) to avoid ART GC crashes on Android 16.  Before each
+        keepalive wake we call the agent's rehook() RPC to re-enable them.
+        """
+        if self.script is None:
+            return False
+        try:
+            raw = self.script.exports_sync.rehook()
+            import json as _json
+            result = _json.loads(raw)
+            status = result.get('status', 'unknown')
+            if status == 'hooks_reinstalled':
+                log.info("REHOOK: Hooks reinstalled for token capture")
+            elif status == 'already_hooked':
+                log.debug("REHOOK: Hooks were still active")
+            else:
+                log.warning("REHOOK: Unexpected status: %s", status)
+            return True
+        except Exception as e:
+            log.warning("REHOOK: Failed to reinstall hooks: %s", e)
+            return False
+
     def _on_detached(self, reason, crash):
         log.warning("Frida detached: reason=%s crash=%s", reason, crash)
         if not self._running:
@@ -7188,6 +7214,7 @@ img{{max-width:100%;height:auto}}</style></head>
             if needs_refresh or not has_any_token:
                 # ── Step 1: wake the running app (~30s) ──
                 log.info("Tokens expiring/missing, waking app for refresh...")
+                self._rehook_frida()
                 self._wake_app()
                 time.sleep(30)
 
@@ -7236,6 +7263,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 # ── Step 3: wait 2 min, try once more (~2.5 min) ──
                 log.warning("Still no tokens — waiting 2 min then retrying")
                 time.sleep(120)
+                self._rehook_frida()
                 self._wake_app()
                 time.sleep(30)
 
@@ -7250,6 +7278,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 self._auto_relogin()
                 no_token_count = 0
                 time.sleep(15)
+                self._rehook_frida()
                 self._wake_app()
             else:
                 no_token_count = 0
@@ -7275,6 +7304,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     except HTTPError as e:
                         if e.code in (401, 403):
                             log.warning("Token validation failed (%d) — waking app for refresh", e.code)
+                            self._rehook_frida()
                             self._wake_app()
                         else:
                             log.debug("Token validation: HTTP %d (non-auth, ignoring)", e.code)

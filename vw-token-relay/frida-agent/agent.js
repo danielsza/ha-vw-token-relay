@@ -3,6 +3,14 @@ import Java from "frida-java-bridge";
 // ── VW Token Relay — Frida Agent ──
 // Hooks OkHttp3 BridgeInterceptor to capture OAuth + API traffic.
 // Requires frida-compile to bundle frida-java-bridge (decoupled in Frida 17+).
+//
+// CAPTURE-AND-UNHOOK pattern:
+// ART's GC on Android 16 crashes when walking the stack through Frida's
+// replaced method implementations (null CodeInfo in DecodeGcMasksOnly).
+// GC typically runs ~15-20s after process start. We install hooks, capture
+// the initial token burst, then restore the original implementation BEFORE
+// the first GC cycle. The Python relay calls rpc.rehook() briefly before
+// each keepalive wake to grab fresh tokens.
 
 // Known API path prefixes
 var API_PATHS = [
@@ -24,7 +32,6 @@ function getRequestBody(req) {
         var body = req.body();
         if (body === null) return null;
 
-        // Strategy 1: okio.Buffer
         var BufferClass = null;
         try { BufferClass = Java.use('okio.Buffer'); } catch(e) {}
         if (!BufferClass) try { BufferClass = Java.use('okhttp3.internal.okio.Buffer'); } catch(e) {}
@@ -38,7 +45,6 @@ function getRequestBody(req) {
             } catch(e1) {}
         }
 
-        // Strategy 2: FormBody
         try {
             var ActualClass = Java.use(body.getClass().getName());
             var typed = Java.cast(body, ActualClass);
@@ -50,7 +56,6 @@ function getRequestBody(req) {
             if (parts.length > 0) return parts.join('&');
         } catch(e2) {}
 
-        // Strategy 3: classloader lookup
         try {
             var cl = body.getClass().getClassLoader();
             var bufCls = cl.loadClass('okio.Buffer');
@@ -68,7 +73,33 @@ function getRequestBody(req) {
     }
 }
 
-// ── Main hook installation ──
+// ── Hook state ──
+var _Bridge = null;          // Java.use handle (reusable across hook/unhook)
+var _origIntercept = null;   // original .implementation ref
+var _hooked = false;
+var _tokenCaptured = false;
+var _unhookTimer = null;
+var _autoUnhookMs = 12000;   // unhook 12s after install (well before GC at ~15-20s)
+var _captureUnhookMs = 3000; // unhook 3s after first token capture
+
+function unhookInterceptor() {
+    if (!_hooked || !_Bridge) return;
+    try {
+        Java.performNow(function () {
+            _Bridge.intercept.implementation = _origIntercept;
+        });
+    } catch (e) {
+        // If performNow fails, try direct assignment
+        try { _Bridge.intercept.implementation = _origIntercept; } catch(e2) {}
+    }
+    _hooked = false;
+    if (_unhookTimer) {
+        clearTimeout(_unhookTimer);
+        _unhookTimer = null;
+    }
+    send({ type: 'status', msg: 'Hooks removed (original implementation restored) — safe from GC crash' });
+}
+
 function installHooks() {
     if (!Java.available) {
         send({ type: 'status', msg: 'Java bridge imported but not available — retrying in 500ms' });
@@ -77,12 +108,16 @@ function installHooks() {
     }
 
     Java.perform(function () {
-        var Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
+        _Bridge = Java.use('okhttp3.internal.http.BridgeInterceptor');
         var JLong = Java.use('java.lang.Long');
         var PEEK = JLong.parseLong('131072');
         var API_PEEK = JLong.parseLong('32768');
 
-        Bridge.intercept.implementation = function (chain) {
+        // Save original implementation for restoration
+        _origIntercept = _Bridge.intercept.implementation;
+        _tokenCaptured = false;
+
+        _Bridge.intercept.implementation = function (chain) {
             var resp;
             try {
                 var req = chain.request();
@@ -97,6 +132,7 @@ function installHooks() {
                         var val = hdrs.value(i);
                         if (val.length > 50) {
                             send({ type: 'auth_header', url: url, token: val.substring(7) });
+                            scheduleUnhookAfterCapture();
                         }
                         break;
                     }
@@ -108,6 +144,7 @@ function installHooks() {
                         var reqBody = getRequestBody(req);
                         send({ type: 'token_response', url: url, method: method,
                                requestBody: reqBody, body: resp.peekBody(PEEK).string() });
+                        scheduleUnhookAfterCapture();
                     } catch (e) {}
                     return resp;
                 }
@@ -115,6 +152,7 @@ function installHooks() {
                 // ── idToken from URL query params ──
                 if (url.indexOf('idToken=') !== -1) {
                     send({ type: 'id_token_url', url: url });
+                    scheduleUnhookAfterCapture();
                 }
 
                 // ── Known API responses ──
@@ -130,8 +168,36 @@ function installHooks() {
             return resp;
         };
 
+        _hooked = true;
         send({ type: 'status', msg: 'Hooks installed — token + API capture active' });
+
+        // Safety net: auto-unhook after _autoUnhookMs even if no tokens captured,
+        // to prevent GC crash
+        _unhookTimer = setTimeout(function () {
+            if (_hooked) {
+                send({ type: 'status', msg: 'Auto-unhook timer fired (no crash window) — removing hooks' });
+                unhookInterceptor();
+            }
+        }, _autoUnhookMs);
     });
+}
+
+function scheduleUnhookAfterCapture() {
+    if (_tokenCaptured) return; // already scheduled
+    _tokenCaptured = true;
+
+    // Clear the safety-net timer and set a shorter post-capture timer
+    if (_unhookTimer) {
+        clearTimeout(_unhookTimer);
+        _unhookTimer = null;
+    }
+
+    _unhookTimer = setTimeout(function () {
+        if (_hooked) {
+            send({ type: 'status', msg: 'Post-capture unhook — tokens grabbed, removing hooks to prevent GC crash' });
+            unhookInterceptor();
+        }
+    }, _captureUnhookMs);
 }
 
 send({ type: 'status', msg: 'Java bridge module loaded via ESM import' });
@@ -139,6 +205,29 @@ installHooks();
 
 // ── RPC exports ──
 rpc.exports = {
+    // Re-enable hooks briefly (called by Python relay before keepalive wake)
+    rehook: function () {
+        if (_hooked) return JSON.stringify({ status: 'already_hooked' });
+        try {
+            installHooks();
+            return JSON.stringify({ status: 'hooks_reinstalled' });
+        } catch (e) {
+            return JSON.stringify({ status: 'error', error: e.toString() });
+        }
+    },
+
+    // Explicitly remove hooks
+    unhook: function () {
+        if (!_hooked) return JSON.stringify({ status: 'not_hooked' });
+        unhookInterceptor();
+        return JSON.stringify({ status: 'unhooked' });
+    },
+
+    // Check hook state
+    hookStatus: function () {
+        return JSON.stringify({ hooked: _hooked, tokenCaptured: _tokenCaptured });
+    },
+
     listKeystoreAliases: function () {
         var retval = null;
         Java.performNow(function () {
