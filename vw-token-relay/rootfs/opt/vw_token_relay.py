@@ -542,6 +542,7 @@ class VWTokenRelay:
         self.session = None
         self.script = None
         self.device = None
+        self._expect_gc_crash = False  # set after token capture; suppresses reattach on ART GC crash
 
         # MQTT
         self.mqttc = None
@@ -6720,6 +6721,7 @@ img{{max-width:100%;height:auto}}</style></head>
                      payload.get("method", "?"), payload.get("url", "?"))
             self._store_tokens_from_response(payload["body"], payload.get("requestBody"))
             self._publish_tokens()
+            self._expect_gc_crash = True  # tokens captured; suppress reattach on ART GC crash
 
         elif msg_type == "auth_header":
             self._store_token_from_header(payload["token"], payload["url"])
@@ -6873,6 +6875,7 @@ img{{max-width:100%;height:auto}}</style></head>
         ART rather than attaching to an already-running process where ART
         memory layout detection can fail (Android 16+).
         """
+        self._expect_gc_crash = False  # reset for fresh attach cycle
         log.info("Looking for USB device...")
         self.device = frida.get_usb_device(timeout=10)
         log.info("Device: %s", self.device.name)
@@ -6981,6 +6984,17 @@ img{{max-width:100%;height:auto}}</style></head>
 
         self.session = None
         self.script = None
+
+        # ── Expected ART GC crash (Android 16) ──
+        # Frida's .implementation replacement corrupts ART CodeInfo metadata.
+        # The GC crashes ~22s after spawn even after hooks are removed.
+        # If we already captured tokens, skip the reattach storm — the
+        # keepalive loop will do a clean _wake_app_full_restart when needed.
+        if self._expect_gc_crash and reason == "process-terminated":
+            log.info("Expected ART GC crash — tokens already captured. "
+                     "Skipping reattach loop; keepalive will recover.")
+            self._expect_gc_crash = False
+            return
 
         # Escalating backoff: 10,10,15,15,20,20,30,30,30,30,30,30 = ~270s total
         delays = [10, 10, 15, 15, 20, 20, 30, 30, 30, 30, 30, 30]
