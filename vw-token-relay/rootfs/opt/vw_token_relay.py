@@ -4911,7 +4911,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     if target_name.lower() in txt:
                         found_target = (cx, cy, bounds, attrs)
                         log.info("SWITCH: Compose found TARGET '%s' at (%d,%d)",
-             0:                 target_name, cx, cy)
+                                target_name, cx, cy)
                     elif any(v in txt for v in ["buzz", "atlas"]):
                         found_current = (cx, cy, bounds, attrs)
                         log.info("SWITCH: Compose found CURRENT at (%d,%d) text='%s'",
