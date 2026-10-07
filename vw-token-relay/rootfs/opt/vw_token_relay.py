@@ -6725,6 +6725,7 @@ img{{max-width:100%;height:auto}}</style></head>
 
         elif msg_type == "auth_header":
             self._store_token_from_header(payload["token"], payload["url"])
+            self._expect_gc_crash = True  # tokens captured; suppress reattach on ART GC crash
             m = re.search(r"/vehicle/([0-9a-f-]{36})", payload["url"])
             if m:
                 vid = m.group(1)
@@ -6779,6 +6780,7 @@ img{{max-width:100%;height:auto}}</style></head>
                             with self._lock:
                                 self.id_token = captured_id
                             log.info("id_token captured from URL query param! (len=%d)", len(captured_id))
+                            self._expect_gc_crash = True  # token captured; suppress reattach on ART GC crash
                 except Exception as e:
                     log.debug("Failed to extract idToken from URL: %s", e)
 
