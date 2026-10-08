@@ -2646,6 +2646,129 @@ img{{max-width:100%;height:auto}}</style></head>
             else:
                 log.error("UI_RST: No UI XML from Garage screen")
 
+            # ── VEHICLE VERIFICATION ──
+            # After tapping Atlas on the Garage, verify the correct
+            # vehicle dashboard loaded.  The VW app sometimes loads the
+            # default/primary vehicle (ID. Buzz) instead of the tapped
+            # one.  Check vehicleNameTextView and retry if wrong.
+            correct_vehicle = False
+            for vv_attempt in range(3):
+                vv_xml = self._dump_ui_xml()
+                if not vv_xml:
+                    log.warning("UI_RST: Vehicle verify — no XML "
+                                "(attempt %d)", vv_attempt)
+                    time.sleep(3)
+                    continue
+
+                vv_name_elems = self._find_ui_elements(
+                    vv_xml, resource_id="vehicleNameTextView")
+                if vv_name_elems:
+                    vv_name = vv_name_elems[0][3].get("text", "")
+                    if "atlas" in vv_name.lower():
+                        log.info("UI_RST: Vehicle verified — %s "
+                                 "(attempt %d)", vv_name, vv_attempt)
+                        correct_vehicle = True
+                        break
+                    else:
+                        log.warning("UI_RST: WRONG VEHICLE loaded: '%s' "
+                                    "(expected Atlas) — retrying "
+                                    "(attempt %d)", vv_name, vv_attempt)
+                        # Press back to return to Garage
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input keyevent BACK"],
+                            capture_output=True, timeout=10)
+                        time.sleep(3)
+
+                        # Re-launch Garage explicitly
+                        subprocess.run(
+                            ["adb", "shell", "am", "start", "-W", "-n",
+                             f"{VW_PACKAGE}/com.vw.myVW.activities."
+                             "ForcedGarageActivity"],
+                            capture_output=True, timeout=30, text=True)
+                        time.sleep(5)
+                        self._dismiss_system_dialogs()
+                        self._dismiss_vw_alert_dialogs()
+
+                        # Re-find and tap Atlas — use card center, not
+                        # text center, for a more reliable hit
+                        retry_xml = self._dump_ui_xml()
+                        if retry_xml:
+                            # Look for the clickable card containing
+                            # "Atlas" text
+                            atlas_texts = self._find_ui_elements(
+                                retry_xml, text="Atlas")
+                            if atlas_texts:
+                                # Find the parent clickable card —
+                                # search for android.view.View elements
+                                # near the Atlas text
+                                atx = atlas_texts[0][0]
+                                aty = atlas_texts[0][1]
+                                # Tap 200px below text center to hit
+                                # the middle of the card image area
+                                tap_y = aty + 200
+                                log.info("UI_RST: Re-tapping Atlas "
+                                         "card center at (%d,%d)",
+                                         540, tap_y)
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     f"input tap 540 {tap_y}"],
+                                    capture_output=True, timeout=10)
+                            else:
+                                # Atlas text not found — tap at known
+                                # card center
+                                log.info("UI_RST: Atlas text not found "
+                                         "— tapping card center "
+                                         "(540,1229)")
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     "input tap 540 1229"],
+                                    capture_output=True, timeout=10)
+                        else:
+                            log.warning("UI_RST: No XML on Garage "
+                                        "retry — tapping (540,1229)")
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input tap 540 1229"],
+                                capture_output=True, timeout=10)
+                        time.sleep(12)
+                else:
+                    # No vehicleNameTextView — might still be on Garage
+                    # or transitioning.  Check if Garage elements exist.
+                    garage_title = self._find_ui_elements(
+                        vv_xml, text="Garage")
+                    if garage_title:
+                        log.info("UI_RST: Still on Garage screen — "
+                                 "Atlas tap may not have registered. "
+                                 "Retapping (attempt %d)", vv_attempt)
+                        atlas_retry = self._find_ui_elements(
+                            vv_xml, text="Atlas")
+                        if atlas_retry:
+                            arx = atlas_retry[0][0]
+                            ary = atlas_retry[0][1]
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {arx} {ary}"],
+                                capture_output=True, timeout=10)
+                        else:
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input tap 540 1229"],
+                                capture_output=True, timeout=10)
+                        time.sleep(12)
+                    else:
+                        log.info("UI_RST: No vehicleNameTextView and "
+                                 "not on Garage — may be loading "
+                                 "(attempt %d)", vv_attempt)
+                        time.sleep(5)
+
+            if not correct_vehicle:
+                log.error("UI_RST: Could not navigate to Atlas "
+                          "dashboard after 3 attempts — aborting")
+                return {"status": "error",
+                        "message": "Wrong vehicle dashboard loaded "
+                                   "(expected Atlas)"}
+
             # ── BLIND TAP AT KNOWN BUTTON POSITION ──
             # Even a UI dump (uiautomator) can cause the toolbar to
             # collapse, so skip all XML checks and directly tap the
@@ -2854,6 +2977,87 @@ img{{max-width:100%;height:auto}}</style></head>
                             time.sleep(15)
                     self._wake_screen()
                     self._dismiss_system_dialogs()
+
+                # ── Dashboard sanity check ──
+                # Verify we're still on the Atlas vehicle dashboard.
+                # Scrolling in previous attempts can accidentally
+                # navigate to Trip stats, charge history, etc.
+                dash_check_xml = self._dump_ui_xml()
+                if dash_check_xml and attempt > 0:
+                    # Check for known non-dashboard screens
+                    trip_stats = self._find_ui_elements(
+                        dash_check_xml, text="Trip stats")
+                    fuel_btn = self._find_ui_elements(
+                        dash_check_xml,
+                        resource_id="fuelEconomyButton")
+                    charge_hist = self._find_ui_elements(
+                        dash_check_xml, text="Charge history")
+                    if trip_stats or fuel_btn or charge_hist:
+                        page_name = ("Trip stats" if trip_stats
+                                     else "Charge history"
+                                     if charge_hist else "sub-page")
+                        log.warning("UI_RST: Navigated away to %s — "
+                                    "going back to dashboard "
+                                    "(attempt %d)", page_name, attempt)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input keyevent BACK"],
+                            capture_output=True, timeout=10)
+                        time.sleep(3)
+                        # Verify we're back on dashboard
+                        back_xml = self._dump_ui_xml()
+                        if back_xml:
+                            vn = self._find_ui_elements(
+                                back_xml,
+                                resource_id="vehicleNameTextView")
+                            if vn:
+                                log.info("UI_RST: Back on dashboard: "
+                                         "%s", vn[0][3].get("text", ""))
+                            else:
+                                # Still not on dashboard — press back
+                                # again (might be nested)
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     "input keyevent BACK"],
+                                    capture_output=True, timeout=10)
+                                time.sleep(3)
+                    else:
+                        # Verify correct vehicle (not ID. Buzz)
+                        vn_check = self._find_ui_elements(
+                            dash_check_xml,
+                            resource_id="vehicleNameTextView")
+                        if (vn_check and
+                                "atlas" not in vn_check[0][3].get(
+                                    "text", "").lower()):
+                            wrong_name = vn_check[0][3].get("text", "")
+                            log.warning("UI_RST: On wrong vehicle '%s'"
+                                        " dashboard (attempt %d) — "
+                                        "re-navigating",
+                                        wrong_name, attempt)
+                            # Navigate back to Garage and re-select
+                            subprocess.run(
+                                ["adb", "shell", "am", "start",
+                                 "-W", "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW."
+                                 "activities."
+                                 "ForcedGarageActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
+                            time.sleep(5)
+                            self._dismiss_system_dialogs()
+                            self._dismiss_vw_alert_dialogs()
+                            rn_xml = self._dump_ui_xml()
+                            if rn_xml:
+                                at_el = self._find_ui_elements(
+                                    rn_xml, text="Atlas")
+                                if at_el:
+                                    subprocess.run(
+                                        ["adb", "shell", "su", "-c",
+                                         f"input tap 540 "
+                                         f"{at_el[0][1] + 200}"],
+                                        capture_output=True,
+                                        timeout=10)
+                                    time.sleep(12)
 
                 # CRITICAL: Check for the button BEFORE any UI interaction
                 # (interstitial/dialog dismissals, scrolling) which can
@@ -3098,6 +3302,41 @@ img{{max-width:100%;height:auto}}</style></head>
                             time.sleep(15)
                     else:
                         time.sleep(15)
+                    # Verify correct vehicle after recovery restart
+                    rv_xml = self._dump_ui_xml()
+                    if rv_xml:
+                        rv_name = self._find_ui_elements(
+                            rv_xml,
+                            resource_id="vehicleNameTextView")
+                        if (rv_name and "atlas" not in
+                                rv_name[0][3].get(
+                                    "text", "").lower()):
+                            log.warning("UI_RST: Recovery restart "
+                                        "loaded wrong vehicle '%s'",
+                                        rv_name[0][3].get("text", ""))
+                            # Try once more: back to Garage, re-tap
+                            subprocess.run(
+                                ["adb", "shell", "am", "start",
+                                 "-W", "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW."
+                                 "activities."
+                                 "ForcedGarageActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
+                            time.sleep(5)
+                            rg_xml = self._dump_ui_xml()
+                            if rg_xml:
+                                ra = self._find_ui_elements(
+                                    rg_xml, text="Atlas")
+                                if ra:
+                                    subprocess.run(
+                                        ["adb", "shell", "su",
+                                         "-c",
+                                         f"input tap 540 "
+                                         f"{ra[0][1] + 200}"],
+                                        capture_output=True,
+                                        timeout=10)
+                                    time.sleep(12)
                     rec_xml = self._dump_ui_xml()
                     if rec_xml:
                         for rid in search_rids:
