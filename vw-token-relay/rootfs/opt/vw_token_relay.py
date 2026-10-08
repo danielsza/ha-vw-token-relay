@@ -3022,6 +3022,8 @@ img{{max-width:100%;height:auto}}</style></head>
                 self._screencap()
                 return False
 
+            action_elems = []  # may be set by quick-check below
+
             if not imm_btn_clicked:
                 cx, cy = elems[0][0], elems[0][1]
                 btn_attrs = elems[0][3]
@@ -3104,7 +3106,36 @@ img{{max-width:100%;height:auto}}</style></head>
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(5)
+                    time.sleep(3)
+
+                    # Quick-check: dump XML right after tap to catch
+                    # the bottom sheet before the lengthy safety checks
+                    # (foreground, screencap, system dialogs) add ~15s
+                    # of delay during which the sheet can auto-dismiss.
+                    quick_xml = self._dump_ui_xml()
+                    if quick_xml:
+                        q_rid = ("secondCommandTextView"
+                                 if action == "Start"
+                                 else "firstCommandTextView")
+                        q_hit = self._find_ui_elements(
+                            quick_xml, resource_id=q_rid)
+                        if not q_hit:
+                            q_hit = [
+                                e for e
+                                in self._find_ui_elements(
+                                    quick_xml, text=action)
+                                if e[1] > 950]
+                        if q_hit:
+                            log.info(
+                                "UI_RST: Quick-check found '%s' "
+                                "in bottom sheet — skipping "
+                                "safety checks", action)
+                            # Jump straight to bottom sheet
+                            # handling, bypassing the slow
+                            # foreground/screencap/dialog path.
+                            xml = quick_xml
+                            action_elems = q_hit
+                            imm_btn_clicked = True  # skip safety
                 else:
                     # Button still disabled after 30s — try Frida fallbacks.
                     log.warning("UI_RST: Button still disabled after 30s — "
@@ -3249,21 +3280,24 @@ img{{max-width:100%;height:auto}}</style></head>
             # bottom sheet.  If the first attempt doesn't find it,
             # dismiss any VW dialog that may have appeared, re-tap
             # the remoteStartButton, and try again.
-            action_elems = []
+            #
+            # IMPORTANT: on retries, search the XML that was dumped
+            # right after the re-tap (end of previous iteration)
+            # BEFORE dismissing dialogs — the dismiss + re-dump
+            # adds ~10 seconds during which the bottom sheet can
+            # auto-close.
+            # action_elems may already be set by the quick-check
+            # above; if so, skip the retry loop entirely.
             for bs_try in range(3):
-                # Dismiss VW alert dialogs that may block the
-                # bottom sheet (e.g. stale error 802 dialog)
-                if bs_try > 0 or not imm_btn_clicked:
-                    self._dismiss_vw_alert_dialogs()
+                if action_elems:
+                    break
 
-                if bs_try > 0:
-                    # Re-dump XML after dialog dismissal
-                    xml = self._dump_ui_xml()
-                    if not xml:
-                        log.error("UI_RST: Cannot get UI XML on "
-                                  "bottom sheet retry %d", bs_try)
-                        time.sleep(2)
-                        continue
+                # On the first try, dismiss dialogs that may have
+                # appeared between the tap and now. On retries the
+                # xml is already fresh from the re-tap — search it
+                # first, dismiss only if still not found.
+                if bs_try == 0 and not imm_btn_clicked:
+                    self._dismiss_vw_alert_dialogs()
 
                 # First try resource IDs (more specific, avoids
                 # substring matching "Start" inside "Remote start")
@@ -3291,10 +3325,13 @@ img{{max-width:100%;height:auto}}</style></head>
                 if action_elems:
                     break
 
-                # Log what IS on screen for diagnostics
-                diag_texts = self._find_ui_elements(xml, text="")
+                # Log what IS on screen for diagnostics.
+                # Use class_name to find all TextViews (text=""
+                # is falsy and matches nothing).
+                diag_texts = self._find_ui_elements(
+                    xml, class_name="android.widget.TextView")
                 key_labels = []
-                for dt in diag_texts[:30]:
+                for dt in diag_texts[:40]:
                     t = dt[3].get("text", "").strip()
                     if t and len(t) < 80:
                         key_labels.append(
@@ -3302,9 +3339,12 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("UI_RST: Bottom sheet not found "
                          "(try %d/3). On-screen text: %s",
                          bs_try + 1,
-                         "; ".join(key_labels[:15]))
+                         "; ".join(key_labels[:20]))
 
                 if bs_try < 2:
+                    # Dismiss any VW dialog that might be blocking
+                    self._dismiss_vw_alert_dialogs()
+
                     # Re-tap remoteStartButton — the bottom sheet
                     # may not have opened on the first tap.
                     log.info("UI_RST: Re-tapping remoteStartButton "
@@ -3325,10 +3365,11 @@ img{{max-width:100%;height:auto}}</style></head>
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(5)
+                    time.sleep(3)
                     xml = self._dump_ui_xml()
                     if not xml:
                         time.sleep(2)
+                        xml = self._dump_ui_xml() or ""
                         continue
 
             if not action_elems:
