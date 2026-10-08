@@ -3012,7 +3012,107 @@ img{{max-width:100%;height:auto}}</style></head>
                     break
 
                 log.info("UI_RST: Button not found (attempt %d/5)", attempt)
-                time.sleep(3)  # Give dashboard more time to load
+
+                # --- Recovery: dashboard loaded but button missing ---
+                # VW app sometimes hides remoteStartButton after errors
+                # (e.g., error 802) while still showing climate/lock.
+                dashboard_loaded = False
+                if xml:
+                    climate_btn = self._find_ui_elements(
+                        xml, resource_id="climateButton")
+                    lock_btn = self._find_ui_elements(
+                        xml, resource_id="lockButton")
+                    if climate_btn or lock_btn:
+                        dashboard_loaded = True
+                        log.info(
+                            "UI_RST: Dashboard loaded (climate=%s, "
+                            "lock=%s) but button absent — recovery "
+                            "(attempt %d)",
+                            bool(climate_btn), bool(lock_btn), attempt)
+
+                if dashboard_loaded and attempt <= 1:
+                    # Phase 1: dismiss promo banner + pull-to-refresh
+                    close_btn = self._find_ui_elements(
+                        xml, resource_id="closeButton")
+                    if close_btn:
+                        cbx, cby = close_btn[0][0], close_btn[0][1]
+                        log.info("UI_RST: Recovery: dismiss promo banner "
+                                 "at (%d,%d)", cbx, cby)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input tap {cbx} {cby}"],
+                            capture_output=True, timeout=10)
+                        time.sleep(2)
+                    log.info("UI_RST: Recovery: pull-to-refresh")
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 540 800 540 1800 800"],
+                        capture_output=True, timeout=10)
+                    time.sleep(8)
+                    rec_xml = self._dump_ui_xml()
+                    if rec_xml:
+                        for rid in search_rids:
+                            rs = self._find_ui_elements(
+                                rec_xml, resource_id=rid)
+                            if rs:
+                                log.info("UI_RST: Recovery found %s "
+                                         "after pull-to-refresh", rid)
+                                elems = rs
+                                xml = rec_xml
+                                break
+                        if elems:
+                            break
+
+                elif dashboard_loaded and attempt == 2:
+                    # Phase 2: force-kill VW app + full restart
+                    log.info("UI_RST: Recovery phase 2: force-stop + "
+                             "restart VW app")
+                    subprocess.run(
+                        ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                        capture_output=True, timeout=10)
+                    time.sleep(3)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-W", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities."
+                         "ForcedGarageActivity"],
+                        capture_output=True, timeout=30, text=True)
+                    time.sleep(8)
+                    self._dismiss_system_dialogs()
+                    self._dismiss_vw_alert_dialogs()
+                    nav_xml = self._dump_ui_xml()
+                    if nav_xml:
+                        atlas_el = self._find_ui_elements(
+                            nav_xml, text="Atlas")
+                        if atlas_el:
+                            ax, ay = atlas_el[0][0], atlas_el[0][1]
+                            log.info("UI_RST: Recovery: tap Atlas at "
+                                     "(%d,%d)", ax, ay)
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 f"input tap {ax} {ay}"],
+                                capture_output=True, timeout=10)
+                            time.sleep(15)
+                        else:
+                            log.warning("UI_RST: Recovery: Atlas not "
+                                        "found after restart")
+                            time.sleep(15)
+                    else:
+                        time.sleep(15)
+                    rec_xml = self._dump_ui_xml()
+                    if rec_xml:
+                        for rid in search_rids:
+                            rs = self._find_ui_elements(
+                                rec_xml, resource_id=rid)
+                            if rs:
+                                log.info("UI_RST: Recovery found %s "
+                                         "after app restart", rid)
+                                elems = rs
+                                xml = rec_xml
+                                break
+                        if elems:
+                            break
+
+                time.sleep(3)
 
             if not elems and not imm_btn_clicked:
                 log.error("UI_RST: Cannot find Remote start/stop button "
