@@ -2616,6 +2616,11 @@ img{{max-width:100%;height:auto}}</style></head>
 
             self._dismiss_system_dialogs()
 
+            # Dismiss VW app error dialogs (e.g. stale "Charge request
+            # was unsuccessful") before looking for vehicle cards — these
+            # modal overlays block the garage UI and prevent tapping.
+            self._dismiss_vw_alert_dialogs()
+
             # Find and tap Atlas in the Garage
             xml = self._dump_ui_xml()
             if xml:
@@ -2826,6 +2831,7 @@ img{{max-width:100%;height:auto}}</style></head>
                              (am_re.stdout or "")[:200])
                     time.sleep(5)
                     self._dismiss_system_dialogs()
+                    self._dismiss_vw_alert_dialogs()
                     xml2 = self._dump_ui_xml()
                     if xml2:
                         atlas2 = self._find_ui_elements(xml2, text="Atlas")
