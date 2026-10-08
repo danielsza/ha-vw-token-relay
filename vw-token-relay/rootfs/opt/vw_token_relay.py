@@ -2671,8 +2671,16 @@ img{{max-width:100%;height:auto}}</style></head>
                 # Check if the blind tap worked
                 blind_xml = self._dump_ui_xml()
                 if blind_xml:
-                    bs_start = self._find_ui_elements(
+                    bs_start_raw = self._find_ui_elements(
                         blind_xml, text="Start")
+                    # Filter out "Start charging" false positives — only
+                    # accept exact "Start" text (the remote-start bottom
+                    # sheet button), not substring matches like
+                    # "Start charging" on the Buzz EV dashboard.
+                    bs_start = [
+                        e for e in bs_start_raw
+                        if e[3].get("text", "").strip().lower() == "start"
+                    ]
                     bs_stop_btn = self._find_ui_elements(
                         blind_xml, resource_id="stopEngineButton")
                     bs_any = (bs_start or bs_stop_btn or
