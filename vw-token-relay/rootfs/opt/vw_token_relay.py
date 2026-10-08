@@ -1615,6 +1615,25 @@ img{{max-width:100%;height:auto}}</style></head>
             crc = table[crc ^ b]
         return (~crc) & 0xFF
 
+    def _compute_spin_hash(self, challenge):
+        """Compute spinHash in VW standard format.
+
+        VW's server expects: SHA512(SPIN_bytes || challenge_bytes)
+        where both SPIN and challenge are hex-decoded to raw bytes,
+        SPIN comes first, and the result is lowercase hex.
+
+        Reference: volkswagencarnet hash_spin() implementation.
+        """
+        spin_bytes = bytearray.fromhex(self.vw_spin)
+        challenge_bytes = bytearray.fromhex(challenge)
+        combined = spin_bytes + challenge_bytes
+        result = hashlib.sha512(combined).hexdigest()
+        log.debug("spinHash: SPIN(%d bytes) + challenge(%d bytes) = %d "
+                  "bytes → SHA512 %s...%s",
+                  len(spin_bytes), len(challenge_bytes),
+                  len(combined), result[:8], result[-8:])
+        return result
+
     def _build_encrypted_payload(self, pairing_key_seed_hex, spin_hash,
                                   captcha_index, captcha_value):
         """Build the encryptedPayload for RemoteStartRequest.
@@ -2022,10 +2041,11 @@ img{{max-width:100%;height:auto}}</style></head>
                 json.dumps({"error": "spin_low_tries", "remaining": remaining}))
             return
 
-        spin_hash1 = hashlib.sha512(f"{challenge1}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
+        spin_hash1 = self._compute_spin_hash(challenge1)
         log.info("RST: Computed spinHash1 (%d chars)", len(spin_hash1))
 
         # ── Step 2: Create ATC session → carnetVehicleToken ──
+        # Try spinHash (challenge-based) first, fall back to tspPin (raw)
         log.info("RST Step 2: Creating ATC session (tsp=ATC)...")
         session_body = json.dumps({
             "idToken": self.id_token,
@@ -2033,6 +2053,21 @@ img{{max-width:100%;height:auto}}</style></head>
             "tsp": "ATC"
         }).encode()
         result, err = self._api_request("POST", session_url, body=session_body, vid=vid)
+
+        # If spinHash fails with 500, try raw tspPin format (older API)
+        if result is None and err and err.get("code") == 500:
+            log.warning("RST: spinHash session failed (500) — trying "
+                        "tspPin (raw SPIN) format as fallback...")
+            session_body_raw = json.dumps({
+                "idToken": self.id_token,
+                "tspPin": self.vw_spin,
+                "tsp": "ATC"
+            }).encode()
+            result, err = self._api_request(
+                "POST", session_url, body=session_body_raw, vid=vid)
+            if result is not None:
+                log.info("RST: tspPin (raw) format SUCCEEDED!")
+
         if result is None:
             log.error("RST: ATC session failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
@@ -2064,7 +2099,7 @@ img{{max-width:100%;height:auto}}</style></head>
         challenge2 = c2_data["data"]["challenge"]
         log.info("RST: challenge2=%s", challenge2)
 
-        spin_hash2 = hashlib.sha512(f"{challenge2}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
+        spin_hash2 = self._compute_spin_hash(challenge2)
         log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
 
         # ── Step 3b: Create captcha via POST/GET /operation/remoteStart ──
@@ -2112,9 +2147,7 @@ img{{max-width:100%;height:auto}}</style></head>
             return
         c_3c = json.loads(result_3c)
         challenge_check = c_3c["data"]["challenge"]
-        spin_hash_check = hashlib.sha512(
-            f"{challenge_check}.{self.vw_spin}".encode("utf-8")
-        ).hexdigest().upper()
+        spin_hash_check = self._compute_spin_hash(challenge_check)
 
         # ── Step 4: SPIN check → roToken ──
         # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
@@ -2147,9 +2180,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     if result3:
                         c3_data = json.loads(result3)
                         challenge3 = c3_data["data"]["challenge"]
-                        spin_hash_check = hashlib.sha512(
-                            f"{challenge3}.{self.vw_spin}".encode("utf-8")
-                        ).hexdigest().upper()
+                        spin_hash_check = self._compute_spin_hash(challenge3)
                         check_body = json.dumps({"spinHash": spin_hash_check}).encode()
                         log.info("RST: Got fresh challenge, trying next operation...")
                     else:
@@ -2163,9 +2194,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 if result3:
                     c3_data = json.loads(result3)
                     challenge3 = c3_data["data"]["challenge"]
-                    spin_hash_check = hashlib.sha512(
-                        f"{challenge3}.{self.vw_spin}".encode("utf-8")
-                    ).hexdigest().upper()
+                    spin_hash_check = self._compute_spin_hash(challenge3)
                     check_body = json.dumps({"spinHash": spin_hash_check}).encode()
                     log.info("RST: Got fresh challenge, trying next operation...")
                 else:
@@ -2360,7 +2389,7 @@ img{{max-width:100%;height:auto}}</style></head>
 
         c_data = json.loads(result)
         challenge = c_data["data"]["challenge"]
-        spin_hash = hashlib.sha512(f"{challenge}.{self.vw_spin}".encode("utf-8")).hexdigest().upper()
+        spin_hash = self._compute_spin_hash(challenge)
 
         session_body = json.dumps({
             "idToken": self.id_token,
@@ -2368,6 +2397,19 @@ img{{max-width:100%;height:auto}}</style></head>
             "tsp": "ATC"
         }).encode()
         result, err = self._api_request("POST", session_url, body=session_body, vid=vid)
+
+        # Fallback: try raw tspPin if spinHash gets 500
+        if result is None and err and err.get("code") == 500:
+            log.warning("RST STOP: spinHash session failed (500) — "
+                        "trying tspPin format...")
+            session_body_raw = json.dumps({
+                "idToken": self.id_token,
+                "tspPin": self.vw_spin,
+                "tsp": "ATC"
+            }).encode()
+            result, err = self._api_request(
+                "POST", session_url, body=session_body_raw, vid=vid)
+
         if result is None:
             log.error("RST STOP: ATC session failed: %s", err)
             return
