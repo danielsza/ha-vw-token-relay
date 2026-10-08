@@ -2622,22 +2622,61 @@ img{{max-width:100%;height:auto}}</style></head>
             self._dismiss_vw_alert_dialogs()
 
             # Find and tap Atlas in the Garage
+            # The VW app has a persistent bug: tapping the Atlas card
+            # on the Garage opens the ID. Buzz dashboard instead.
+            # To work around this, scroll the Garage so the ID. Buzz
+            # card is off-screen, leaving Atlas as the only visible
+            # card before tapping.
             xml = self._dump_ui_xml()
             if xml:
                 self._log_dashboard_buttons(xml)
                 atlas_elems = self._find_ui_elements(xml, text="Atlas")
                 if atlas_elems:
-                    cx, cy = atlas_elems[0][0], atlas_elems[0][1]
+                    atlas_cx = atlas_elems[0][0]
+                    atlas_cy = atlas_elems[0][1]
+                    log.info("UI_RST: Atlas found at (%d,%d) — "
+                             "scrolling Garage to bring it to top",
+                             atlas_cx, atlas_cy)
+                    # Scroll the Atlas text position up near the top
+                    # of the screen (y≈350, just below the title bar).
+                    # This pushes the ID. Buzz card off-screen.
+                    if atlas_cy > 500:
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input swipe 540 {atlas_cy} 540 350 "
+                             "400"],
+                            capture_output=True, timeout=10)
+                        time.sleep(2)
+
+                        # Re-dump UI to find Atlas at its new position
+                        xml2 = self._dump_ui_xml()
+                        if xml2:
+                            atlas2 = self._find_ui_elements(
+                                xml2, text="Atlas")
+                            if atlas2:
+                                cx = atlas2[0][0]
+                                cy = atlas2[0][1]
+                                log.info("UI_RST: After scroll, Atlas "
+                                         "at (%d,%d)", cx, cy)
+                            else:
+                                cx, cy = 540, 500
+                                log.info("UI_RST: Atlas not found "
+                                         "after scroll — tapping "
+                                         "(%d,%d)", cx, cy)
+                        else:
+                            cx, cy = 540, 500
+                    else:
+                        cx, cy = atlas_cx, atlas_cy
                     log.info("UI_RST: Tapping Atlas at (%d,%d)", cx, cy)
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
                          f"input tap {cx} {cy}"],
                         capture_output=True, timeout=10)
-                    time.sleep(12)  # Shorter wait — 30s caused toolbar to collapse
+                    time.sleep(12)
                 else:
                     log.warning("UI_RST: Atlas not found in Garage")
-                    # Try tapping at known Atlas position anyway
-                    log.info("UI_RST: Tapping known Atlas position (342,635)")
+                    log.info("UI_RST: Tapping known Atlas position "
+                             "(342,635)")
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
                          "input tap 342 635"],
@@ -2675,16 +2714,66 @@ img{{max-width:100%;height:auto}}</style></head>
                     else:
                         wrong_vehicle_count += 1
                         log.warning("UI_RST: WRONG VEHICLE loaded: '%s' "
-                                    "(expected Atlas) — retrying "
-                                    "(attempt %d)", vv_name, vv_attempt)
-                        # Press back to return to Garage
+                                    "(expected Atlas) — trying dashboard "
+                                    "vehicle switch (attempt %d)",
+                                    vv_name, vv_attempt)
+                        # The Garage card tap doesn't reliably select
+                        # the correct vehicle — the VW app ignores which
+                        # card was tapped and opens the default vehicle.
+                        # Try switching vehicles on the dashboard itself.
+
+                        # Approach 1: swipe left on the vehicle header
+                        # area — VW app may support horizontal vehicle
+                        # switching.
+                        log.info("UI_RST: Trying swipe-left to switch "
+                                 "vehicle on dashboard")
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input swipe 900 550 100 550 400"],
+                            capture_output=True, timeout=10)
+                        time.sleep(5)
+
+                        sw_xml = self._dump_ui_xml()
+                        if sw_xml:
+                            sw_vn = self._find_ui_elements(
+                                sw_xml,
+                                resource_id="vehicleNameTextView")
+                            if (sw_vn and "atlas" in sw_vn[0][3].get(
+                                    "text", "").lower()):
+                                log.info("UI_RST: Swipe-left switched "
+                                         "to Atlas!")
+                                correct_vehicle = True
+                                break
+
+                        # Approach 2: swipe right
+                        log.info("UI_RST: Trying swipe-right")
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input swipe 100 550 900 550 400"],
+                            capture_output=True, timeout=10)
+                        time.sleep(5)
+
+                        sw2_xml = self._dump_ui_xml()
+                        if sw2_xml:
+                            sw2_vn = self._find_ui_elements(
+                                sw2_xml,
+                                resource_id="vehicleNameTextView")
+                            if (sw2_vn and "atlas" in sw2_vn[0][3].get(
+                                    "text", "").lower()):
+                                log.info("UI_RST: Swipe-right switched "
+                                         "to Atlas!")
+                                correct_vehicle = True
+                                break
+
+                        # Approach 3: re-navigate via Garage with
+                        # scroll (push ID. Buzz off-screen first)
+                        log.info("UI_RST: Swipes didn't work — "
+                                 "re-trying Garage with scroll")
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
                              "input keyevent BACK"],
                             capture_output=True, timeout=10)
-                        time.sleep(3)
-
-                        # Re-launch Garage explicitly
+                        time.sleep(2)
                         subprocess.run(
                             ["adb", "shell", "am", "start", "-W", "-n",
                              f"{VW_PACKAGE}/com.vw.myVW.activities."
@@ -2694,38 +2783,55 @@ img{{max-width:100%;height:auto}}</style></head>
                         self._dismiss_system_dialogs()
                         self._dismiss_vw_alert_dialogs()
 
-                        # Re-find and tap Atlas — use card center, not
-                        # text center, for a more reliable hit
                         retry_xml = self._dump_ui_xml()
                         if retry_xml:
-                            atlas_texts = self._find_ui_elements(
+                            at_r = self._find_ui_elements(
                                 retry_xml, text="Atlas")
-                            if atlas_texts:
-                                atx = atlas_texts[0][0]
-                                aty = atlas_texts[0][1]
-                                tap_y = aty + 200
-                                log.info("UI_RST: Re-tapping Atlas "
-                                         "card center at (%d,%d)",
-                                         540, tap_y)
-                                subprocess.run(
-                                    ["adb", "shell", "su", "-c",
-                                     f"input tap 540 {tap_y}"],
-                                    capture_output=True, timeout=10)
+                            if at_r:
+                                ary = at_r[0][1]
+                                if ary > 500:
+                                    subprocess.run(
+                                        ["adb", "shell", "su", "-c",
+                                         f"input swipe 540 {ary} "
+                                         "540 350 400"],
+                                        capture_output=True, timeout=10)
+                                    time.sleep(2)
+                                    rx2 = self._dump_ui_xml()
+                                    if rx2:
+                                        at_r2 = self._find_ui_elements(
+                                            rx2, text="Atlas")
+                                        if at_r2:
+                                            subprocess.run(
+                                                ["adb", "shell", "su",
+                                                 "-c", f"input tap "
+                                                 f"{at_r2[0][0]} "
+                                                 f"{at_r2[0][1]}"],
+                                                capture_output=True,
+                                                timeout=10)
+                                        else:
+                                            subprocess.run(
+                                                ["adb", "shell", "su",
+                                                 "-c", "input tap "
+                                                 "540 500"],
+                                                capture_output=True,
+                                                timeout=10)
+                                    else:
+                                        subprocess.run(
+                                            ["adb", "shell", "su",
+                                             "-c", "input tap 540 500"],
+                                            capture_output=True,
+                                            timeout=10)
+                                else:
+                                    subprocess.run(
+                                        ["adb", "shell", "su", "-c",
+                                         f"input tap {at_r[0][0]} "
+                                         f"{at_r[0][1]}"],
+                                        capture_output=True, timeout=10)
                             else:
-                                log.info("UI_RST: Atlas text not found "
-                                         "— tapping card center "
-                                         "(540,1229)")
                                 subprocess.run(
                                     ["adb", "shell", "su", "-c",
-                                     "input tap 540 1229"],
+                                     "input tap 540 500"],
                                     capture_output=True, timeout=10)
-                        else:
-                            log.warning("UI_RST: No XML on Garage "
-                                        "retry — tapping (540,1229)")
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 "input tap 540 1229"],
-                                capture_output=True, timeout=10)
                         time.sleep(15)
                 else:
                     # No vehicleNameTextView — check if we're on
@@ -3054,32 +3160,96 @@ img{{max-width:100%;height:auto}}</style></head>
                             wrong_name = vn_check[0][3].get("text", "")
                             log.warning("UI_RST: On wrong vehicle '%s'"
                                         " dashboard (attempt %d) — "
-                                        "re-navigating",
+                                        "trying vehicle switch",
                                         wrong_name, attempt)
-                            # Navigate back to Garage and re-select
+                            # Try swiping to switch vehicles on
+                            # the dashboard
                             subprocess.run(
-                                ["adb", "shell", "am", "start",
-                                 "-W", "-n",
-                                 f"{VW_PACKAGE}/com.vw.myVW."
-                                 "activities."
-                                 "ForcedGarageActivity"],
-                                capture_output=True, timeout=30,
-                                text=True)
+                                ["adb", "shell", "su", "-c",
+                                 "input swipe 900 550 100 550 400"],
+                                capture_output=True, timeout=10)
                             time.sleep(5)
-                            self._dismiss_system_dialogs()
-                            self._dismiss_vw_alert_dialogs()
-                            rn_xml = self._dump_ui_xml()
-                            if rn_xml:
-                                at_el = self._find_ui_elements(
-                                    rn_xml, text="Atlas")
-                                if at_el:
-                                    subprocess.run(
-                                        ["adb", "shell", "su", "-c",
-                                         f"input tap 540 "
-                                         f"{at_el[0][1] + 200}"],
-                                        capture_output=True,
-                                        timeout=10)
-                                    time.sleep(12)
+                            sw_xml = self._dump_ui_xml()
+                            switched = False
+                            if sw_xml:
+                                sw_vn = self._find_ui_elements(
+                                    sw_xml,
+                                    resource_id="vehicleNameTextView")
+                                if (sw_vn and "atlas" in
+                                        sw_vn[0][3].get(
+                                            "text", "").lower()):
+                                    log.info("UI_RST: Swipe switched "
+                                             "to Atlas!")
+                                    switched = True
+                            if not switched:
+                                # Swipe right
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     "input swipe 100 550 900 550 "
+                                     "400"],
+                                    capture_output=True, timeout=10)
+                                time.sleep(5)
+                            if not switched:
+                                # Fall back to Garage with scroll
+                                subprocess.run(
+                                    ["adb", "shell", "am", "start",
+                                     "-W", "-n",
+                                     f"{VW_PACKAGE}/com.vw.myVW."
+                                     "activities."
+                                     "ForcedGarageActivity"],
+                                    capture_output=True, timeout=30,
+                                    text=True)
+                                time.sleep(5)
+                                self._dismiss_system_dialogs()
+                                self._dismiss_vw_alert_dialogs()
+                                rn_xml = self._dump_ui_xml()
+                                if rn_xml:
+                                    at_el = self._find_ui_elements(
+                                        rn_xml, text="Atlas")
+                                    if at_el:
+                                        ary = at_el[0][1]
+                                        if ary > 500:
+                                            subprocess.run(
+                                                ["adb", "shell", "su",
+                                                 "-c", f"input swipe "
+                                                 f"540 {ary} "
+                                                 "540 350 400"],
+                                                capture_output=True,
+                                                timeout=10)
+                                            time.sleep(2)
+                                            rx = self._dump_ui_xml()
+                                            if rx:
+                                                at2 = (
+                                                    self._find_ui_elements(
+                                                        rx, text="Atlas"))
+                                                if at2:
+                                                    subprocess.run(
+                                                        ["adb", "shell",
+                                                         "su", "-c",
+                                                         f"input tap "
+                                                         f"{at2[0][0]}"
+                                                         f" {at2[0][1]}"
+                                                         ],
+                                                        capture_output=
+                                                        True,
+                                                        timeout=10)
+                                                else:
+                                                    subprocess.run(
+                                                        ["adb", "shell",
+                                                         "su", "-c",
+                                                         "input tap "
+                                                         "540 500"],
+                                                        capture_output=
+                                                        True,
+                                                        timeout=10)
+                                        else:
+                                            subprocess.run(
+                                                ["adb", "shell", "su",
+                                                 "-c", f"input tap "
+                                                 f"540 {ary + 200}"],
+                                                capture_output=True,
+                                                timeout=10)
+                                time.sleep(12)
 
                 # CRITICAL: Check for the button BEFORE any UI interaction
                 # (interstitial/dialog dismissals, scrolling) which can
@@ -3310,7 +3480,25 @@ img{{max-width:100%;height:auto}}</style></head>
                         atlas_el = self._find_ui_elements(
                             nav_xml, text="Atlas")
                         if atlas_el:
-                            ax, ay = atlas_el[0][0], atlas_el[0][1]
+                            ax = atlas_el[0][0]
+                            ay = atlas_el[0][1]
+                            # Scroll Atlas to top before tapping
+                            if ay > 500:
+                                log.info("UI_RST: Recovery: scrolling "
+                                         "Atlas to top first")
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     f"input swipe 540 {ay} "
+                                     "540 350 400"],
+                                    capture_output=True, timeout=10)
+                                time.sleep(2)
+                                ns_xml = self._dump_ui_xml()
+                                if ns_xml:
+                                    ns_a = self._find_ui_elements(
+                                        ns_xml, text="Atlas")
+                                    if ns_a:
+                                        ax = ns_a[0][0]
+                                        ay = ns_a[0][1]
                             log.info("UI_RST: Recovery: tap Atlas at "
                                      "(%d,%d)", ax, ay)
                             subprocess.run(
@@ -3334,31 +3522,15 @@ img{{max-width:100%;height:auto}}</style></head>
                                 rv_name[0][3].get(
                                     "text", "").lower()):
                             log.warning("UI_RST: Recovery restart "
-                                        "loaded wrong vehicle '%s'",
+                                        "loaded wrong vehicle '%s'"
+                                        " — trying swipe",
                                         rv_name[0][3].get("text", ""))
-                            # Try once more: back to Garage, re-tap
+                            # Try swiping to switch vehicle
                             subprocess.run(
-                                ["adb", "shell", "am", "start",
-                                 "-W", "-n",
-                                 f"{VW_PACKAGE}/com.vw.myVW."
-                                 "activities."
-                                 "ForcedGarageActivity"],
-                                capture_output=True, timeout=30,
-                                text=True)
+                                ["adb", "shell", "su", "-c",
+                                 "input swipe 900 550 100 550 400"],
+                                capture_output=True, timeout=10)
                             time.sleep(5)
-                            rg_xml = self._dump_ui_xml()
-                            if rg_xml:
-                                ra = self._find_ui_elements(
-                                    rg_xml, text="Atlas")
-                                if ra:
-                                    subprocess.run(
-                                        ["adb", "shell", "su",
-                                         "-c",
-                                         f"input tap 540 "
-                                         f"{ra[0][1] + 200}"],
-                                        capture_output=True,
-                                        timeout=10)
-                                    time.sleep(12)
                     rec_xml = self._dump_ui_xml()
                     if rec_xml:
                         for rid in search_rids:
