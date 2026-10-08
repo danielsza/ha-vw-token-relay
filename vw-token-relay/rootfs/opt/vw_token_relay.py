@@ -657,6 +657,10 @@ class VWTokenRelay:
             threading.Thread(target=self._dump_rn_storage, daemon=True).start()
         elif cmd == "switch_vehicle":
             threading.Thread(target=self._switch_vehicle, args=(payload,), daemon=True).start()
+        elif cmd == "deep_explore":
+            threading.Thread(target=self._deep_data_explore, daemon=True).start()
+        elif cmd == "explore_menu":
+            threading.Thread(target=self._explore_options_menu, daemon=True).start()
         elif cmd == "update_pif":
             threading.Thread(target=self._update_pif, daemon=True).start()
         elif cmd == "clear_data":
@@ -2543,39 +2547,40 @@ img{{max-width:100%;height:auto}}</style></head>
                             "(non-critical)")
             time.sleep(1)
 
-            # Step 1: Navigate to Atlas dashboard (no force-stop — keep
-            # Frida alive and app warm)
+            # Step 1: Navigate to Atlas dashboard
+            # Strategy: Use MainActivity (not ForcedGarageActivity) to
+            # open whatever vehicle was last viewed. Then verify and
+            # switch if needed. ForcedGarageActivity is broken — it
+            # always opens ID. Buzz regardless of which card is tapped.
             log.info("UI_RST: Navigating to vehicle dashboard...")
             self._wake_screen()
-            # Use -W to wait for launch completion, -S to force restart
-            # of the activity (brings app to foreground reliably)
+
+            # Launch with MainActivity first — this opens the last-
+            # viewed vehicle dashboard directly (skip the broken Garage)
             am_result = subprocess.run(
                 ["adb", "shell", "am", "start", "-W", "-n",
-                 f"{VW_PACKAGE}/com.vw.myVW.activities.ForcedGarageActivity"],
+                 f"{VW_PACKAGE}/.MainActivity"],
                 capture_output=True, timeout=30, text=True)
-            log.info("UI_RST: am start result: rc=%d stdout=%s stderr=%s",
+            log.info("UI_RST: am start MainActivity: rc=%d stdout=%s",
                      am_result.returncode,
-                     (am_result.stdout or "")[:200],
-                     (am_result.stderr or "")[:200])
+                     (am_result.stdout or "")[:200])
             time.sleep(5)
 
-            # Check foreground right after Garage launch — MUST be VW app
+            # Check foreground — MUST be VW app
             self._wake_screen()
             vw_in_fg = False
             for fg_try in range(4):
                 fg_garage = self._get_foreground_activity()
-                log.info("UI_RST: After Garage launch, foreground: %s",
+                log.info("UI_RST: After launch, foreground: %s",
                          (fg_garage or "?")[:80])
                 if fg_garage and VW_PACKAGE in fg_garage:
                     vw_in_fg = True
                     break
                 log.warning("UI_RST: VW app NOT in foreground (attempt "
                             "%d/4) — relaunching...", fg_try + 1)
-                # Try launching again
                 subprocess.run(
                     ["adb", "shell", "am", "start", "-W", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities."
-                     "ForcedGarageActivity"],
+                     f"{VW_PACKAGE}/.MainActivity"],
                     capture_output=True, timeout=30, text=True)
                 time.sleep(3)
                 self._wake_screen()
@@ -2586,10 +2591,8 @@ img{{max-width:100%;height:auto}}</style></head>
                             "after 4 tries — force-stopping competing "
                             "app and retrying")
                 fg_final = self._get_foreground_activity() or ""
-                # Extract package name from activity string
                 if "/" in fg_final:
                     competing_pkg = fg_final.split("/")[0].strip()
-                    # Only stop common competing packages
                     if competing_pkg and "." in competing_pkg:
                         subprocess.run(
                             ["adb", "shell", "am", "force-stop",
@@ -2598,8 +2601,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         time.sleep(1)
                 subprocess.run(
                     ["adb", "shell", "am", "start", "-W", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities."
-                     "ForcedGarageActivity"],
+                     f"{VW_PACKAGE}/.MainActivity"],
                     capture_output=True, timeout=30, text=True)
                 time.sleep(5)
                 fg_garage = self._get_foreground_activity()
@@ -2615,86 +2617,20 @@ img{{max-width:100%;height:auto}}</style></head>
                                        "foreground"}
 
             self._dismiss_system_dialogs()
-
-            # Dismiss VW app error dialogs (e.g. stale "Charge request
-            # was unsuccessful") before looking for vehicle cards — these
-            # modal overlays block the garage UI and prevent tapping.
             self._dismiss_vw_alert_dialogs()
 
-            # Find and tap Atlas in the Garage
-            # The VW app has a persistent bug: tapping the Atlas card
-            # on the Garage opens the ID. Buzz dashboard instead.
-            # To work around this, scroll the Garage so the ID. Buzz
-            # card is off-screen, leaving Atlas as the only visible
-            # card before tapping.
-            xml = self._dump_ui_xml()
-            if xml:
-                self._log_dashboard_buttons(xml)
-                atlas_elems = self._find_ui_elements(xml, text="Atlas")
-                if atlas_elems:
-                    atlas_cx = atlas_elems[0][0]
-                    atlas_cy = atlas_elems[0][1]
-                    log.info("UI_RST: Atlas found at (%d,%d) — "
-                             "scrolling Garage to bring it to top",
-                             atlas_cx, atlas_cy)
-                    # Scroll the Atlas text position up near the top
-                    # of the screen (y≈350, just below the title bar).
-                    # This pushes the ID. Buzz card off-screen.
-                    if atlas_cy > 500:
-                        subprocess.run(
-                            ["adb", "shell", "su", "-c",
-                             f"input swipe 540 {atlas_cy} 540 350 "
-                             "400"],
-                            capture_output=True, timeout=10)
-                        time.sleep(2)
+            # Wait for dashboard to fully render
+            time.sleep(8)
 
-                        # Re-dump UI to find Atlas at its new position
-                        xml2 = self._dump_ui_xml()
-                        if xml2:
-                            atlas2 = self._find_ui_elements(
-                                xml2, text="Atlas")
-                            if atlas2:
-                                cx = atlas2[0][0]
-                                cy = atlas2[0][1]
-                                log.info("UI_RST: After scroll, Atlas "
-                                         "at (%d,%d)", cx, cy)
-                            else:
-                                cx, cy = 540, 500
-                                log.info("UI_RST: Atlas not found "
-                                         "after scroll — tapping "
-                                         "(%d,%d)", cx, cy)
-                        else:
-                            cx, cy = 540, 500
-                    else:
-                        cx, cy = atlas_cx, atlas_cy
-                    log.info("UI_RST: Tapping Atlas at (%d,%d)", cx, cy)
-                    subprocess.run(
-                        ["adb", "shell", "su", "-c",
-                         f"input tap {cx} {cy}"],
-                        capture_output=True, timeout=10)
-                    time.sleep(12)
-                else:
-                    log.warning("UI_RST: Atlas not found in Garage")
-                    log.info("UI_RST: Tapping known Atlas position "
-                             "(342,635)")
-                    subprocess.run(
-                        ["adb", "shell", "su", "-c",
-                         "input tap 342 635"],
-                        capture_output=True, timeout=10)
-                    time.sleep(12)
-            else:
-                log.error("UI_RST: No UI XML from Garage screen")
-
-            # ── VEHICLE VERIFICATION ──
-            # After tapping Atlas on the Garage, verify the correct
-            # vehicle dashboard loaded.  The VW app sometimes loads the
-            # default/primary vehicle (ID. Buzz) instead of the tapped
-            # one.  Check vehicleNameTextView and retry if wrong.
-            # The dashboard can take 15-25s to fully render after tapping
-            # a vehicle, so we poll patiently before giving up.
+            # ── VEHICLE VERIFICATION (v1.32 strategy) ──
+            # 1. Check if we're already on Atlas (lucky path)
+            # 2. If wrong vehicle, try options menu vehicle switcher
+            # 3. If that fails, try ForcedGarageActivity as fallback
+            # 4. Use ICE-specific verification (not just header text)
             correct_vehicle = False
             wrong_vehicle_count = 0
-            for vv_attempt in range(6):
+
+            for vv_attempt in range(8):
                 vv_xml = self._dump_ui_xml()
                 if not vv_xml:
                     log.warning("UI_RST: Vehicle verify — no XML "
@@ -2702,73 +2638,89 @@ img{{max-width:100%;height:auto}}</style></head>
                     time.sleep(3)
                     continue
 
+                # Log all dashboard elements for diagnostics
+                if vv_attempt == 0:
+                    self._log_dashboard_buttons(vv_xml)
+
+                # Check if we're on the Garage screen instead of dashboard
+                garage_title = self._find_ui_elements(vv_xml, text="Garage")
+                if garage_title:
+                    log.info("UI_RST: On Garage screen — tapping Atlas "
+                             "card (attempt %d)", vv_attempt)
+                    atlas_card = self._find_ui_elements(vv_xml, text="Atlas")
+                    if atlas_card:
+                        self._adb_tap(atlas_card[0][0], atlas_card[0][1],
+                                      label="garage-Atlas")
+                    else:
+                        # Atlas card at known lower position
+                        self._adb_tap(540, 1229, label="garage-Atlas-blind")
+                    time.sleep(10)
+                    continue
+
+                # Check vehicleNameTextView
                 vv_name_elems = self._find_ui_elements(
                     vv_xml, resource_id="vehicleNameTextView")
+
                 if vv_name_elems:
                     vv_name = vv_name_elems[0][3].get("text", "")
-                    if "atlas" in vv_name.lower():
-                        log.info("UI_RST: Vehicle verified — %s "
-                                 "(attempt %d)", vv_name, vv_attempt)
+                    # Use ICE-specific verification too
+                    is_atlas, confidence = self._verify_atlas_dashboard(vv_xml)
+
+                    if is_atlas:
+                        log.info("UI_RST: Atlas dashboard VERIFIED — "
+                                 "'%s' confidence=%s (attempt %d)",
+                                 vv_name, confidence, vv_attempt)
                         correct_vehicle = True
                         break
-                    else:
-                        wrong_vehicle_count += 1
-                        log.warning("UI_RST: WRONG VEHICLE loaded: '%s' "
-                                    "(expected Atlas) — trying dashboard "
-                                    "vehicle switch (attempt %d)",
-                                    vv_name, vv_attempt)
-                        # The Garage card tap doesn't reliably select
-                        # the correct vehicle — the VW app ignores which
-                        # card was tapped and opens the default vehicle.
-                        # Try switching vehicles on the dashboard itself.
 
-                        # Approach 1: swipe left on the vehicle header
-                        # area — VW app may support horizontal vehicle
-                        # switching.
+                    if "atlas" in vv_name.lower() and not is_atlas:
+                        # Header says Atlas but body has EV content
+                        log.warning("UI_RST: Header says '%s' but "
+                                    "body content is EV (confidence=%s)"
+                                    " — dashboard NOT actually Atlas",
+                                    vv_name, confidence)
+
+                    wrong_vehicle_count += 1
+                    log.warning("UI_RST: WRONG VEHICLE: '%s' "
+                                "(confidence=%s, attempt %d)",
+                                vv_name, confidence, vv_attempt)
+
+                    # ── VEHICLE SWITCH STRATEGIES ──
+
+                    # Strategy A: Try options menu vehicle switcher
+                    # (unexplored — the three-dot menu may have a
+                    # vehicle picker that actually works)
+                    if vv_attempt == 0:
+                        log.info("UI_RST: Trying options menu vehicle "
+                                 "switch...")
+                        if self._switch_vehicle_via_menu():
+                            correct_vehicle = True
+                            break
+                        time.sleep(2)
+
+                    # Strategy B: Swipe left/right on vehicle header
+                    elif vv_attempt == 1:
                         log.info("UI_RST: Trying swipe-left to switch "
                                  "vehicle on dashboard")
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
-                             "input swipe 900 550 100 550 400"],
+                             "input swipe 900 520 100 520 400"],
                             capture_output=True, timeout=10)
                         time.sleep(5)
 
-                        sw_xml = self._dump_ui_xml()
-                        if sw_xml:
-                            sw_vn = self._find_ui_elements(
-                                sw_xml,
-                                resource_id="vehicleNameTextView")
-                            if (sw_vn and "atlas" in sw_vn[0][3].get(
-                                    "text", "").lower()):
-                                log.info("UI_RST: Swipe-left switched "
-                                         "to Atlas!")
-                                correct_vehicle = True
-                                break
-
-                        # Approach 2: swipe right
+                    elif vv_attempt == 2:
                         log.info("UI_RST: Trying swipe-right")
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
-                             "input swipe 100 550 900 550 400"],
+                             "input swipe 100 520 900 520 400"],
                             capture_output=True, timeout=10)
                         time.sleep(5)
 
-                        sw2_xml = self._dump_ui_xml()
-                        if sw2_xml:
-                            sw2_vn = self._find_ui_elements(
-                                sw2_xml,
-                                resource_id="vehicleNameTextView")
-                            if (sw2_vn and "atlas" in sw2_vn[0][3].get(
-                                    "text", "").lower()):
-                                log.info("UI_RST: Swipe-right switched "
-                                         "to Atlas!")
-                                correct_vehicle = True
-                                break
-
-                        # Approach 3: re-navigate via Garage with
-                        # scroll (push ID. Buzz off-screen first)
-                        log.info("UI_RST: Swipes didn't work — "
-                                 "re-trying Garage with scroll")
+                    # Strategy C: ForcedGarageActivity as fallback
+                    elif vv_attempt >= 3:
+                        log.info("UI_RST: Falling back to "
+                                 "ForcedGarageActivity (attempt %d)",
+                                 vv_attempt)
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
                              "input keyevent BACK"],
@@ -2788,108 +2740,37 @@ img{{max-width:100%;height:auto}}</style></head>
                             at_r = self._find_ui_elements(
                                 retry_xml, text="Atlas")
                             if at_r:
-                                ary = at_r[0][1]
-                                if ary > 500:
-                                    subprocess.run(
-                                        ["adb", "shell", "su", "-c",
-                                         f"input swipe 540 {ary} "
-                                         "540 350 400"],
-                                        capture_output=True, timeout=10)
-                                    time.sleep(2)
-                                    rx2 = self._dump_ui_xml()
-                                    if rx2:
-                                        at_r2 = self._find_ui_elements(
-                                            rx2, text="Atlas")
-                                        if at_r2:
-                                            subprocess.run(
-                                                ["adb", "shell", "su",
-                                                 "-c", f"input tap "
-                                                 f"{at_r2[0][0]} "
-                                                 f"{at_r2[0][1]}"],
-                                                capture_output=True,
-                                                timeout=10)
-                                        else:
-                                            subprocess.run(
-                                                ["adb", "shell", "su",
-                                                 "-c", "input tap "
-                                                 "540 500"],
-                                                capture_output=True,
-                                                timeout=10)
-                                    else:
-                                        subprocess.run(
-                                            ["adb", "shell", "su",
-                                             "-c", "input tap 540 500"],
-                                            capture_output=True,
-                                            timeout=10)
-                                else:
-                                    subprocess.run(
-                                        ["adb", "shell", "su", "-c",
-                                         f"input tap {at_r[0][0]} "
-                                         f"{at_r[0][1]}"],
-                                        capture_output=True, timeout=10)
+                                self._adb_tap(
+                                    at_r[0][0], at_r[0][1],
+                                    label="garage-Atlas-retry")
                             else:
-                                subprocess.run(
-                                    ["adb", "shell", "su", "-c",
-                                     "input tap 540 500"],
-                                    capture_output=True, timeout=10)
-                        time.sleep(15)
+                                self._adb_tap(540, 1229,
+                                              label="garage-Atlas-blind")
+                        time.sleep(12)
+
                 else:
-                    # No vehicleNameTextView — check if we're on
-                    # the Garage, on a loading dashboard, or lost.
-                    garage_title = self._find_ui_elements(
-                        vv_xml, text="Garage")
-                    # Check nav bar — home tab means we're on a
-                    # dashboard even if the name hasn't rendered
+                    # No vehicleNameTextView — loading or transitioning
                     home_tab = self._find_ui_elements(
                         vv_xml, resource_id="home_nav_graph")
                     fg_act = self._get_foreground_activity() or ""
 
-                    if garage_title:
-                        log.info("UI_RST: Still on Garage screen — "
-                                 "Atlas tap may not have registered. "
-                                 "Retapping (attempt %d)", vv_attempt)
-                        atlas_retry = self._find_ui_elements(
-                            vv_xml, text="Atlas")
-                        if atlas_retry:
-                            arx = atlas_retry[0][0]
-                            ary = atlas_retry[0][1]
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 f"input tap {arx} {ary}"],
-                                capture_output=True, timeout=10)
-                        else:
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 "input tap 540 1229"],
-                                capture_output=True, timeout=10)
-                        time.sleep(15)
-                    elif (home_tab or
-                          "MainActivity" in fg_act):
-                        # On a dashboard (home tab active or on
-                        # MainActivity) but vehicleNameTextView not
-                        # rendered yet — dashboard still loading.
-                        # Wait patiently; the name will appear.
-                        log.info("UI_RST: On dashboard (home tab or "
-                                 "MainActivity) but vehicle name not "
-                                 "yet rendered — waiting "
+                    if (home_tab or "MainActivity" in fg_act):
+                        log.info("UI_RST: On dashboard but vehicle name "
+                                 "not yet rendered — waiting "
                                  "(attempt %d)", vv_attempt)
                         time.sleep(8)
                     else:
                         log.info("UI_RST: No vehicleNameTextView, "
-                                 "no Garage, no home tab — may be "
-                                 "transitioning (attempt %d, fg=%s)",
+                                 "no home tab — transitioning "
+                                 "(attempt %d, fg=%s)",
                                  vv_attempt,
                                  (fg_act or "?")[:60])
                         time.sleep(8)
 
             if not correct_vehicle and wrong_vehicle_count == 0:
-                # Never saw vehicleNameTextView at all — dashboard may
-                # still be loading.  Don't abort; let the blind tap /
-                # retry loop handle it (they'll detect wrong vehicle).
                 log.warning("UI_RST: Vehicle name never appeared in "
                             "%d checks — proceeding anyway "
-                            "(dashboard may still be loading)",
-                            6)
+                            "(dashboard may still be loading)", 8)
             elif not correct_vehicle:
                 log.error("UI_RST: Wrong vehicle dashboard loaded "
                           "%d times — aborting", wrong_vehicle_count)
@@ -3079,30 +2960,29 @@ img{{max-width:100%;height:auto}}</style></head>
                     log.info("UI_RST: VW app lost foreground (%s) — "
                              "full re-navigation", (fg or "?")[:60])
                     self._wake_screen()
-                    # Use ForcedGarageActivity with -W (wait for launch)
+                    # Use MainActivity (not ForcedGarageActivity which
+                    # always opens the wrong vehicle)
                     am_re = subprocess.run(
                         ["adb", "shell", "am", "start", "-W", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities."
-                         "ForcedGarageActivity"],
+                         f"{VW_PACKAGE}/.MainActivity"],
                         capture_output=True, timeout=30, text=True)
                     log.info("UI_RST: Re-nav am start: rc=%d out=%s",
                              am_re.returncode,
                              (am_re.stdout or "")[:200])
-                    time.sleep(5)
+                    time.sleep(8)
                     self._dismiss_system_dialogs()
                     self._dismiss_vw_alert_dialogs()
+                    # Try options menu vehicle switch first
+                    if not self._switch_vehicle_via_menu():
+                        log.info("UI_RST: Menu switch failed in "
+                                 "re-nav — checking dashboard")
                     xml2 = self._dump_ui_xml()
                     if xml2:
-                        atlas2 = self._find_ui_elements(xml2, text="Atlas")
-                        if atlas2:
-                            cx2, cy2 = atlas2[0][0], atlas2[0][1]
-                            log.info("UI_RST: Re-tapping Atlas at (%d,%d)",
-                                     cx2, cy2)
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 f"input tap {cx2} {cy2}"],
-                                capture_output=True, timeout=10)
-                            time.sleep(15)
+                        is_atlas, conf = self._verify_atlas_dashboard(
+                            xml2)
+                        if not is_atlas:
+                            log.warning("UI_RST: Re-nav still on "
+                                        "wrong vehicle (%s)", conf)
                     self._wake_screen()
                     self._dismiss_system_dialogs()
 
@@ -3190,66 +3070,26 @@ img{{max-width:100%;height:auto}}</style></head>
                                     capture_output=True, timeout=10)
                                 time.sleep(5)
                             if not switched:
-                                # Fall back to Garage with scroll
-                                subprocess.run(
-                                    ["adb", "shell", "am", "start",
-                                     "-W", "-n",
-                                     f"{VW_PACKAGE}/com.vw.myVW."
-                                     "activities."
-                                     "ForcedGarageActivity"],
-                                    capture_output=True, timeout=30,
-                                    text=True)
+                                # Try options menu vehicle switch
+                                log.info("UI_RST: Trying options menu "
+                                         "vehicle switch (sanity)")
+                                if self._switch_vehicle_via_menu():
+                                    log.info("UI_RST: Menu switch "
+                                             "succeeded in sanity check")
+                                else:
+                                    log.warning("UI_RST: Menu switch "
+                                                "failed — trying "
+                                                "MainActivity restart")
+                                    subprocess.run(
+                                        ["adb", "shell", "am", "start",
+                                         "-W", "-n",
+                                         f"{VW_PACKAGE}/.MainActivity"],
+                                        capture_output=True, timeout=30,
+                                        text=True)
+                                    time.sleep(8)
+                                    self._dismiss_system_dialogs()
+                                    self._dismiss_vw_alert_dialogs()
                                 time.sleep(5)
-                                self._dismiss_system_dialogs()
-                                self._dismiss_vw_alert_dialogs()
-                                rn_xml = self._dump_ui_xml()
-                                if rn_xml:
-                                    at_el = self._find_ui_elements(
-                                        rn_xml, text="Atlas")
-                                    if at_el:
-                                        ary = at_el[0][1]
-                                        if ary > 500:
-                                            subprocess.run(
-                                                ["adb", "shell", "su",
-                                                 "-c", f"input swipe "
-                                                 f"540 {ary} "
-                                                 "540 350 400"],
-                                                capture_output=True,
-                                                timeout=10)
-                                            time.sleep(2)
-                                            rx = self._dump_ui_xml()
-                                            if rx:
-                                                at2 = (
-                                                    self._find_ui_elements(
-                                                        rx, text="Atlas"))
-                                                if at2:
-                                                    subprocess.run(
-                                                        ["adb", "shell",
-                                                         "su", "-c",
-                                                         f"input tap "
-                                                         f"{at2[0][0]}"
-                                                         f" {at2[0][1]}"
-                                                         ],
-                                                        capture_output=
-                                                        True,
-                                                        timeout=10)
-                                                else:
-                                                    subprocess.run(
-                                                        ["adb", "shell",
-                                                         "su", "-c",
-                                                         "input tap "
-                                                         "540 500"],
-                                                        capture_output=
-                                                        True,
-                                                        timeout=10)
-                                        else:
-                                            subprocess.run(
-                                                ["adb", "shell", "su",
-                                                 "-c", f"input tap "
-                                                 f"540 {ary + 200}"],
-                                                capture_output=True,
-                                                timeout=10)
-                                time.sleep(12)
 
                 # CRITICAL: Check for the button BEFORE any UI interaction
                 # (interstitial/dialog dismissals, scrolling) which can
@@ -3462,73 +3302,38 @@ img{{max-width:100%;height:auto}}</style></head>
                 elif dashboard_loaded and attempt == 2:
                     # Phase 2: force-kill VW app + full restart
                     log.info("UI_RST: Recovery phase 2: force-stop + "
-                             "restart VW app")
+                             "restart VW app via MainActivity")
                     subprocess.run(
                         ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                         capture_output=True, timeout=10)
                     time.sleep(3)
                     subprocess.run(
                         ["adb", "shell", "am", "start", "-W", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities."
-                         "ForcedGarageActivity"],
+                         f"{VW_PACKAGE}/.MainActivity"],
                         capture_output=True, timeout=30, text=True)
                     time.sleep(8)
                     self._dismiss_system_dialogs()
                     self._dismiss_vw_alert_dialogs()
-                    nav_xml = self._dump_ui_xml()
-                    if nav_xml:
-                        atlas_el = self._find_ui_elements(
-                            nav_xml, text="Atlas")
-                        if atlas_el:
-                            ax = atlas_el[0][0]
-                            ay = atlas_el[0][1]
-                            # Scroll Atlas to top before tapping
-                            if ay > 500:
-                                log.info("UI_RST: Recovery: scrolling "
-                                         "Atlas to top first")
-                                subprocess.run(
-                                    ["adb", "shell", "su", "-c",
-                                     f"input swipe 540 {ay} "
-                                     "540 350 400"],
-                                    capture_output=True, timeout=10)
-                                time.sleep(2)
-                                ns_xml = self._dump_ui_xml()
-                                if ns_xml:
-                                    ns_a = self._find_ui_elements(
-                                        ns_xml, text="Atlas")
-                                    if ns_a:
-                                        ax = ns_a[0][0]
-                                        ay = ns_a[0][1]
-                            log.info("UI_RST: Recovery: tap Atlas at "
-                                     "(%d,%d)", ax, ay)
-                            subprocess.run(
-                                ["adb", "shell", "su", "-c",
-                                 f"input tap {ax} {ay}"],
-                                capture_output=True, timeout=10)
-                            time.sleep(15)
-                        else:
-                            log.warning("UI_RST: Recovery: Atlas not "
-                                        "found after restart")
-                            time.sleep(15)
+                    # Try options menu vehicle switch
+                    if self._switch_vehicle_via_menu():
+                        log.info("UI_RST: Recovery: menu switch "
+                                 "succeeded after restart")
                     else:
-                        time.sleep(15)
-                    # Verify correct vehicle after recovery restart
+                        log.warning("UI_RST: Recovery: menu switch "
+                                    "failed after restart")
+                    time.sleep(5)
+                    # Verify correct vehicle
                     rv_xml = self._dump_ui_xml()
                     if rv_xml:
-                        rv_name = self._find_ui_elements(
-                            rv_xml,
-                            resource_id="vehicleNameTextView")
-                        if (rv_name and "atlas" not in
-                                rv_name[0][3].get(
-                                    "text", "").lower()):
+                        is_atlas, conf = (
+                            self._verify_atlas_dashboard(rv_xml))
+                        if not is_atlas:
                             log.warning("UI_RST: Recovery restart "
-                                        "loaded wrong vehicle '%s'"
-                                        " — trying swipe",
-                                        rv_name[0][3].get("text", ""))
-                            # Try swiping to switch vehicle
+                                        "wrong vehicle (%s) — "
+                                        "trying swipe", conf)
                             subprocess.run(
                                 ["adb", "shell", "su", "-c",
-                                 "input swipe 900 550 100 550 400"],
+                                 "input swipe 900 520 100 520 400"],
                                 capture_output=True, timeout=10)
                             time.sleep(5)
                     rec_xml = self._dump_ui_xml()
@@ -4185,7 +3990,8 @@ img{{max-width:100%;height:auto}}</style></head>
         Uses uiautomator to inspect the actual screen before tapping.
 
         Handles three main screens:
-          - ForcedGarageActivity: vehicle list — tap a vehicle card
+          - ForcedGarageActivity: vehicle list — tap Atlas card
+            (prefers Atlas over first card)
           - MainActivity (Home tab): vehicle dashboard — already good
           - MainActivity (Nav tab): wrong tab — switch to Home
 
@@ -4250,15 +4056,27 @@ img{{max-width:100%;height:auto}}</style></head>
 
                 if cards:
                     # If target_vid specified, try to find matching card
-                    # Otherwise tap the first card
+                    # Otherwise prefer Atlas card (not first card which
+                    # is usually Buzz)
                     tap_card = cards[0]
-                    if target_vid and len(cards) > 1 and vins:
-                        for i, vin_elem in enumerate(vins):
-                            vin_text = vin_elem[3].get("text", "")
-                            if target_vid[:8] in vin_text or \
-                               (i < len(cards) and "Atlas" in cards[i][3].get("text", "")):
-                                tap_card = cards[i] if i < len(cards) else cards[0]
-                                break
+                    if len(cards) > 1:
+                        # Try to match target_vid first
+                        matched = False
+                        if target_vid and vins:
+                            for i, vin_elem in enumerate(vins):
+                                vin_text = vin_elem[3].get("text", "")
+                                if target_vid[:8] in vin_text:
+                                    if i < len(cards):
+                                        tap_card = cards[i]
+                                        matched = True
+                                    break
+                        # If no target_vid match, prefer Atlas card
+                        if not matched:
+                            for i, c in enumerate(cards):
+                                ctext = c[3].get("text", "").lower()
+                                if "atlas" in ctext:
+                                    tap_card = c
+                                    break
                     cx, cy = tap_card[0], tap_card[1]
                     card_name = tap_card[3].get("text", "?")
                     log.info("NAV: Tapping vehicle card '%s' at (%d,%d)",
@@ -5516,6 +5334,342 @@ img{{max-width:100%;height:auto}}</style></head>
             )
         except Exception as e:
             log.error("RN_STORAGE: Failed: %s", e)
+
+    def _deep_data_explore(self):
+        """Deep scan of VW app data directory to find vehicle selection storage.
+        Checks DataStore, files/, cache/, and APK manifest intent filters."""
+        try:
+            log.info("DEEP_EXPLORE: Scanning VW app data directory...")
+            pkg = VW_PACKAGE
+
+            # 1. Full directory tree of app data
+            r = self._adb_su(f"find /data/data/{pkg}/ -maxdepth 3 -type f 2>/dev/null | head -200")
+            log.info("DEEP_EXPLORE: File tree:\n%s", (r.stdout or "")[:3000])
+
+            # 2. Check files/datastore/ (Jetpack DataStore - modern prefs)
+            r = self._adb_su(f"ls -la /data/data/{pkg}/files/datastore/ 2>/dev/null")
+            ds_out = (r.stdout or "").strip()
+            log.info("DEEP_EXPLORE: DataStore dir: %s", ds_out[:500] if ds_out else "NOT FOUND")
+
+            if ds_out and "No such file" not in ds_out:
+                for line in ds_out.split("\n"):
+                    fname = line.strip().split()[-1] if line.strip() else ""
+                    if fname and not fname.startswith(".") and fname != "datastore":
+                        self._adb_su(f"cp /data/data/{pkg}/files/datastore/{fname} /data/local/tmp/ds_{fname}")
+                        self._adb_su(f"chmod 644 /data/local/tmp/ds_{fname}")
+                        # Try reading as text (preferences DataStore is XML-like)
+                        r2 = self._adb_su(f"cat /data/local/tmp/ds_{fname} 2>/dev/null | strings | head -50")
+                        log.info("DEEP_EXPLORE: DataStore [%s] strings:\n%s",
+                                 fname, (r2.stdout or "")[:1000])
+
+            # 3. Check files/ directory for vehicle-related files
+            r = self._adb_su(f"ls -la /data/data/{pkg}/files/ 2>/dev/null")
+            log.info("DEEP_EXPLORE: files/ dir: %s", (r.stdout or "")[:1000])
+
+            # Search for vehicle keywords in all files under files/
+            r = self._adb_su(
+                f"grep -rl '90bf07c5\\|702b3cc5\\|atlas\\|1V2FR2CA1RC525711\\|WVG6YVEB2SH022706\\|selected_vehicle\\|garage_order' "
+                f"/data/data/{pkg}/files/ 2>/dev/null | head -20")
+            grep_hits = (r.stdout or "").strip()
+            if grep_hits:
+                log.info("DEEP_EXPLORE: Vehicle keyword HITS in files/:\n%s", grep_hits)
+                for hit_file in grep_hits.split("\n")[:5]:
+                    hit_file = hit_file.strip()
+                    if hit_file:
+                        r3 = self._adb_su(f"strings {hit_file} 2>/dev/null | head -30")
+                        log.info("DEEP_EXPLORE: [%s] content:\n%s",
+                                 hit_file, (r3.stdout or "")[:1000])
+            else:
+                log.info("DEEP_EXPLORE: No vehicle keyword hits in files/")
+
+            # 4. Check cache/ for vehicle data
+            r = self._adb_su(
+                f"grep -rl '90bf07c5\\|702b3cc5\\|atlas\\|selected_vehicle' "
+                f"/data/data/{pkg}/cache/ 2>/dev/null | head -10")
+            cache_hits = (r.stdout or "").strip()
+            if cache_hits:
+                log.info("DEEP_EXPLORE: Vehicle keyword HITS in cache/:\n%s", cache_hits)
+            else:
+                log.info("DEEP_EXPLORE: No vehicle keyword hits in cache/")
+
+            # 5. Check for encrypted/protected SharedPreferences
+            r = self._adb_su(
+                f"ls -la /data/data/{pkg}/shared_prefs/ 2>/dev/null")
+            log.info("DEEP_EXPLORE: SharedPrefs listing:\n%s", (r.stdout or "")[:1000])
+
+            # Grep ALL SharedPrefs for ANY content (dump the UUID-named ones)
+            for uuid_name in ["6087599C-C4B5-4D7C-8264-CD77F8E62571",
+                              "B76460B0-936B-4C58-9269-FA54AA6391BA",
+                              "DDFC3671-8589-4C96-8F3F-30700D8BC5CE",
+                              "FBAA574A-D4BD-4F54-9731-5DA6C7CBF6FD"]:
+                r = self._adb_su(
+                    f"cat /data/data/{pkg}/shared_prefs/{uuid_name}.xml 2>/dev/null")
+                content = (r.stdout or "")[:2000]
+                if content:
+                    log.info("DEEP_EXPLORE: SharedPref [%s.xml]:\n%s",
+                             uuid_name, content)
+
+            # 6. Dump APK manifest for intent filters / deep links
+            r = self._adb_su(
+                f"dumpsys package {pkg} | grep -A5 'intent-filter\\|scheme\\|host\\|pathPattern\\|Activity' | head -100")
+            log.info("DEEP_EXPLORE: Intent filters:\n%s", (r.stdout or "")[:2000])
+
+            # 7. Check for EncryptedSharedPreferences (AndroidX Security)
+            r = self._adb_su(
+                f"ls -la /data/data/{pkg}/shared_prefs/__androidx_security_crypto_encrypted_prefs__* 2>/dev/null")
+            enc_prefs = (r.stdout or "").strip()
+            if enc_prefs and "No such file" not in enc_prefs:
+                log.info("DEEP_EXPLORE: EncryptedSharedPreferences FOUND: %s", enc_prefs)
+            else:
+                log.info("DEEP_EXPLORE: No EncryptedSharedPreferences found")
+
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/deep_explore",
+                json.dumps({"status": "ok", "msg": "See addon logs for results"}),
+            )
+        except Exception as e:
+            log.error("DEEP_EXPLORE: Failed: %s", e)
+
+    def _explore_options_menu(self):
+        """Tap the options/three-dot menu on the dashboard and dump its contents.
+        The optionsButton at the top-right of the vehicle dashboard may contain
+        a vehicle switcher option."""
+        try:
+            log.info("EXPLORE_MENU: Tapping options menu on dashboard...")
+
+            # Make sure we're on the dashboard first
+            fg = self._get_foreground_activity()
+            if not fg or VW_PACKAGE not in fg:
+                log.info("EXPLORE_MENU: VW app not in foreground — launching...")
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-W", "-n",
+                     f"{VW_PACKAGE}/.MainActivity"],
+                    capture_output=True, timeout=30, text=True)
+                time.sleep(5)
+
+            # Dump current dashboard state first
+            xml_before = self._dump_ui_xml()
+            if xml_before:
+                opts_btn = self._find_ui_elements(
+                    xml_before, resource_id="optionsButton")
+                vn = self._find_ui_elements(
+                    xml_before, resource_id="vehicleNameTextView")
+                if vn:
+                    log.info("EXPLORE_MENU: Current vehicle: %s",
+                             vn[0][3].get("text", "?"))
+
+                if opts_btn:
+                    ox, oy = opts_btn[0][0], opts_btn[0][1]
+                    log.info("EXPLORE_MENU: optionsButton found at (%d,%d) "
+                             "— tapping", ox, oy)
+                else:
+                    # Use known position from prior logs
+                    ox, oy = 952, 521
+                    log.info("EXPLORE_MENU: optionsButton not found in XML "
+                             "— using known position (%d,%d)", ox, oy)
+
+                # Tap the options button
+                self._adb_tap(ox, oy, label="EXPLORE_MENU-options")
+                time.sleep(3)
+
+                # Dump the menu contents
+                xml_menu = self._dump_ui_xml()
+                if xml_menu:
+                    # Log ALL elements in the menu
+                    all_elems = self._find_ui_elements(xml_menu, text="")
+                    log.info("EXPLORE_MENU: Menu has %d UI elements",
+                             len(all_elems) if all_elems else 0)
+                    # Log every element with text
+                    for elem in (all_elems or []):
+                        txt = elem[3].get("text", "")
+                        desc = elem[3].get("content-desc", "")
+                        rid = elem[3].get("resource-id", "")
+                        cls = elem[3].get("class", "")
+                        bnds = elem[3].get("bounds", "")
+                        if txt or desc:
+                            log.info("EXPLORE_MENU:   [%s] text='%s' "
+                                     "desc='%s' rid='%s' bounds=%s",
+                                     cls.split(".")[-1] if cls else "?",
+                                     txt[:80], desc[:80],
+                                     rid.split("/")[-1] if "/" in rid else rid,
+                                     bnds)
+
+                    # Look specifically for vehicle-related options
+                    vehicle_opts = []
+                    for kw in ["vehicle", "switch", "garage", "atlas",
+                               "buzz", "change", "select", "car"]:
+                        hits = self._find_ui_elements(xml_menu, text=kw)
+                        if hits:
+                            vehicle_opts.extend(hits)
+                            log.info("EXPLORE_MENU: Vehicle option '%s' "
+                                     "found at (%d,%d)", kw,
+                                     hits[0][0], hits[0][1])
+
+                    if not vehicle_opts:
+                        log.info("EXPLORE_MENU: No vehicle-related options "
+                                 "found in menu")
+
+                # Take a screenshot for visual reference
+                self._screencap()
+
+                # Close the menu by pressing BACK
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input keyevent BACK"],
+                    capture_output=True, timeout=10)
+
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/explore_menu",
+                json.dumps({"status": "ok", "msg": "See addon logs for results"}),
+            )
+        except Exception as e:
+            log.error("EXPLORE_MENU: Failed: %s", e)
+
+    def _switch_vehicle_via_menu(self):
+        """Try to switch to Atlas using the dashboard options menu.
+        Returns True if successfully switched, False otherwise."""
+        try:
+            log.info("MENU_SWITCH: Attempting vehicle switch via options menu...")
+
+            xml = self._dump_ui_xml()
+            if not xml:
+                return False
+
+            # Find the optionsButton
+            opts_btn = self._find_ui_elements(
+                xml, resource_id="optionsButton")
+            if opts_btn:
+                ox, oy = opts_btn[0][0], opts_btn[0][1]
+            else:
+                ox, oy = 952, 521
+                log.info("MENU_SWITCH: Using known optionsButton position")
+
+            self._adb_tap(ox, oy, label="MENU_SWITCH-options")
+            time.sleep(3)
+
+            menu_xml = self._dump_ui_xml()
+            if not menu_xml:
+                log.warning("MENU_SWITCH: No XML after tapping options")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input keyevent BACK"],
+                    capture_output=True, timeout=10)
+                return False
+
+            # Look for vehicle-related menu items
+            for kw in ["vehicle", "switch", "garage", "change vehicle",
+                        "select vehicle", "atlas", "car"]:
+                hits = self._find_ui_elements(menu_xml, text=kw)
+                if hits:
+                    hx, hy = hits[0][0], hits[0][1]
+                    hit_text = hits[0][3].get("text", "")
+                    log.info("MENU_SWITCH: Found '%s' at (%d,%d) — tapping",
+                             hit_text, hx, hy)
+                    self._adb_tap(hx, hy, label=f"MENU_SWITCH-{kw}")
+                    time.sleep(5)
+
+                    # Check if we got to a vehicle picker or the Atlas dashboard
+                    pick_xml = self._dump_ui_xml()
+                    if pick_xml:
+                        # Look for Atlas in whatever appeared
+                        atlas_pick = self._find_ui_elements(pick_xml, text="Atlas")
+                        if atlas_pick:
+                            log.info("MENU_SWITCH: Atlas found in picker at "
+                                     "(%d,%d) — tapping",
+                                     atlas_pick[0][0], atlas_pick[0][1])
+                            self._adb_tap(
+                                atlas_pick[0][0], atlas_pick[0][1],
+                                label="MENU_SWITCH-atlas")
+                            time.sleep(8)
+
+                            # Verify
+                            ver_xml = self._dump_ui_xml()
+                            if ver_xml:
+                                vn = self._find_ui_elements(
+                                    ver_xml,
+                                    resource_id="vehicleNameTextView")
+                                if vn and "atlas" in vn[0][3].get(
+                                        "text", "").lower():
+                                    log.info("MENU_SWITCH: SUCCESS — Atlas "
+                                             "dashboard loaded!")
+                                    return True
+
+                        # Check if we went straight to Atlas dashboard
+                        vn = self._find_ui_elements(
+                            pick_xml,
+                            resource_id="vehicleNameTextView")
+                        if vn and "atlas" in vn[0][3].get(
+                                "text", "").lower():
+                            log.info("MENU_SWITCH: Direct switch to Atlas!")
+                            return True
+
+            # Close menu if still open
+            log.info("MENU_SWITCH: No vehicle option found in menu")
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 "input keyevent BACK"],
+                capture_output=True, timeout=10)
+            return False
+
+        except Exception as e:
+            log.error("MENU_SWITCH: Failed: %s", e)
+            return False
+
+    def _verify_atlas_dashboard(self, xml):
+        """Verify we're on the Atlas (ICE) dashboard, not ID. Buzz (EV).
+        Checks for ICE-specific elements and absence of EV elements.
+        Returns (is_atlas, confidence) tuple."""
+        if not xml:
+            return False, "no_xml"
+
+        is_atlas_header = False
+        is_ice_content = False
+        is_ev_content = False
+
+        # Check vehicle name
+        vn = self._find_ui_elements(xml, resource_id="vehicleNameTextView")
+        if vn:
+            name = vn[0][3].get("text", "")
+            if "atlas" in name.lower():
+                is_atlas_header = True
+            elif "buzz" in name.lower() or "id." in name.lower():
+                return False, f"header_says_{name}"
+
+        # Check for ICE-specific elements
+        ice_indicators = [
+            ("Remote start", "text"),
+            ("remoteStartButton", "rid"),
+            # ICE vehicles show fuel level, not battery
+        ]
+        for indicator, itype in ice_indicators:
+            if itype == "text":
+                hits = self._find_ui_elements(xml, text=indicator)
+            else:
+                hits = self._find_ui_elements(xml, resource_id=indicator)
+            if hits:
+                is_ice_content = True
+                log.info("VERIFY_ATLAS: ICE indicator found: %s", indicator)
+
+        # Check for EV-specific elements (should NOT be present on Atlas)
+        ev_indicators = ["Plugged in", "Start charging", "Est. km",
+                         "Est. mi", "Battery"]
+        for ev_ind in ev_indicators:
+            hits = self._find_ui_elements(xml, text=ev_ind)
+            if hits:
+                is_ev_content = True
+                log.info("VERIFY_ATLAS: EV indicator found (WRONG): %s",
+                         ev_ind)
+
+        if is_ev_content:
+            return False, "ev_content_present"
+        if is_atlas_header and is_ice_content:
+            return True, "header_and_ice_content"
+        if is_atlas_header:
+            return True, "header_only"
+        if is_ice_content:
+            return True, "ice_content_only"
+
+        return False, "inconclusive"
 
     def _switch_vehicle(self, target_vid=None):
         """Switch the VW app to a different vehicle using uiautomator.
