@@ -2651,8 +2651,11 @@ img{{max-width:100%;height:auto}}</style></head>
             # vehicle dashboard loaded.  The VW app sometimes loads the
             # default/primary vehicle (ID. Buzz) instead of the tapped
             # one.  Check vehicleNameTextView and retry if wrong.
+            # The dashboard can take 15-25s to fully render after tapping
+            # a vehicle, so we poll patiently before giving up.
             correct_vehicle = False
-            for vv_attempt in range(3):
+            wrong_vehicle_count = 0
+            for vv_attempt in range(6):
                 vv_xml = self._dump_ui_xml()
                 if not vv_xml:
                     log.warning("UI_RST: Vehicle verify — no XML "
@@ -2670,6 +2673,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         correct_vehicle = True
                         break
                     else:
+                        wrong_vehicle_count += 1
                         log.warning("UI_RST: WRONG VEHICLE loaded: '%s' "
                                     "(expected Atlas) — retrying "
                                     "(attempt %d)", vv_name, vv_attempt)
@@ -2694,18 +2698,11 @@ img{{max-width:100%;height:auto}}</style></head>
                         # text center, for a more reliable hit
                         retry_xml = self._dump_ui_xml()
                         if retry_xml:
-                            # Look for the clickable card containing
-                            # "Atlas" text
                             atlas_texts = self._find_ui_elements(
                                 retry_xml, text="Atlas")
                             if atlas_texts:
-                                # Find the parent clickable card —
-                                # search for android.view.View elements
-                                # near the Atlas text
                                 atx = atlas_texts[0][0]
                                 aty = atlas_texts[0][1]
-                                # Tap 200px below text center to hit
-                                # the middle of the card image area
                                 tap_y = aty + 200
                                 log.info("UI_RST: Re-tapping Atlas "
                                          "card center at (%d,%d)",
@@ -2715,8 +2712,6 @@ img{{max-width:100%;height:auto}}</style></head>
                                      f"input tap 540 {tap_y}"],
                                     capture_output=True, timeout=10)
                             else:
-                                # Atlas text not found — tap at known
-                                # card center
                                 log.info("UI_RST: Atlas text not found "
                                          "— tapping card center "
                                          "(540,1229)")
@@ -2731,12 +2726,18 @@ img{{max-width:100%;height:auto}}</style></head>
                                 ["adb", "shell", "su", "-c",
                                  "input tap 540 1229"],
                                 capture_output=True, timeout=10)
-                        time.sleep(12)
+                        time.sleep(15)
                 else:
-                    # No vehicleNameTextView — might still be on Garage
-                    # or transitioning.  Check if Garage elements exist.
+                    # No vehicleNameTextView — check if we're on
+                    # the Garage, on a loading dashboard, or lost.
                     garage_title = self._find_ui_elements(
                         vv_xml, text="Garage")
+                    # Check nav bar — home tab means we're on a
+                    # dashboard even if the name hasn't rendered
+                    home_tab = self._find_ui_elements(
+                        vv_xml, resource_id="home_nav_graph")
+                    fg_act = self._get_foreground_activity() or ""
+
                     if garage_title:
                         log.info("UI_RST: Still on Garage screen — "
                                  "Atlas tap may not have registered. "
@@ -2755,16 +2756,37 @@ img{{max-width:100%;height:auto}}</style></head>
                                 ["adb", "shell", "su", "-c",
                                  "input tap 540 1229"],
                                 capture_output=True, timeout=10)
-                        time.sleep(12)
-                    else:
-                        log.info("UI_RST: No vehicleNameTextView and "
-                                 "not on Garage — may be loading "
+                        time.sleep(15)
+                    elif (home_tab or
+                          "MainActivity" in fg_act):
+                        # On a dashboard (home tab active or on
+                        # MainActivity) but vehicleNameTextView not
+                        # rendered yet — dashboard still loading.
+                        # Wait patiently; the name will appear.
+                        log.info("UI_RST: On dashboard (home tab or "
+                                 "MainActivity) but vehicle name not "
+                                 "yet rendered — waiting "
                                  "(attempt %d)", vv_attempt)
-                        time.sleep(5)
+                        time.sleep(8)
+                    else:
+                        log.info("UI_RST: No vehicleNameTextView, "
+                                 "no Garage, no home tab — may be "
+                                 "transitioning (attempt %d, fg=%s)",
+                                 vv_attempt,
+                                 (fg_act or "?")[:60])
+                        time.sleep(8)
 
-            if not correct_vehicle:
-                log.error("UI_RST: Could not navigate to Atlas "
-                          "dashboard after 3 attempts — aborting")
+            if not correct_vehicle and wrong_vehicle_count == 0:
+                # Never saw vehicleNameTextView at all — dashboard may
+                # still be loading.  Don't abort; let the blind tap /
+                # retry loop handle it (they'll detect wrong vehicle).
+                log.warning("UI_RST: Vehicle name never appeared in "
+                            "%d checks — proceeding anyway "
+                            "(dashboard may still be loading)",
+                            6)
+            elif not correct_vehicle:
+                log.error("UI_RST: Wrong vehicle dashboard loaded "
+                          "%d times — aborting", wrong_vehicle_count)
                 return {"status": "error",
                         "message": "Wrong vehicle dashboard loaded "
                                    "(expected Atlas)"}
