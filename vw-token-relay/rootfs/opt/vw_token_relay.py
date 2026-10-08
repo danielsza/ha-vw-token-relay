@@ -3245,27 +3245,95 @@ img{{max-width:100%;height:auto}}</style></head>
                 if not xml:
                     return False
 
-            # Look for the action button (Start or Stop)
-            # First try resource IDs (more specific, avoids substring
-            # matching "Start" inside "Remote start")
-            rid = ("secondCommandTextView" if action == "Start"
-                   else "firstCommandTextView")
-            action_elems = self._find_ui_elements(xml, resource_id=rid)
-            if not action_elems:
-                # Fall back to text search but filter out the dashboard
-                # remoteStartButton (which contains "Remote start" and
-                # sits at Y~889). Bottom sheet buttons are below Y=1000.
-                all_start = self._find_ui_elements(xml, text=action)
-                action_elems = [e for e in all_start if e[1] > 950]
-                if not action_elems and all_start:
-                    # If nothing below Y=950, use whatever we found
-                    log.warning("UI_RST: No '%s' button below Y=950 "
-                                "— using first match at (%d,%d)",
-                                action, all_start[0][0], all_start[0][1])
-                    action_elems = all_start
+            # Look for the action button (Start or Stop) in the
+            # bottom sheet.  If the first attempt doesn't find it,
+            # dismiss any VW dialog that may have appeared, re-tap
+            # the remoteStartButton, and try again.
+            action_elems = []
+            for bs_try in range(3):
+                # Dismiss VW alert dialogs that may block the
+                # bottom sheet (e.g. stale error 802 dialog)
+                if bs_try > 0 or not imm_btn_clicked:
+                    self._dismiss_vw_alert_dialogs()
+
+                if bs_try > 0:
+                    # Re-dump XML after dialog dismissal
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        log.error("UI_RST: Cannot get UI XML on "
+                                  "bottom sheet retry %d", bs_try)
+                        time.sleep(2)
+                        continue
+
+                # First try resource IDs (more specific, avoids
+                # substring matching "Start" inside "Remote start")
+                rid = ("secondCommandTextView" if action == "Start"
+                       else "firstCommandTextView")
+                action_elems = self._find_ui_elements(
+                    xml, resource_id=rid)
+                if not action_elems:
+                    # Fall back to text search but filter out the
+                    # dashboard remoteStartButton (which contains
+                    # "Remote start" and sits at Y~889).  Bottom
+                    # sheet buttons are below Y=1000.
+                    all_start = self._find_ui_elements(
+                        xml, text=action)
+                    action_elems = [
+                        e for e in all_start if e[1] > 950]
+                    if not action_elems and all_start:
+                        log.warning(
+                            "UI_RST: No '%s' button below Y=950 "
+                            "— using first match at (%d,%d)",
+                            action,
+                            all_start[0][0], all_start[0][1])
+                        action_elems = all_start
+
+                if action_elems:
+                    break
+
+                # Log what IS on screen for diagnostics
+                diag_texts = self._find_ui_elements(xml, text="")
+                key_labels = []
+                for dt in diag_texts[:30]:
+                    t = dt[3].get("text", "").strip()
+                    if t and len(t) < 80:
+                        key_labels.append(
+                            f"'{t}' @({dt[0]},{dt[1]})")
+                log.info("UI_RST: Bottom sheet not found "
+                         "(try %d/3). On-screen text: %s",
+                         bs_try + 1,
+                         "; ".join(key_labels[:15]))
+
+                if bs_try < 2:
+                    # Re-tap remoteStartButton — the bottom sheet
+                    # may not have opened on the first tap.
+                    log.info("UI_RST: Re-tapping remoteStartButton "
+                             "for bottom sheet (retry %d)...",
+                             bs_try + 1)
+                    # Re-find the button in case layout shifted
+                    fresh_xml = self._dump_ui_xml()
+                    if fresh_xml:
+                        rs_btn = self._find_ui_elements(
+                            fresh_xml,
+                            resource_id="remoteStartButton")
+                        if rs_btn:
+                            cx, cy = rs_btn[0][0], rs_btn[0][1]
+                            log.info(
+                                "UI_RST: remoteStartButton at "
+                                "(%d,%d)", cx, cy)
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input tap {cx} {cy}"],
+                        capture_output=True, timeout=10)
+                    time.sleep(5)
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        time.sleep(2)
+                        continue
+
             if not action_elems:
                 log.error("UI_RST: Cannot find '%s' button in "
-                          "bottom sheet", action)
+                          "bottom sheet after 3 attempts", action)
                 self._screencap()
                 return False
 
