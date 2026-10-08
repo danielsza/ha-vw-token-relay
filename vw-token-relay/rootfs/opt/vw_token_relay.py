@@ -3156,6 +3156,33 @@ img{{max-width:100%;height:auto}}</style></head>
                                      "enabled=%s clickable=%s",
                                      btn_attrs.get("enabled"),
                                      btn_attrs.get("clickable"))
+                        else:
+                            # Button vanished after banner dismiss —
+                            # toolbar likely collapsed.  Scroll up to
+                            # re-expand it and re-find the button.
+                            log.warning("UI_RST: Button lost after "
+                                        "banner dismiss — scrolling up")
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input swipe 360 300 360 1000 500"],
+                                capture_output=True, timeout=10)
+                            time.sleep(3)
+                            xml2 = self._dump_ui_xml()
+                            if xml2:
+                                xml = xml2
+                                rb = self._find_ui_elements(
+                                    xml, resource_id="remoteStartButton")
+                                if rb:
+                                    cx, cy = rb[0][0], rb[0][1]
+                                    btn_attrs = rb[0][3]
+                                    log.info("UI_RST: Recovered button "
+                                             "at (%d,%d) after scroll-up"
+                                             " (enabled=%s)", cx, cy,
+                                             btn_attrs.get("enabled"))
+                                else:
+                                    log.warning("UI_RST: Button still "
+                                                "missing after scroll-up"
+                                                " — using stale coords")
 
                 # The VW app can mark dashboard command buttons as
                 # enabled="false" but clickable="true" while loading vehicle
@@ -3199,6 +3226,51 @@ img{{max-width:100%;height:auto}}</style></head>
                             break
 
                 if button_enabled:
+                    # Final coordinate refresh — the banner dismiss or
+                    # status poll can collapse the toolbar and shift the
+                    # button.  Re-dump XML and get fresh coordinates to
+                    # avoid tapping stale coords that miss the button.
+                    final_xml = self._dump_ui_xml()
+                    if final_xml:
+                        final_btn = self._find_ui_elements(
+                            final_xml, resource_id="remoteStartButton")
+                        if final_btn:
+                            new_cx = final_btn[0][0]
+                            new_cy = final_btn[0][1]
+                            if (new_cx, new_cy) != (cx, cy):
+                                log.info("UI_RST: Button moved from "
+                                         "(%d,%d) to (%d,%d) — using "
+                                         "fresh coords",
+                                         cx, cy, new_cx, new_cy)
+                            cx, cy = new_cx, new_cy
+                            xml = final_xml
+                        else:
+                            # Button vanished — scroll up to re-expand
+                            # toolbar before tapping stale coords.
+                            log.warning("UI_RST: Button vanished before "
+                                        "tap — scrolling up to recover")
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input swipe 360 300 360 1000 500"],
+                                capture_output=True, timeout=10)
+                            time.sleep(2)
+                            re_xml = self._dump_ui_xml()
+                            if re_xml:
+                                re_btn = self._find_ui_elements(
+                                    re_xml, resource_id="remoteStartButton")
+                                if re_btn:
+                                    cx, cy = (re_btn[0][0],
+                                              re_btn[0][1])
+                                    xml = re_xml
+                                    log.info("UI_RST: Recovered button "
+                                             "at (%d,%d) after scroll",
+                                             cx, cy)
+                                else:
+                                    log.warning("UI_RST: Button still "
+                                                "not found after scroll "
+                                                "— tapping old coords "
+                                                "(%d,%d)", cx, cy)
+
                     # Normal tap — button is enabled
                     log.info("UI_RST: Tapping Remote start at (%d,%d)",
                              cx, cy)
