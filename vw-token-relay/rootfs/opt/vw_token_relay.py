@@ -659,6 +659,17 @@ class VWTokenRelay:
                              args=(payload, True), daemon=True).start()
         elif cmd == "get_pairing":
             threading.Thread(target=self._cmd_get_pairing, args=(payload,), daemon=True).start()
+        elif cmd == "tap":
+            # Direct ADB tap at coordinates.  Payload: "x,y"
+            try:
+                parts = payload.strip().split(",")
+                tx, ty = int(parts[0]), int(parts[1])
+                log.info("CMD: ADB tap at (%d,%d)", tx, ty)
+                subprocess.run(["adb", "shell", "su", "-c",
+                                f"input tap {tx} {ty}"],
+                               capture_output=True, timeout=10)
+            except Exception as e:
+                log.error("CMD: tap failed: %s", e)
         elif cmd == "dump_ui":
             threading.Thread(target=self._dump_ui, daemon=True).start()
         elif cmd == "ui_xml":
@@ -3811,10 +3822,29 @@ img{{max-width:100%;height:auto}}</style></head>
                            capture_output=True, timeout=10)
             time.sleep(5)
 
-            # Step 6: Check result — dismiss system dialogs, check for SPIN entry
+            # Step 6: Check result — dismiss system dialogs, check for
+            # Accept dialog, SPIN entry, pairing form
             self._dismiss_system_dialogs()
             xml = self._dump_ui_xml()
             if xml:
+                # Check for device pairing Accept dialog (appears after
+                # Start tap when the phone needs to re-pair with the car)
+                accept_elems = self._find_ui_elements(xml, text="Accept")
+                if accept_elems:
+                    log.info("UI_RST: Post-Start pairing Accept dialog "
+                             "detected — tapping Accept at (%d,%d)",
+                             accept_elems[0][0], accept_elems[0][1])
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input tap {accept_elems[0][0]} {accept_elems[0][1]}"],
+                        capture_output=True, timeout=10)
+                    time.sleep(5)
+                    # Re-dump XML after Accept to check for SPIN or result
+                    xml = self._dump_ui_xml()
+                    if not xml:
+                        log.warning("UI_RST: No XML after Accept tap")
+                        return False
+
                 # If SPIN entry dialog appears, enter it
                 spin_entered = self._enter_spin_if_present(xml)
                 if spin_entered:
