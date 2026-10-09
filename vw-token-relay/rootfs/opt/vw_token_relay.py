@@ -1991,6 +1991,47 @@ img{{max-width:100%;height:auto}}</style></head>
                     json.dumps({"error": "no_id_token", "msg": "No OIDC id_token — wake app first"}))
                 return
 
+        # ── Check id_token expiration ──
+        # The OIDC id_token has a 30-minute lifetime.  The SpinService returns
+        # a generic HTTP 500 for expired JWTs instead of a clean 401, so we
+        # must ensure freshness before using it.
+        try:
+            parts = self.id_token.split(".")
+            pad = "=" * (4 - len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+            exp = payload.get("exp", 0)
+            ttl = exp - time.time()
+            log.info("RST: id_token exp=%d, TTL=%.0fs (%.1f min)", exp, ttl, ttl / 60)
+            if ttl < 120:  # expired or expiring within 2 minutes
+                log.warning("RST: id_token expired/expiring (TTL=%.0fs) — refreshing...", ttl)
+                refreshed = self._direct_idp_refresh()
+                if not refreshed:
+                    log.info("RST: IDP refresh failed — waking app for fresh login...")
+                    self._wake_app(target_vid=vid)
+                    time.sleep(30)
+                if not self.id_token:
+                    log.error("RST: Still no id_token after refresh attempt")
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                        json.dumps({"error": "id_token_expired",
+                                    "msg": "Could not refresh expired id_token"}))
+                    return
+                # Re-check expiration after refresh
+                parts2 = self.id_token.split(".")
+                pad2 = "=" * (4 - len(parts2[1]) % 4)
+                payload2 = json.loads(base64.urlsafe_b64decode(parts2[1] + pad2))
+                exp2 = payload2.get("exp", 0)
+                ttl2 = exp2 - time.time()
+                log.info("RST: Refreshed id_token exp=%d, TTL=%.0fs (%.1f min)",
+                         exp2, ttl2, ttl2 / 60)
+                if ttl2 < 30:
+                    log.error("RST: Refreshed id_token still expired (TTL=%.0fs)", ttl2)
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                        json.dumps({"error": "id_token_still_expired",
+                                    "ttl": round(ttl2)}))
+                    return
+        except Exception as e:
+            log.warning("RST: Could not check id_token expiration: %s (proceeding anyway)", e)
+
         if not self.user_id:
             log.error("RST: No user_id available")
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
