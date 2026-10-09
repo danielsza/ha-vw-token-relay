@@ -2044,29 +2044,68 @@ img{{max-width:100%;height:auto}}</style></head>
         spin_hash1 = self._compute_spin_hash(challenge1)
         log.info("RST: Computed spinHash1 (%d chars)", len(spin_hash1))
 
+        # Debug: decode idToken JWT to check its contents
+        if self.id_token and self.id_token.startswith("eyJ"):
+            try:
+                import base64
+                parts = self.id_token.split(".")
+                # Decode header and payload (add padding)
+                hdr = base64.urlsafe_b64decode(parts[0] + "==").decode("utf-8", errors="replace")
+                payload = base64.urlsafe_b64decode(parts[1] + "==").decode("utf-8", errors="replace")
+                log.info("RST: idToken JWT header: %s", hdr[:200])
+                log.info("RST: idToken JWT payload: %s", payload[:500])
+            except Exception as e:
+                log.warning("RST: Failed to decode idToken JWT: %s", e)
+
         # ── Step 2: Create ATC session → carnetVehicleToken ──
-        # Try spinHash (challenge-based) first, fall back to tspPin (raw)
+        # Try multiple body formats — the NA SpinService format is uncertain
         log.info("RST Step 2: Creating ATC session (tsp=ATC)...")
-        session_body = json.dumps({
-            "idToken": self.id_token,
-            "spinHash": spin_hash1,
-            "tsp": "ATC"
-        }).encode()
+
+        # Format A: {idToken, spinHash, tsp}
+        body_a = {"idToken": self.id_token, "spinHash": spin_hash1, "tsp": "ATC"}
+        log.info("RST Step 2A: Trying {idToken, spinHash, tsp} ...")
+        session_body = json.dumps(body_a).encode()
         result, err = self._api_request("POST", session_url, body=session_body, vid=vid)
 
-        # If spinHash fails with 500, try raw tspPin format (older API)
+        # Format B: {spinHash, tsp} — no idToken (bearer token might suffice)
         if result is None and err and err.get("code") == 500:
-            log.warning("RST: spinHash session failed (500) — trying "
-                        "tspPin (raw SPIN) format as fallback...")
-            session_body_raw = json.dumps({
-                "idToken": self.id_token,
-                "tspPin": self.vw_spin,
-                "tsp": "ATC"
-            }).encode()
+            log.warning("RST Step 2A failed (500) — trying format B: {spinHash, tsp} (no idToken)...")
+            body_b = {"spinHash": spin_hash1, "tsp": "ATC"}
             result, err = self._api_request(
-                "POST", session_url, body=session_body_raw, vid=vid)
+                "POST", session_url, body=json.dumps(body_b).encode(), vid=vid)
             if result is not None:
-                log.info("RST: tspPin (raw) format SUCCEEDED!")
+                log.info("RST: Format B (no idToken) SUCCEEDED!")
+
+        # Format C: {spinHash, challenge, tsp} — include challenge in body
+        if result is None and err and err.get("code") in (400, 500):
+            log.warning("RST Step 2B failed (%s) — trying format C: {spinHash, challenge, tsp}...",
+                        err.get("code"))
+            body_c = {"spinHash": spin_hash1, "challenge": challenge1, "tsp": "ATC"}
+            result, err = self._api_request(
+                "POST", session_url, body=json.dumps(body_c).encode(), vid=vid)
+            if result is not None:
+                log.info("RST: Format C (with challenge) SUCCEEDED!")
+
+        # Format D: {idToken, spinHash, tsp, challenge}
+        if result is None and err and err.get("code") in (400, 500):
+            log.warning("RST Step 2C failed (%s) — trying format D: {idToken, spinHash, challenge, tsp}...",
+                        err.get("code"))
+            body_d = {"idToken": self.id_token, "spinHash": spin_hash1,
+                      "challenge": challenge1, "tsp": "ATC"}
+            result, err = self._api_request(
+                "POST", session_url, body=json.dumps(body_d).encode(), vid=vid)
+            if result is not None:
+                log.info("RST: Format D (idToken + challenge) SUCCEEDED!")
+
+        # Format E: tspPin fallback (raw SPIN, older API)
+        if result is None and err and err.get("code") in (400, 500):
+            log.warning("RST Step 2D failed (%s) — trying format E: tspPin (raw SPIN)...",
+                        err.get("code"))
+            body_e = {"idToken": self.id_token, "tspPin": self.vw_spin, "tsp": "ATC"}
+            result, err = self._api_request(
+                "POST", session_url, body=json.dumps(body_e).encode(), vid=vid)
+            if result is not None:
+                log.info("RST: Format E (tspPin) SUCCEEDED!")
 
         if result is None:
             log.error("RST: ATC session failed: %s", err)
