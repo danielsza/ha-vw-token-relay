@@ -1615,22 +1615,39 @@ img{{max-width:100%;height:auto}}</style></head>
             crc = table[crc ^ b]
         return (~crc) & 0xFF
 
-    def _compute_spin_hash(self, challenge):
-        """Compute spinHash in VW standard format.
+    def _compute_spin_hash(self, challenge, encoding="hex"):
+        """Compute spinHash for VW SpinService.
 
-        VW's server expects: SHA512(SPIN_bytes || challenge_bytes)
-        where both SPIN and challenge are hex-decoded to raw bytes,
-        SPIN comes first, and the result is lowercase hex.
+        encoding controls how the SPIN is converted to bytes:
+          "hex"   — bytearray.fromhex(spin) (volkswagencarnet style)
+          "ascii" — spin.encode("utf-8")     (PIN as ASCII bytes)
 
-        Reference: volkswagencarnet hash_spin() implementation.
+        Both prepend SPIN bytes before challenge bytes.
         """
-        spin_bytes = bytearray.fromhex(self.vw_spin)
+        if encoding == "ascii":
+            spin_bytes = self.vw_spin.encode("utf-8")
+        else:
+            spin_bytes = bytearray.fromhex(self.vw_spin)
         challenge_bytes = bytearray.fromhex(challenge)
         combined = spin_bytes + challenge_bytes
         result = hashlib.sha512(combined).hexdigest()
-        log.debug("spinHash: SPIN(%d bytes) + challenge(%d bytes) = %d "
+        log.debug("spinHash(%s): SPIN(%d bytes) + challenge(%d bytes) = %d "
                   "bytes → SHA512 %s...%s",
-                  len(spin_bytes), len(challenge_bytes),
+                  encoding, len(spin_bytes), len(challenge_bytes),
+                  len(combined), result[:8], result[-8:])
+        return result
+
+    def _compute_spin_hash_reversed(self, challenge, encoding="hex"):
+        """Like _compute_spin_hash but with reversed byte order: challenge||SPIN."""
+        if encoding == "ascii":
+            spin_bytes = self.vw_spin.encode("utf-8")
+        else:
+            spin_bytes = bytearray.fromhex(self.vw_spin)
+        challenge_bytes = bytearray.fromhex(challenge)
+        combined = challenge_bytes + spin_bytes  # reversed: challenge first
+        result = hashlib.sha512(combined).hexdigest()
+        log.debug("spinHash_rev(%s): challenge(%d) + SPIN(%d) = %d bytes → %s...%s",
+                  encoding, len(challenge_bytes), len(spin_bytes),
                   len(combined), result[:8], result[-8:])
         return result
 
@@ -2041,8 +2058,11 @@ img{{max-width:100%;height:auto}}</style></head>
                 json.dumps({"error": "spin_low_tries", "remaining": remaining}))
             return
 
-        spin_hash1 = self._compute_spin_hash(challenge1)
-        log.info("RST: Computed spinHash1 (%d chars)", len(spin_hash1))
+        spin_hash1_hex = self._compute_spin_hash(challenge1, encoding="hex")
+        spin_hash1_ascii = self._compute_spin_hash(challenge1, encoding="ascii")
+        log.info("RST: spinHash1 hex=%s...%s  ascii=%s...%s",
+                 spin_hash1_hex[:16], spin_hash1_hex[-8:],
+                 spin_hash1_ascii[:16], spin_hash1_ascii[-8:])
 
         # Debug: decode idToken JWT to check its contents
         if self.id_token and self.id_token.startswith("eyJ"):
@@ -2061,51 +2081,38 @@ img{{max-width:100%;height:auto}}</style></head>
         # Try multiple body formats — the NA SpinService format is uncertain
         log.info("RST Step 2: Creating ATC session (tsp=ATC)...")
 
-        # Format A: {idToken, spinHash, tsp}
-        body_a = {"idToken": self.id_token, "spinHash": spin_hash1, "tsp": "ATC"}
-        log.info("RST Step 2A: Trying {idToken, spinHash, tsp} ...")
-        session_body = json.dumps(body_a).encode()
-        result, err = self._api_request("POST", session_url, body=session_body, vid=vid)
+        # Try multiple SPIN encodings × body formats.
+        # Previous runs showed: {idToken + spinHash(hex)} → 500 (server crash).
+        # Hypothesis: SPIN "1234" should be ASCII-encoded (4 bytes) not hex-decoded (2 bytes).
+        # Also test reversed byte order: challenge||SPIN instead of SPIN||challenge.
 
-        # Format B: {spinHash, tsp} — no idToken (bearer token might suffice)
-        if result is None and err and err.get("code") == 500:
-            log.warning("RST Step 2A failed (500) — trying format B: {spinHash, tsp} (no idToken)...")
-            body_b = {"spinHash": spin_hash1, "tsp": "ATC"}
-            result, err = self._api_request(
-                "POST", session_url, body=json.dumps(body_b).encode(), vid=vid)
-            if result is not None:
-                log.info("RST: Format B (no idToken) SUCCEEDED!")
+        formats = [
+            # (label, body_dict)
+            ("A-hex",   {"idToken": self.id_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}),
+            ("A-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}),
+        ]
 
-        # Format C: {spinHash, challenge, tsp} — include challenge in body
-        if result is None and err and err.get("code") in (400, 500):
-            log.warning("RST Step 2B failed (%s) — trying format C: {spinHash, challenge, tsp}...",
-                        err.get("code"))
-            body_c = {"spinHash": spin_hash1, "challenge": challenge1, "tsp": "ATC"}
-            result, err = self._api_request(
-                "POST", session_url, body=json.dumps(body_c).encode(), vid=vid)
-            if result is not None:
-                log.info("RST: Format C (with challenge) SUCCEEDED!")
+        # Reversed byte order: challenge + SPIN (instead of SPIN + challenge)
+        rev_hex = self._compute_spin_hash_reversed(challenge1, encoding="hex")
+        rev_ascii = self._compute_spin_hash_reversed(challenge1, encoding="ascii")
+        formats.append(("A-rev-hex",   {"idToken": self.id_token, "spinHash": rev_hex, "tsp": "ATC"}))
+        formats.append(("A-rev-ascii", {"idToken": self.id_token, "spinHash": rev_ascii, "tsp": "ATC"}))
 
-        # Format D: {idToken, spinHash, tsp, challenge}
-        if result is None and err and err.get("code") in (400, 500):
-            log.warning("RST Step 2C failed (%s) — trying format D: {idToken, spinHash, challenge, tsp}...",
-                        err.get("code"))
-            body_d = {"idToken": self.id_token, "spinHash": spin_hash1,
-                      "challenge": challenge1, "tsp": "ATC"}
-            result, err = self._api_request(
-                "POST", session_url, body=json.dumps(body_d).encode(), vid=vid)
-            if result is not None:
-                log.info("RST: Format D (idToken + challenge) SUCCEEDED!")
+        # Without idToken (bearer only)
+        formats.append(("B-ascii", {"spinHash": spin_hash1_ascii, "tsp": "ATC"}))
 
-        # Format E: tspPin fallback (raw SPIN, older API)
-        if result is None and err and err.get("code") in (400, 500):
-            log.warning("RST Step 2D failed (%s) — trying format E: tspPin (raw SPIN)...",
-                        err.get("code"))
-            body_e = {"idToken": self.id_token, "tspPin": self.vw_spin, "tsp": "ATC"}
+        winning_label = None
+        for label, body in formats:
+            log.info("RST Step 2 [%s]: Trying %s ...", label, list(body.keys()))
             result, err = self._api_request(
-                "POST", session_url, body=json.dumps(body_e).encode(), vid=vid)
+                "POST", session_url, body=json.dumps(body).encode(), vid=vid)
             if result is not None:
-                log.info("RST: Format E (tspPin) SUCCEEDED!")
+                log.info("RST: Format %s SUCCEEDED!", label)
+                winning_label = label
+                break
+            code = err.get("code", 0) if err else 0
+            log.warning("RST Step 2 [%s] failed (%s): %s", label, code,
+                        json.dumps(err)[:300] if err else "no error info")
 
         if result is None:
             log.error("RST: ATC session failed: %s", err)
@@ -2138,8 +2145,17 @@ img{{max-width:100%;height:auto}}</style></head>
         challenge2 = c2_data["data"]["challenge"]
         log.info("RST: challenge2=%s", challenge2)
 
-        spin_hash2 = self._compute_spin_hash(challenge2)
-        log.info("RST: Computed spinHash2 (%d chars)", len(spin_hash2))
+        # Use same encoding that won at Step 2
+        if winning_label and "rev" in winning_label:
+            spin_enc = "ascii" if "ascii" in winning_label else "hex"
+            spin_hash2 = self._compute_spin_hash_reversed(challenge2, encoding=spin_enc)
+            log.info("RST: spinHash2 (reversed, %s) (%d chars)", spin_enc, len(spin_hash2))
+        elif winning_label and "ascii" in winning_label:
+            spin_hash2 = self._compute_spin_hash(challenge2, encoding="ascii")
+            log.info("RST: spinHash2 (ascii) (%d chars)", len(spin_hash2))
+        else:
+            spin_hash2 = self._compute_spin_hash(challenge2, encoding="hex")
+            log.info("RST: spinHash2 (hex/default) (%d chars)", len(spin_hash2))
 
         # ── Step 3b: Create captcha via POST/GET /operation/remoteStart ──
         # The captcha is server-side state that must be created BEFORE /check.
