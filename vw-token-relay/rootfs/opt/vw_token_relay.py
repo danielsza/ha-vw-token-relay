@@ -634,9 +634,9 @@ class VWTokenRelay:
         elif cmd == "unlock":
             self._api_lock(payload, lock=False)
         elif cmd == "climate_start":
-            self._api_climate(payload, start=True)
+            threading.Thread(target=self._api_climate, args=(payload, True), daemon=True).start()
         elif cmd == "climate_stop":
-            self._api_climate(payload, start=False)
+            threading.Thread(target=self._api_climate, args=(payload, False), daemon=True).start()
         elif cmd == "remote_start":
             threading.Thread(target=self._api_remote_start, args=(payload,), daemon=True).start()
         elif cmd == "remote_start_dry":
@@ -1593,16 +1593,160 @@ img{{max-width:100%;height:auto}}</style></head>
         else:
             log.error("%s failed: %s", action, err)
 
+    def _get_spin_token(self, vehicle_id, tsp="WCT"):
+        """Acquire a SPIN-authenticated carnetVehicleToken for vehicle commands.
+
+        This is the shared SPIN challenge/verify flow used by both climate and
+        remote-start.  The VW API accepts regular Bearer tokens for command
+        endpoints but silently drops the command unless the token is a
+        carnetVehicleToken obtained through this SPIN flow.
+
+        Args:
+            vehicle_id: Full vehicle UUID (already resolved).
+            tsp: Telematics Service Provider — "WCT" for MEB/EV (ID. Buzz),
+                 "ATC" for ICE (Atlas).
+
+        Returns:
+            (carnetVehicleToken_str, None) on success,
+            (None, error_dict) on failure.
+        """
+        if not self.vw_spin:
+            return None, {"error": "no_spin", "msg": "S-PIN not configured"}
+        if not self.user_id:
+            return None, {"error": "no_user_id", "msg": "User ID not set"}
+        if not self.id_token:
+            return None, {"error": "no_id_token", "msg": "No id_token captured yet"}
+
+        # Get an OAuth token for the challenge endpoints
+        oauth_token = self._get_valid_token(vehicle_id, vehicle_only=True)
+        if not oauth_token:
+            oauth_token = self._get_valid_token(vehicle_id, vehicle_only=False)
+        if not oauth_token:
+            log.info("SPIN: No token — waking app...")
+            self._wake_app(target_vid=vehicle_id)
+            time.sleep(30)
+            oauth_token = self._get_valid_token(vehicle_id)
+            if not oauth_token:
+                return None, {"error": "no_valid_token", "msg": "No OAuth token available"}
+
+        challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
+        session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vehicle_id}/session"
+
+        # ── Step 1: Fetch challenge ──
+        log.info("SPIN: Fetching challenge for %s session (vehicle %s)...", tsp, vehicle_id[:16])
+        result, err = self._api_request("GET", challenge_url, vid=vehicle_id)
+        if result is None:
+            log.error("SPIN: Challenge failed: %s", err)
+            return None, {"error": "challenge_failed", **(err or {})}
+
+        c_data = json.loads(result)
+        challenge = c_data["data"]["challenge"]
+        remaining = c_data["data"].get("remainingTries", 999)
+        log.info("SPIN: challenge=%s, remainingTries=%d", challenge, remaining)
+
+        if remaining < 3:
+            log.warning("SPIN: Only %d tries remaining — aborting", remaining)
+            return None, {"error": "spin_low_tries", "remaining": remaining}
+
+        spin_hash = self._compute_spin_hash(challenge)
+        log.info("SPIN: spinHash=%s...%s", spin_hash[:16], spin_hash[-8:])
+
+        # ── Step 2: Create session → carnetVehicleToken ──
+        session_body = {"idToken": self.id_token, "spinHash": spin_hash, "tsp": tsp}
+        log.info("SPIN: Creating %s session (idToken=%d chars)...", tsp, len(self.id_token))
+        result, err = self._api_request(
+            "POST", session_url, body=json.dumps(session_body).encode(), vid=vehicle_id)
+
+        if result is None:
+            log.error("SPIN: %s session failed: %s", tsp, err)
+            return None, {"error": "session_failed", **(err or {})}
+
+        session_data = json.loads(result)
+        token = session_data.get("data", {}).get("carnetVehicleToken")
+        if not token:
+            log.error("SPIN: No carnetVehicleToken in response: %s",
+                      json.dumps(session_data)[:500])
+            return None, {"error": "no_carnet_token",
+                          "msg": "Session response missing carnetVehicleToken"}
+
+        log.info("SPIN: Got carnetVehicleToken (%d chars) via %s", len(token), tsp)
+        return token, None
+
     def _api_climate(self, vehicle_id, start=True):
-        """Send climate start/stop command with auto-retry."""
+        """Send climate start/stop command with SPIN authentication.
+
+        The VW API requires a SPIN-authenticated carnetVehicleToken for
+        climate commands.  Without it, the API returns 200 + correlationId
+        but silently does not execute the command on the vehicle.
+        """
         vid = vehicle_id.strip()
         action = "start" if start else "stop"
-        url = f"{BASE_URL}/ev/v1/vehicle/{vid}/pretripclimate/{action}"
 
-        result, err = self._api_request("POST", url, body=b"", vid=vid)
+        # Resolve short vehicle ID to full UUID
+        resolved_vid = self._resolve_vehicle_id(vid)
+        if resolved_vid != vid:
+            log.info("CLIMATE: Resolved vehicle ID: %s → %s", vid, resolved_vid)
+        vid = resolved_vid
+
+        log.info("═══ CLIMATE %s ═══ vehicle=%s", action.upper(), vid[:16])
+
+        # ── Acquire SPIN token (EV vehicles use WCT) ──
+        spin_token, spin_err = self._get_spin_token(vid, tsp="WCT")
+        if spin_token is None:
+            log.error("CLIMATE: SPIN auth failed: %s", spin_err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": f"climate_spin_failed", "action": action, **(spin_err or {})}))
+            return
+
+        # ── Send climate command with carnetVehicleToken ──
+        url = f"{BASE_URL}/ev/v1/vehicle/{vid}/pretripclimate/{action}"
+        log.info("CLIMATE: POST %s (using SPIN token, %d chars)", url[-50:], len(spin_token))
+
+        result, err = self._api_request_with_token("POST", url,
+                                                     body=b"",
+                                                     bearer_token=spin_token)
         if result is not None:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/response/climate", result)
             log.info("CLIMATE %s success: %s", action.upper(), result[:200])
+
+            # Poll for command execution status
+            try:
+                resp_data = json.loads(result)
+                correlation_id = resp_data.get("data", {}).get("correlationId") or resp_data.get("correlationId")
+                if correlation_id:
+                    log.info("CLIMATE: Polling for result (correlationId=%s)...", correlation_id)
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid[:8]}/climate",
+                        json.dumps({"status": "pending", "action": action,
+                                    "correlationId": correlation_id}), retain=False)
+
+                    poll_url = f"{BASE_URL}/history/v1/vehicle/{vid}/correlationId/{correlation_id}/ro/"
+                    for attempt in range(12):  # Up to 2 minutes
+                        time.sleep(10)
+                        poll_result, poll_err = self._api_request_with_token(
+                            "GET", poll_url, bearer_token=spin_token)
+                        if poll_result is not None:
+                            poll_data = json.loads(poll_result)
+                            status_str = poll_data.get("data", {}).get("responseStatusString", "")
+                            outcome_str = poll_data.get("data", {}).get("responseOutcomeString", "")
+                            log.info("CLIMATE poll %d: status=%s outcome=%s",
+                                     attempt + 1, status_str, outcome_str)
+                            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid[:8]}/climate",
+                                json.dumps({"status": status_str, "outcome": outcome_str,
+                                            "action": action, "correlationId": correlation_id,
+                                            "attempt": attempt + 1}), retain=False)
+                            if status_str in ("ACKNOWLEDGED", "COMPLETED"):
+                                if outcome_str == "ACCEPTED":
+                                    log.info("═══ CLIMATE %s SUCCESS ═══", action.upper())
+                                else:
+                                    log.warning("═══ CLIMATE %s RESULT: %s ═══", action.upper(), outcome_str)
+                                return
+                        else:
+                            code = poll_err.get("code", 0) if isinstance(poll_err, dict) else 0
+                            if code != 404:
+                                log.error("CLIMATE poll %d failed: %s", attempt + 1, poll_err)
+                            log.warning("CLIMATE: Polling timed out after 12 attempts")
+            except Exception as e:
+                log.warning("CLIMATE: Polling error (command was sent): %s", e)
         else:
             log.error("Climate %s failed: %s", action, err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
