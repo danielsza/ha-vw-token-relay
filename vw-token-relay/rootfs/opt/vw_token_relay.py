@@ -2538,6 +2538,13 @@ img{{max-width:100%;height:auto}}</style></head>
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
             json.dumps({"status": f"ui_{action.lower()}_initiated"}), retain=False)
 
+        # ── SUPPRESS KEEPALIVE during UI remote start ──
+        # The keepalive thread can force-kill the VW app mid-flow if it
+        # hasn't seen a fresh token.  Set maintenance mode to prevent that.
+        self._maintenance.set()
+        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "on", retain=True)
+        log.info("UI_RST: Maintenance mode ON (keepalive suppressed)")
+
         try:
             # Step 0: Wake screen + keep it on + clear Media Storage crashes
             self._wake_screen()
@@ -2574,16 +2581,19 @@ img{{max-width:100%;height:auto}}</style></head>
                             "(non-critical)")
             time.sleep(1)
 
-            # Step 1: Navigate to Atlas dashboard
-            # Strategy: Use MainActivity (not ForcedGarageActivity) to
-            # open whatever vehicle was last viewed. Then verify and
-            # switch if needed. ForcedGarageActivity is broken — it
-            # always opens ID. Buzz regardless of which card is tapped.
-            log.info("UI_RST: Navigating to vehicle dashboard...")
+            # Step 1: Force-stop and cold-launch VW app.
+            # Using am start on an already-running instance keeps the old
+            # scroll position and vehicle, causing the toolbar to stay
+            # collapsed (vehicle name invisible) and wrong vehicle showing.
+            # A cold launch ensures a clean state with toolbar expanded.
+            log.info("UI_RST: Force-stopping VW app for clean launch...")
             self._wake_screen()
+            subprocess.run(
+                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                capture_output=True, timeout=10)
+            time.sleep(2)
 
-            # Launch with MainActivity first — this opens the last-
-            # viewed vehicle dashboard directly (skip the broken Garage)
+            log.info("UI_RST: Cold-launching VW app...")
             am_result = subprocess.run(
                 ["adb", "shell", "am", "start", "-W", "-n",
                  f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
@@ -2591,7 +2601,7 @@ img{{max-width:100%;height:auto}}</style></head>
             log.info("UI_RST: am start MainActivity: rc=%d stdout=%s",
                      am_result.returncode,
                      (am_result.stdout or "")[:200])
-            time.sleep(5)
+            time.sleep(8)  # Extra time for cold start + React Native init
 
             # Check foreground — MUST be VW app
             self._wake_screen()
@@ -3907,6 +3917,12 @@ img{{max-width:100%;height:auto}}</style></head>
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
                 json.dumps({"error": "ui_rst_exception", "msg": str(e)}))
             return False
+        finally:
+            # ── RESTORE KEEPALIVE ──
+            self._maintenance.clear()
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/maintenance", "off",
+                               retain=True)
+            log.info("UI_RST: Maintenance mode OFF (keepalive restored)")
 
     # ── Wake the VW app to trigger token refresh ────────────────────
     def _adb_check(self):
