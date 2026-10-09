@@ -2803,6 +2803,21 @@ img{{max-width:100%;height:auto}}</style></head>
             # Wait for dashboard to fully render
             time.sleep(8)
 
+            # ── EXPAND COLLAPSED TOOLBAR ──
+            # The VW app's CollapsingToolbarLayout starts collapsed
+            # even after a cold launch.  Scroll up (swipe down on
+            # screen) to fully expand it — this reveals both the
+            # vehicleNameTextView and the command buttons (Remote
+            # start, Climate, Lock) that are hidden when collapsed.
+            log.info("UI_RST: Expanding toolbar after cold launch...")
+            for _swipe in range(3):
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input swipe 540 400 540 1200 400"],
+                    capture_output=True, timeout=10)
+                time.sleep(1)
+            time.sleep(2)
+
             # ── VEHICLE VERIFICATION (v1.32 strategy) ──
             # 1. Check if we're already on Atlas (lucky path)
             # 2. If wrong vehicle, try options menu vehicle switcher
@@ -2937,9 +2952,17 @@ img{{max-width:100%;height:auto}}</style></head>
 
                     if (home_tab or "MainActivity" in fg_act):
                         log.info("UI_RST: On dashboard but vehicle name "
-                                 "not yet rendered — waiting "
-                                 "(attempt %d)", vv_attempt)
-                        time.sleep(8)
+                                 "not yet rendered — scrolling up to "
+                                 "expand toolbar (attempt %d)", vv_attempt)
+                        # The toolbar is likely collapsed — scroll up
+                        # to expand it and reveal vehicleNameTextView
+                        for _sw in range(2):
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input swipe 540 400 540 1200 400"],
+                                capture_output=True, timeout=10)
+                            time.sleep(1)
+                        time.sleep(5)
                     else:
                         log.info("UI_RST: No vehicleNameTextView, "
                                  "no home tab — transitioning "
