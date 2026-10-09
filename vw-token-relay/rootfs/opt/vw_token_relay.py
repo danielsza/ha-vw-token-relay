@@ -2078,6 +2078,14 @@ img{{max-width:100%;height:auto}}</style></head>
                  spin_hash1_hex[:16], spin_hash1_hex[-8:],
                  spin_hash1_ascii[:16], spin_hash1_ascii[-8:])
 
+        # Debug: log token types
+        log.info("RST: OAuth token (Bearer): %s...%s (%d chars, JWT=%s)",
+                 oauth_token[:20], oauth_token[-8:], len(oauth_token),
+                 oauth_token.startswith("eyJ"))
+        log.info("RST: id_token: %s...%s (%d chars, JWT=%s)",
+                 self.id_token[:20], self.id_token[-8:], len(self.id_token),
+                 self.id_token.startswith("eyJ"))
+
         # Debug: decode idToken JWT to check its contents
         if self.id_token and self.id_token.startswith("eyJ"):
             try:
@@ -2100,29 +2108,18 @@ img{{max-width:100%;height:auto}}</style></head>
         # Hypothesis: SPIN "1234" should be ASCII-encoded (4 bytes) not hex-decoded (2 bytes).
         # Also test reversed byte order: challenge||SPIN instead of SPIN||challenge.
 
-        # Build format list — try securityToken variants first if available
+        # Build format list.  Previous results: {idToken(JWT) + ANY spinHash} → 500.
+        # Hypothesis: "idToken" field might want the OAuth access_token, not JWT id_token.
         formats = []
 
-        if sec_token1:
-            # Hypothesis: securityToken from challenge is REQUIRED (like EU API)
-            log.info("RST: securityToken found — trying with it first")
-            # Format S1: flat {idToken, spinHash, securityToken, tsp}
-            formats.append(("S1-hex", {"idToken": self.id_token, "spinHash": spin_hash1_hex,
-                                       "securityToken": sec_token1, "tsp": "ATC"}))
-            formats.append(("S1-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii,
-                                         "securityToken": sec_token1, "tsp": "ATC"}))
-            # Format S2: EU-style nested body
-            formats.append(("S2-nested", {
-                "securityPinAuthentication": {
-                    "securityPin": {
-                        "challenge": challenge1,
-                        "securityPinHash": spin_hash1_hex
-                    },
-                    "securityToken": sec_token1
-                }
-            }))
+        # T1: OAuth access_token as idToken (hex SPIN hash)
+        formats.append(("T1-oauth-hex",
+                        {"idToken": oauth_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}))
+        # T2: OAuth access_token as idToken (ascii SPIN hash)
+        formats.append(("T2-oauth-ascii",
+                        {"idToken": oauth_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}))
 
-        # Original formats (without securityToken)
+        # Original formats with JWT id_token (known to cause 500)
         formats.append(("A-hex",   {"idToken": self.id_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}))
         formats.append(("A-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}))
 
