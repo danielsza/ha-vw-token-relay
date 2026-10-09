@@ -1625,40 +1625,17 @@ img{{max-width:100%;height:auto}}</style></head>
             crc = table[crc ^ b]
         return (~crc) & 0xFF
 
-    def _compute_spin_hash(self, challenge, encoding="hex"):
-        """Compute spinHash for VW SpinService.
+    def _compute_spin_hash(self, challenge):
+        """Compute spinHash for VW NA SpinService.
 
-        encoding controls how the SPIN is converted to bytes:
-          "hex"   — bytearray.fromhex(spin) (volkswagencarnet style)
-          "ascii" — spin.encode("utf-8")     (PIN as ASCII bytes)
-
-        Both prepend SPIN bytes before challenge bytes.
+        Correct algorithm (from CarConnectivity-connector-volkswagen-na):
+          SHA-512 of "{challenge}.{spin}" as a UTF-8 string, result UPPERCASED.
+          The challenge and SPIN are joined as plain text with a dot separator.
         """
-        if encoding == "ascii":
-            spin_bytes = self.vw_spin.encode("utf-8")
-        else:
-            spin_bytes = bytearray.fromhex(self.vw_spin)
-        challenge_bytes = bytearray.fromhex(challenge)
-        combined = spin_bytes + challenge_bytes
-        result = hashlib.sha512(combined).hexdigest()
-        log.debug("spinHash(%s): SPIN(%d bytes) + challenge(%d bytes) = %d "
-                  "bytes → SHA512 %s...%s",
-                  encoding, len(spin_bytes), len(challenge_bytes),
-                  len(combined), result[:8], result[-8:])
-        return result
-
-    def _compute_spin_hash_reversed(self, challenge, encoding="hex"):
-        """Like _compute_spin_hash but with reversed byte order: challenge||SPIN."""
-        if encoding == "ascii":
-            spin_bytes = self.vw_spin.encode("utf-8")
-        else:
-            spin_bytes = bytearray.fromhex(self.vw_spin)
-        challenge_bytes = bytearray.fromhex(challenge)
-        combined = challenge_bytes + spin_bytes  # reversed: challenge first
-        result = hashlib.sha512(combined).hexdigest()
-        log.debug("spinHash_rev(%s): challenge(%d) + SPIN(%d) = %d bytes → %s...%s",
-                  encoding, len(challenge_bytes), len(spin_bytes),
-                  len(combined), result[:8], result[-8:])
+        plaintext = f"{challenge}.{self.vw_spin}"
+        result = hashlib.sha512(plaintext.encode("utf-8")).hexdigest().upper()
+        log.debug("spinHash: SHA512(\"%s.****\") → %s...%s",
+                  challenge[:16], result[:16], result[-8:])
         return result
 
     def _build_encrypted_payload(self, pairing_key_seed_hex, spin_hash,
@@ -2072,74 +2049,24 @@ img{{max-width:100%;height:auto}}</style></head>
                 json.dumps({"error": "spin_low_tries", "remaining": remaining}))
             return
 
-        spin_hash1_hex = self._compute_spin_hash(challenge1, encoding="hex")
-        spin_hash1_ascii = self._compute_spin_hash(challenge1, encoding="ascii")
-        log.info("RST: spinHash1 hex=%s...%s  ascii=%s...%s",
-                 spin_hash1_hex[:16], spin_hash1_hex[-8:],
-                 spin_hash1_ascii[:16], spin_hash1_ascii[-8:])
-
-        # Debug: log token types
-        log.info("RST: OAuth token (Bearer): %s...%s (%d chars, JWT=%s)",
-                 oauth_token[:20], oauth_token[-8:], len(oauth_token),
-                 oauth_token.startswith("eyJ"))
-        log.info("RST: id_token: %s...%s (%d chars, JWT=%s)",
-                 self.id_token[:20], self.id_token[-8:], len(self.id_token),
-                 self.id_token.startswith("eyJ"))
-
-        # Debug: decode idToken JWT to check its contents
-        if self.id_token and self.id_token.startswith("eyJ"):
-            try:
-                import base64
-                parts = self.id_token.split(".")
-                # Decode header and payload (add padding)
-                hdr = base64.urlsafe_b64decode(parts[0] + "==").decode("utf-8", errors="replace")
-                payload = base64.urlsafe_b64decode(parts[1] + "==").decode("utf-8", errors="replace")
-                log.info("RST: idToken JWT header: %s", hdr[:200])
-                log.info("RST: idToken JWT payload: %s", payload[:500])
-            except Exception as e:
-                log.warning("RST: Failed to decode idToken JWT: %s", e)
+        spin_hash1 = self._compute_spin_hash(challenge1)
+        log.info("RST: spinHash1=%s...%s (%d chars)",
+                 spin_hash1[:16], spin_hash1[-8:], len(spin_hash1))
 
         # ── Step 2: Create ATC session → carnetVehicleToken ──
-        # Try multiple body formats — the NA SpinService format is uncertain
-        log.info("RST Step 2: Creating ATC session (tsp=ATC)...")
-
-        # Try multiple SPIN encodings × body formats.
-        # Previous runs showed: {idToken + spinHash(hex)} → 500 (server crash).
-        # Hypothesis: SPIN "1234" should be ASCII-encoded (4 bytes) not hex-decoded (2 bytes).
-        # Also test reversed byte order: challenge||SPIN instead of SPIN||challenge.
-
-        # Build format list.  Previous results: {idToken(JWT) + ANY spinHash} → 500.
-        # Hypothesis: "idToken" field might want the OAuth access_token, not JWT id_token.
-        formats = []
-
-        # T1: OAuth access_token as idToken (hex SPIN hash)
-        formats.append(("T1-oauth-hex",
-                        {"idToken": oauth_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}))
-        # T2: OAuth access_token as idToken (ascii SPIN hash)
-        formats.append(("T2-oauth-ascii",
-                        {"idToken": oauth_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}))
-
-        # Original formats with JWT id_token (known to cause 500)
-        formats.append(("A-hex",   {"idToken": self.id_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}))
-        formats.append(("A-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}))
-
-        winning_label = None
-        for label, body in formats:
-            log.info("RST Step 2 [%s]: Trying %s ...", label, list(body.keys()))
-            result, err = self._api_request(
-                "POST", session_url, body=json.dumps(body).encode(), vid=vid)
-            if result is not None:
-                log.info("RST: Format %s SUCCEEDED!", label)
-                winning_label = label
-                break
-            code = err.get("code", 0) if err else 0
-            log.warning("RST Step 2 [%s] failed (%s): %s", label, code,
-                        json.dumps(err)[:300] if err else "no error info")
+        # Body format from CarConnectivity-connector-volkswagen-na:
+        #   idToken = OIDC id_token (JWT), spinHash = SHA512("{challenge}.{spin}") UPPER, tsp = "ATC"
+        log.info("RST Step 2: Creating ATC session...")
+        session_body = {"idToken": self.id_token, "spinHash": spin_hash1, "tsp": "ATC"}
+        log.info("RST Step 2: POST %s (idToken=%d chars, spinHash=%s...)",
+                 session_url[-40:], len(self.id_token), spin_hash1[:16])
+        result, err = self._api_request(
+            "POST", session_url, body=json.dumps(session_body).encode(), vid=vid)
 
         if result is None:
             log.error("RST: ATC session failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "atc_session_failed", **err}))
+                json.dumps({"error": "atc_session_failed", **(err or {})}))
             return
 
         session_data = json.loads(result)
@@ -2160,123 +2087,44 @@ img{{max-width:100%;height:auto}}</style></head>
         if result is None:
             log.error("RST: Challenge2 failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "challenge2_failed", **err}))
+                json.dumps({"error": "challenge2_failed", **(err or {})}))
             return
 
         c2_data = json.loads(result)
         challenge2 = c2_data["data"]["challenge"]
         log.info("RST: challenge2=%s", challenge2)
 
-        # Use same encoding that won at Step 2
-        if winning_label and "rev" in winning_label:
-            spin_enc = "ascii" if "ascii" in winning_label else "hex"
-            spin_hash2 = self._compute_spin_hash_reversed(challenge2, encoding=spin_enc)
-            log.info("RST: spinHash2 (reversed, %s) (%d chars)", spin_enc, len(spin_hash2))
-        elif winning_label and "ascii" in winning_label:
-            spin_hash2 = self._compute_spin_hash(challenge2, encoding="ascii")
-            log.info("RST: spinHash2 (ascii) (%d chars)", len(spin_hash2))
-        else:
-            spin_hash2 = self._compute_spin_hash(challenge2, encoding="hex")
-            log.info("RST: spinHash2 (hex/default) (%d chars)", len(spin_hash2))
-
-        # ── Step 3b: Create captcha via POST/GET /operation/remoteStart ──
-        # The captcha is server-side state that must be created BEFORE /check.
-        # Try with OAuth token first (app creates captcha before ATC session),
-        # then with ATC token.  Try both POST and GET, with and without body.
-        for init_op in ("remoteStart",):
-            init_url = (f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}"
-                        f"/operation/{init_op}")
-            # Attempt 1: OAuth token + POST empty body
-            log.info("RST Step 3b-1: POST /operation/%s with OAuth token (empty body)...", init_op)
-            init_result, init_err = self._api_request_with_token(
-                "POST", init_url, body=b'{}', bearer_token=oauth_token)
-            if init_result is not None:
-                log.info("RST Step 3b-1: SUCCESS → %s", init_result[:500])
-            else:
-                log.warning("RST Step 3b-1: Failed: %s", init_err)
-
-            # Attempt 2: OAuth token + GET
-            log.info("RST Step 3b-2: GET /operation/%s with OAuth token...", init_op)
-            init_result2, init_err2 = self._api_request_with_token(
-                "GET", init_url, bearer_token=oauth_token)
-            if init_result2 is not None:
-                log.info("RST Step 3b-2: SUCCESS → %s", init_result2[:500])
-            else:
-                log.warning("RST Step 3b-2: Failed: %s", init_err2)
-
-            # Attempt 3: ATC token + POST with spinHash
-            init_body3 = json.dumps({"spinHash": spin_hash2}).encode()
-            log.info("RST Step 3b-3: POST /operation/%s with ATC token + spinHash...", init_op)
-            init_result3, init_err3 = self._api_request_with_token(
-                "POST", init_url, body=init_body3, bearer_token=atc_token)
-            if init_result3 is not None:
-                log.info("RST Step 3b-3: SUCCESS → %s", init_result3[:500])
-            else:
-                log.warning("RST Step 3b-3: Failed: %s", init_err3)
-
-        # Fetch a fresh challenge for the /check call (challenges are single-use)
-        log.info("RST Step 3c: Fetching fresh challenge for /check...")
-        result_3c, err_3c = self._api_request("GET", challenge_url, vid=vid)
-        if result_3c is None:
-            log.error("RST: Challenge for /check failed: %s", err_3c)
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "challenge_check_failed", **(err_3c or {})}))
-            return
-        c_3c = json.loads(result_3c)
-        challenge_check = c_3c["data"]["challenge"]
-        spin_hash_check = self._compute_spin_hash(challenge_check)
+        spin_hash_check = self._compute_spin_hash(challenge2)
+        log.info("RST: spinHash2=%s...%s (%d chars)",
+                 spin_hash_check[:16], spin_hash_check[-8:], len(spin_hash_check))
 
         # ── Step 4: SPIN check → roToken ──
-        # MUST use carnetVehicleToken as Bearer, NOT the OAuth token
+        # POST /climateControl/check with {spinHash} using carnetVehicleToken as Bearer
+        # (per CarConnectivity-connector-volkswagen-na flow)
+        check_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/climateControl/check"
         check_body = json.dumps({"spinHash": spin_hash_check}).encode()
         ro_token = None
         captcha_index = "0"
         captcha_value = "0"
-        for operation in ("remoteStart", "climateControl"):
-            op_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vid}/operation/{operation}/check"
-            log.info("RST Step 4: %s/check for roToken (ATC bearer)...", operation)
-            result, err = self._api_request_with_token("POST", op_url,
-                                                        body=check_body,
-                                                        bearer_token=atc_token)
-            if result is not None:
-                check_data = json.loads(result)
-                log.info("RST Step 4 (%s) response: %s", operation, json.dumps(check_data)[:500])
-                ro_token = check_data.get("data", {}).get("roToken", "")
-                captcha_index = check_data.get("data", {}).get("captchaIndex", "0")
-                captcha_value = check_data.get("data", {}).get("captchaValue", "0")
-                if ro_token:
-                    log.info("RST: Got roToken (%d chars) via %s, captchaIndex=%s, captchaValue=%s",
-                             len(ro_token), operation, captcha_index, captcha_value)
-                    break
-                else:
-                    log.warning("RST: %s/check returned 200 but no roToken: %s",
-                                operation, json.dumps(check_data)[:300])
-                    # Challenge was consumed — fetch a fresh one for fallback operation
-                    log.info("RST: Fetching fresh challenge for fallback operation...")
-                    result3, err3 = self._api_request("GET", challenge_url, vid=vid)
-                    if result3:
-                        c3_data = json.loads(result3)
-                        challenge3 = c3_data["data"]["challenge"]
-                        spin_hash_check = self._compute_spin_hash(challenge3)
-                        check_body = json.dumps({"spinHash": spin_hash_check}).encode()
-                        log.info("RST: Got fresh challenge, trying next operation...")
-                    else:
-                        log.error("RST: Fresh challenge fetch failed, can't try fallback")
-                        break
+
+        log.info("RST Step 4: POST climateControl/check (ATC bearer)...")
+        result, err = self._api_request_with_token("POST", check_url,
+                                                    body=check_body,
+                                                    bearer_token=atc_token)
+        if result is not None:
+            check_data = json.loads(result)
+            log.info("RST Step 4 response: %s", json.dumps(check_data)[:500])
+            ro_token = check_data.get("data", {}).get("roToken", "")
+            captcha_index = check_data.get("data", {}).get("captchaIndex", "0")
+            captcha_value = check_data.get("data", {}).get("captchaValue", "0")
+            if ro_token:
+                log.info("RST: Got roToken (%d chars), captchaIndex=%s, captchaValue=%s",
+                         len(ro_token), captcha_index, captcha_value)
             else:
-                log.warning("RST: %s/check failed: %s", operation, err)
-                # On failure (404 etc.), fetch fresh challenge for fallback
-                log.info("RST: Fetching fresh challenge for fallback operation...")
-                result3, err3 = self._api_request("GET", challenge_url, vid=vid)
-                if result3:
-                    c3_data = json.loads(result3)
-                    challenge3 = c3_data["data"]["challenge"]
-                    spin_hash_check = self._compute_spin_hash(challenge3)
-                    check_body = json.dumps({"spinHash": spin_hash_check}).encode()
-                    log.info("RST: Got fresh challenge, trying next operation...")
-                else:
-                    log.error("RST: Fresh challenge fetch failed, can't try fallback")
-                    break
+                log.warning("RST: climateControl/check returned 200 but no roToken: %s",
+                            json.dumps(check_data)[:300])
+        else:
+            log.warning("RST: climateControl/check failed: %s", err)
 
         if not ro_token:
             if dry_run:
