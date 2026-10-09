@@ -2243,49 +2243,12 @@ img{{max-width:100%;height:auto}}</style></head>
 
         # ── Step 5: POST /rst/v1/vehicle/{vid} ──
         # MUST use carnetVehicleToken as Bearer
-        # Include pairing crypto data — required by Atlas (and likely other ICE vehicles)
-        log.info("RST Step 5: Building RST body with pairing data...")
+        # CarConnectivity reference sends ONLY {"roToken": ro_token} — no
+        # pairing crypto.  Adding pairingId / rstSpinHash / encryptedPayload /
+        # encryptedPayloadSignature causes PAIRING_ERROR_ON_REMOTE_START.
+        log.info("RST Step 5: Building RST body (roToken only — matches CarConnectivity)...")
 
         rst_payload = {"roToken": ro_token}
-
-        # Get pairing data and build encrypted payload + signature
-        pairing = self._get_pairing_data(vid)
-        if pairing and pairing.get("pairingKeySeed") and pairing.get("pairingId"):
-            pairing_id = pairing["pairingId"]
-            pairing_seed = pairing["pairingKeySeed"]
-
-            log.info("RST: Building XTEA encrypted payload (seed=%s...)",
-                     pairing_seed[:4])
-
-            # Build encrypted payload with XTEA cipher
-            # CRITICAL: Must use the SAME spin hash that was sent to the /check
-            # endpoint (spin_hash_check), NOT spin_hash2 which is from a
-            # different challenge.  The app uses one hash for both /check and
-            # the payload — mismatch causes PAIRING_ERROR_ON_REMOTE_START.
-            encrypted_bytes = self._build_encrypted_payload(
-                pairing_seed, spin_hash_check, captcha_index, captcha_value)
-            log.info("RST: XTEA encryptedPayload built (%d bytes)", len(encrypted_bytes))
-
-            # Sign: pairingId UTF-8 bytes + encrypted bytes (concatenated raw)
-            data_to_sign = pairing_id.encode("utf-8") + encrypted_bytes
-            sign_b64 = base64.b64encode(data_to_sign).decode("ascii")
-            signature = self._sign_with_keystore(sign_b64, user_id=self.user_id)
-            if signature:
-                log.info("RST: ECDSA signature obtained (%d chars)", len(signature))
-                rst_payload["pairingId"] = pairing_id
-                rst_payload["rstSpinHash"] = spin_hash_check[:16]  # first 16 chars — MUST match /check hash
-                rst_payload["encryptedPayload"] = encrypted_bytes.hex().upper()  # HEX not base64
-                rst_payload["encryptedPayloadSignature"] = signature
-                log.info("RST: Full pairing body built (5 fields, rstSpinHash=%s...)",
-                         rst_payload["rstSpinHash"][:8])
-            else:
-                log.warning("RST: KeyStore signing failed — trying without signature")
-                rst_payload["pairingId"] = pairing_id
-                rst_payload["rstSpinHash"] = spin_hash_check[:16]
-                rst_payload["encryptedPayload"] = encrypted_bytes.hex().upper()
-                log.info("RST: Partial pairing body (no signature, 4 fields)")
-        else:
-            log.warning("RST: No pairing data — sending minimal body (roToken only)")
 
         log.info("RST Step 5: Sending remote start command...")
         rst_body = json.dumps(rst_payload).encode()
