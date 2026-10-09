@@ -1625,6 +1625,44 @@ img{{max-width:100%;height:auto}}</style></head>
             crc = table[crc ^ b]
         return (~crc) & 0xFF
 
+    def _resolve_vehicle_id(self, vid):
+        """Resolve an MQTT vehicle ID input to the correct full UUID.
+
+        The SpinService URL requires the full 36-char vehicle UUID
+        (e.g. 90bf07c5-1fb8-36a6-8b12-9bbb013c51a0), but MQTT triggers
+        may send a short prefix (90bf07c5) or a mismatched UUID.
+
+        Resolution order:
+          1. Exact match in self.vehicle_ids (Frida-captured full UUIDs)
+          2. Prefix match (first 8 chars) in self.vehicle_ids
+          3. Prefix match in self._cached_pairings keys
+          4. Return vid unchanged (best effort)
+        """
+        vid = vid.strip()
+
+        # 1. Exact match
+        with self._lock:
+            if vid in self.vehicle_ids:
+                log.info("VID resolve: exact match → %s", vid)
+                return vid
+
+            # 2. Prefix match in vehicle_ids
+            short = vid[:8].lower()
+            for full_vid in self.vehicle_ids:
+                if full_vid.lower().startswith(short):
+                    log.info("VID resolve: prefix '%s' → %s (from vehicle_ids)", short, full_vid)
+                    return full_vid
+
+        # 3. Prefix match in cached pairings
+        for pairing_vid in self._cached_pairings:
+            if pairing_vid.lower().startswith(short):
+                log.info("VID resolve: prefix '%s' → %s (from cached pairings)", short, pairing_vid)
+                return pairing_vid
+
+        log.warning("VID resolve: no match for '%s' — using as-is (vehicle_ids=%s)",
+                    vid, [v[:12] for v in self.vehicle_ids])
+        return vid
+
     def _compute_spin_hash(self, challenge):
         """Compute spinHash for VW NA SpinService.
 
@@ -1972,7 +2010,14 @@ img{{max-width:100%;height:auto}}</style></head>
         If dry_run=True, stops after Step 4 and publishes diagnostic results.
         """
         mode = "DRY RUN" if dry_run else "REMOTE START"
-        log.info("═══ %s ═══ vehicle=%s", mode, vid)
+        log.info("═══ %s ═══ vehicle=%s (raw input)", mode, vid)
+
+        # ── Resolve vehicle ID to full UUID ──
+        resolved_vid = self._resolve_vehicle_id(vid)
+        if resolved_vid != vid:
+            log.info("RST: Resolved vehicle ID: %s → %s", vid, resolved_vid)
+        vid = resolved_vid
+        log.info("═══ %s ═══ vehicle=%s (resolved)", mode, vid)
 
         if not self.vw_spin:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
@@ -2327,7 +2372,7 @@ img{{max-width:100%;height:auto}}</style></head>
         Flow: challenge → ATC session → DELETE /rst/v1/vehicle/{vid}
         No roToken needed for stop — just the carnetVehicleToken.
         """
-        vid = vehicle_id.strip()
+        vid = self._resolve_vehicle_id(vehicle_id.strip())
         log.info("═══ REMOTE STOP ═══ vehicle=%s", vid)
 
         if not self.vw_spin:
@@ -7287,7 +7332,8 @@ img{{max-width:100%;height:auto}}</style></head>
                         if vehicle_id not in self.vehicle_ids:
                             self.vehicle_ids.append(vehicle_id)
                         self._last_token_time = datetime.now()
-                        log.info("Vehicle token updated: %s (exp %s)", vehicle_id[:8], expiry.strftime("%H:%M"))
+                        log.info("Vehicle token updated: %s (full tid=%s, exp %s)",
+                                 vehicle_id[:8], vehicle_id, expiry.strftime("%H:%M"))
                 else:
                     if self.global_token != token:
                         self.global_token = token
