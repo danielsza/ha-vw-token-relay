@@ -5713,8 +5713,10 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("VERIFY_ATLAS: ICE indicator found: %s", indicator)
 
         # Check for EV-specific elements (should NOT be present on Atlas)
-        ev_indicators = ["Plugged in", "Start charging", "Est. km",
-                         "Est. mi", "Battery"]
+        # NOTE: "Est. km" / "Est. mi" appear on ICE vehicles too (fuel
+        # range), so they are NOT reliable EV indicators. Only truly
+        # EV-specific strings are listed here.
+        ev_indicators = ["Plugged in", "Start charging", "Battery"]
         for ev_ind in ev_indicators:
             hits = self._find_ui_elements(xml, text=ev_ind)
             if hits:
@@ -5722,14 +5724,17 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("VERIFY_ATLAS: EV indicator found (WRONG): %s",
                          ev_ind)
 
-        if is_ev_content:
-            return False, "ev_content_present"
-        if is_atlas_header and is_ice_content:
+        # If we found definitive ICE indicators (remoteStartButton exists
+        # only on ICE vehicles), trust those even if a borderline EV
+        # indicator slipped through.
+        if is_ice_content and is_atlas_header:
             return True, "header_and_ice_content"
-        if is_atlas_header:
-            return True, "header_only"
         if is_ice_content:
             return True, "ice_content_only"
+        if is_ev_content:
+            return False, "ev_content_present"
+        if is_atlas_header:
+            return True, "header_only"
 
         return False, "inconclusive"
 
