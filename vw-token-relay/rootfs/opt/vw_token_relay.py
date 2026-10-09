@@ -286,7 +286,17 @@ _waitForJava(function () {
 
             if (isApiUrl(url)) {
                 try {
-                    send({ type: 'api_response', url: url, method: method, body: resp.peekBody(API_PEEK).string() });
+                    // Capture request body for /ss/ endpoints (SpinService)
+                    var reqBodyStr = null;
+                    if (url.indexOf('/ss/v1/') !== -1 && method !== 'GET') {
+                        reqBodyStr = getRequestBody(req);
+                    }
+                    var msg = { type: 'api_response', url: url, method: method, body: resp.peekBody(API_PEEK).string() };
+                    if (reqBodyStr) {
+                        msg.requestBody = reqBodyStr;
+                        msg.requestHeaders = getHeaders(req.headers());
+                    }
+                    send(msg);
                 } catch (e) {}
             }
 
@@ -2048,9 +2058,13 @@ img{{max-width:100%;height:auto}}</style></head>
             return
 
         c1_data = json.loads(result)
+        log.info("RST: Full challenge1 response: %s", json.dumps(c1_data)[:1000])
+        log.info("RST: challenge1 data keys: %s", list(c1_data.get("data", {}).keys()))
         challenge1 = c1_data["data"]["challenge"]
         remaining = c1_data["data"].get("remainingTries", 999)
-        log.info("RST: challenge1=%s, remainingTries=%d", challenge1, remaining)
+        sec_token1 = c1_data["data"].get("securityToken", "")
+        log.info("RST: challenge1=%s, remainingTries=%d, securityToken=%s",
+                 challenge1, remaining, sec_token1[:40] if sec_token1 else "(none)")
 
         if remaining < 3:
             log.warning("RST: Only %d SPIN tries remaining — aborting", remaining)
@@ -2086,20 +2100,31 @@ img{{max-width:100%;height:auto}}</style></head>
         # Hypothesis: SPIN "1234" should be ASCII-encoded (4 bytes) not hex-decoded (2 bytes).
         # Also test reversed byte order: challenge||SPIN instead of SPIN||challenge.
 
-        formats = [
-            # (label, body_dict)
-            ("A-hex",   {"idToken": self.id_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}),
-            ("A-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}),
-        ]
+        # Build format list — try securityToken variants first if available
+        formats = []
 
-        # Reversed byte order: challenge + SPIN (instead of SPIN + challenge)
-        rev_hex = self._compute_spin_hash_reversed(challenge1, encoding="hex")
-        rev_ascii = self._compute_spin_hash_reversed(challenge1, encoding="ascii")
-        formats.append(("A-rev-hex",   {"idToken": self.id_token, "spinHash": rev_hex, "tsp": "ATC"}))
-        formats.append(("A-rev-ascii", {"idToken": self.id_token, "spinHash": rev_ascii, "tsp": "ATC"}))
+        if sec_token1:
+            # Hypothesis: securityToken from challenge is REQUIRED (like EU API)
+            log.info("RST: securityToken found — trying with it first")
+            # Format S1: flat {idToken, spinHash, securityToken, tsp}
+            formats.append(("S1-hex", {"idToken": self.id_token, "spinHash": spin_hash1_hex,
+                                       "securityToken": sec_token1, "tsp": "ATC"}))
+            formats.append(("S1-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii,
+                                         "securityToken": sec_token1, "tsp": "ATC"}))
+            # Format S2: EU-style nested body
+            formats.append(("S2-nested", {
+                "securityPinAuthentication": {
+                    "securityPin": {
+                        "challenge": challenge1,
+                        "securityPinHash": spin_hash1_hex
+                    },
+                    "securityToken": sec_token1
+                }
+            }))
 
-        # Without idToken (bearer only)
-        formats.append(("B-ascii", {"spinHash": spin_hash1_ascii, "tsp": "ATC"}))
+        # Original formats (without securityToken)
+        formats.append(("A-hex",   {"idToken": self.id_token, "spinHash": spin_hash1_hex, "tsp": "ATC"}))
+        formats.append(("A-ascii", {"idToken": self.id_token, "spinHash": spin_hash1_ascii, "tsp": "ATC"}))
 
         winning_label = None
         for label, body in formats:
@@ -7775,9 +7800,17 @@ img{{max-width:100%;height:auto}}</style></head>
         elif msg_type == "api_response":
             url = payload.get("url", "")
             body_str = payload.get("body", "")
-            self._parse_and_publish_vehicle_data(
-                url, body_str, payload.get("method", "GET")
-            )
+            method = payload.get("method", "GET")
+            # Log /ss/ request bodies captured by Frida (SpinService debugging)
+            if "/ss/v1/" in url and payload.get("requestBody"):
+                log.info("FRIDA_SS: %s %s", method, url)
+                log.info("FRIDA_SS: REQUEST BODY: %s", payload["requestBody"][:2000])
+                req_hdrs = payload.get("requestHeaders", {})
+                if req_hdrs:
+                    log.info("FRIDA_SS: REQUEST HEADERS: %s",
+                             json.dumps(req_hdrs)[:1000])
+                log.info("FRIDA_SS: RESPONSE: %s", body_str[:1000])
+            self._parse_and_publish_vehicle_data(url, body_str, method)
             # Cache pairing data from pair/v1 responses
             if "/pair/v1/vehicle/" in url and "pairingRequest" in url and body_str:
                 try:
