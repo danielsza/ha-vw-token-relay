@@ -2586,7 +2586,7 @@ img{{max-width:100%;height:auto}}</style></head>
             # viewed vehicle dashboard directly (skip the broken Garage)
             am_result = subprocess.run(
                 ["adb", "shell", "am", "start", "-W", "-n",
-                 f"{VW_PACKAGE}/.MainActivity"],
+                 f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                 capture_output=True, timeout=30, text=True)
             log.info("UI_RST: am start MainActivity: rc=%d stdout=%s",
                      am_result.returncode,
@@ -2607,7 +2607,7 @@ img{{max-width:100%;height:auto}}</style></head>
                             "%d/4) — relaunching...", fg_try + 1)
                 subprocess.run(
                     ["adb", "shell", "am", "start", "-W", "-n",
-                     f"{VW_PACKAGE}/.MainActivity"],
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                     capture_output=True, timeout=30, text=True)
                 time.sleep(3)
                 self._wake_screen()
@@ -2628,7 +2628,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         time.sleep(1)
                 subprocess.run(
                     ["adb", "shell", "am", "start", "-W", "-n",
-                     f"{VW_PACKAGE}/.MainActivity"],
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                     capture_output=True, timeout=30, text=True)
                 time.sleep(5)
                 fg_garage = self._get_foreground_activity()
@@ -2991,7 +2991,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     # always opens the wrong vehicle)
                     am_re = subprocess.run(
                         ["adb", "shell", "am", "start", "-W", "-n",
-                         f"{VW_PACKAGE}/.MainActivity"],
+                         f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                         capture_output=True, timeout=30, text=True)
                     log.info("UI_RST: Re-nav am start: rc=%d out=%s",
                              am_re.returncode,
@@ -3110,7 +3110,7 @@ img{{max-width:100%;height:auto}}</style></head>
                                     subprocess.run(
                                         ["adb", "shell", "am", "start",
                                          "-W", "-n",
-                                         f"{VW_PACKAGE}/.MainActivity"],
+                                         f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                                         capture_output=True, timeout=30,
                                         text=True)
                                     time.sleep(8)
@@ -3336,7 +3336,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     time.sleep(3)
                     subprocess.run(
                         ["adb", "shell", "am", "start", "-W", "-n",
-                         f"{VW_PACKAGE}/.MainActivity"],
+                         f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                         capture_output=True, timeout=30, text=True)
                     time.sleep(8)
                     self._dismiss_system_dialogs()
@@ -5489,7 +5489,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("EXPLORE_MENU: VW app not in foreground — launching...")
                 subprocess.run(
                     ["adb", "shell", "am", "start", "-W", "-n",
-                     f"{VW_PACKAGE}/.MainActivity"],
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
                     capture_output=True, timeout=30, text=True)
                 time.sleep(5)
 
