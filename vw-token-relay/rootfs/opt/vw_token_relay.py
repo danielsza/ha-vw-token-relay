@@ -1490,6 +1490,12 @@ img{{max-width:100%;height:auto}}</style></head>
                     f"{MQTT_TOPIC_PREFIX}/cmd_status",
                     json.dumps({"status": "failed", "cmd": cmd_name, "reason": "token_timeout_10min"}),
                 )
+                # Publish to cmd_failed for HA notification
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/cmd_failed",
+                    json.dumps({"cmd": cmd_name, "error": "token_timeout_10min",
+                                "msg": f"{cmd_name} failed after 10 min of retries"}),
+                )
                 return None, {"error": "no_valid_token", "msg": "Token expired — no fresh token after 10 min wait"}
 
         max_retries = 1
@@ -1659,12 +1665,41 @@ img{{max-width:100%;height:auto}}</style></head>
         if not oauth_token:
             oauth_token = self._get_valid_token(vehicle_id, vehicle_only=False)
         if not oauth_token:
-            log.info("SPIN: No token — waking app...")
+            # ── 10-minute token queue (matches _api_request Level 0) ──
+            log.info("SPIN: No token — queuing, will retry up to 10 min...")
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                json.dumps({"status": "queued", "cmd": f"spin_{tsp.lower()}",
+                            "reason": "waiting_for_token", "max_wait_min": 10}),
+            )
             self._wake_app(target_vid=vehicle_id)
-            time.sleep(30)
-            oauth_token = self._get_valid_token(vehicle_id)
+            wait_start = time.time()
+            max_wait = 600  # 10 minutes
+            while time.time() - wait_start < max_wait:
+                time.sleep(30)
+                oauth_token = self._get_valid_token(vehicle_id)
+                if oauth_token:
+                    elapsed = int(time.time() - wait_start)
+                    log.info("SPIN: Token available after %ds — proceeding", elapsed)
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                        json.dumps({"status": "executing", "cmd": f"spin_{tsp.lower()}",
+                                    "waited_s": elapsed}),
+                    )
+                    break
+                elapsed = int(time.time() - wait_start)
+                if elapsed % 120 < 35:
+                    log.info("SPIN: Still waiting for token (%ds)... re-waking app", elapsed)
+                    self._wake_app(target_vid=vehicle_id)
             if not oauth_token:
-                return None, {"error": "no_valid_token", "msg": "No OAuth token available"}
+                log.error("SPIN: No token after 10 min wait — giving up")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                    json.dumps({"status": "failed", "cmd": f"spin_{tsp.lower()}",
+                                "reason": "token_timeout_10min"}),
+                )
+                return None, {"error": "no_valid_token",
+                              "msg": "No OAuth token after 10 min wait"}
 
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
         session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vehicle_id}/session"
@@ -1730,9 +1765,16 @@ img{{max-width:100%;height:auto}}</style></head>
         # ── Acquire SPIN token (EV vehicles use WCT) ──
         spin_token, spin_err = self._get_spin_token(vid, tsp="WCT")
         if spin_token is None:
-            log.error("CLIMATE: SPIN auth failed: %s", spin_err)
+            log.error("CLIMATE: SPIN auth failed after all retries: %s", spin_err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": f"climate_spin_failed", "action": action, **(spin_err or {})}))
+                json.dumps({"error": "climate_spin_failed", "action": action, **(spin_err or {})}))
+            # Publish final failure for HA notification
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/cmd_failed",
+                json.dumps({"cmd": f"climate_{action}", "vehicle": vid[:8],
+                            "error": spin_err.get("error", "unknown") if spin_err else "unknown",
+                            "msg": f"Climate {action} failed after 10 min of retries"}),
+            )
             return
 
         # ── Send climate command with carnetVehicleToken ──
