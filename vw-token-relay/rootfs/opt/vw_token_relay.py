@@ -525,6 +525,11 @@ class VWTokenRelay:
         self._phone_down_notified = False # whether we already sent "phone down" alert
         self._phone_recovery_in_progress = False  # prevent concurrent recovery attempts
 
+        # Pipeline health tracking (for HA auto-recovery automation)
+        self._consecutive_api_failures = 0  # count of consecutive 401/403 from proactive validation
+        self._last_successful_api_call = None  # last time proactive validation succeeded
+        self._recovery_attempts_since_success = 0  # how many recovery cycles since last good data
+
         # Token state — keyed by vehicle ID
         self.tokens = {}       # {vehicle_id: {"token": str, "expiry": datetime}}
         self.global_token = None  # most recent non-vehicle-scoped token
@@ -695,6 +700,33 @@ class VWTokenRelay:
             threading.Thread(target=self._auto_login, daemon=True).start()
         elif cmd == "refresh_google":
             threading.Thread(target=self._refresh_google_account, daemon=True).start()
+        elif cmd == "force_recovery":
+            # HA auto-recovery automation calls this when data is stale.
+            # Full recovery: force-restart app, reattach Frida, wake for new token.
+            log.warning("CMD: force_recovery requested (by HA auto-recovery)")
+            self._recovery_attempts_since_success += 1
+            def _do_force_recovery():
+                self._keepalive_recovering = True
+                self.session = None
+                self.script = None
+                try:
+                    self._wake_app_full_restart()
+                    time.sleep(30)
+                    if self._tokens_are_fresh():
+                        log.info("force_recovery: Token flow recovered")
+                        self._recovery_attempts_since_success = 0
+                        self._consecutive_api_failures = 0
+                        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/recovery_result",
+                            json.dumps({"status": "success", "action": "force_recovery"}), retain=False)
+                    else:
+                        log.warning("force_recovery: Still no fresh tokens after restart")
+                        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/recovery_result",
+                            json.dumps({"status": "failed", "action": "force_recovery",
+                                        "recovery_attempts": self._recovery_attempts_since_success}), retain=False)
+                finally:
+                    self._keepalive_recovering = False
+                self._publish_pipeline_health()
+            threading.Thread(target=_do_force_recovery, daemon=True).start()
         elif cmd == "maintenance":
             if payload.strip().lower() in ("on", "1", "true", "start", "enable"):
                 self._maintenance.set()
@@ -8207,6 +8239,75 @@ img{{max-width:100%;height:auto}}</style></head>
                 return True
         return False
 
+    # ── Pipeline health publishing ──────────────────────────────────
+    def _publish_pipeline_health(self):
+        """Publish a comprehensive health status to vw/pipeline_health (retained).
+        This gives HA a single MQTT topic to monitor for auto-recovery decisions.
+
+        Status levels:
+          - healthy: tokens fresh, Frida attached, API calls succeeding
+          - degraded: tokens expiring soon or Frida recovering
+          - critical: no fresh tokens for >15 min or repeated API failures
+          - dead: no fresh tokens for >30 min and recovery has failed
+        """
+        now = datetime.now()
+
+        # Determine Frida status
+        frida_ok = self.session is not None and self.script is not None
+        frida_status = "attached" if frida_ok else "detached"
+
+        # Token age
+        token_age_min = None
+        if self._last_token_time:
+            token_age_min = round((now - self._last_token_time).total_seconds() / 60, 1)
+
+        # Token freshness
+        tokens_fresh = self._tokens_are_fresh()
+
+        # Last successful API validation
+        api_age_min = None
+        if self._last_successful_api_call:
+            api_age_min = round((now - self._last_successful_api_call).total_seconds() / 60, 1)
+
+        # Determine overall status
+        if tokens_fresh and frida_ok and self._consecutive_api_failures == 0:
+            status = "healthy"
+        elif token_age_min is not None and token_age_min > 30 and self._recovery_attempts_since_success >= 2:
+            status = "dead"
+        elif (token_age_min is not None and token_age_min > 15) or self._consecutive_api_failures >= 2:
+            status = "critical"
+        elif not tokens_fresh or not frida_ok or self._consecutive_api_failures > 0:
+            status = "degraded"
+        else:
+            status = "healthy"
+
+        # Maintenance mode
+        if self._maintenance.is_set():
+            status = "maintenance"
+
+        health = {
+            "status": status,
+            "frida": frida_status,
+            "tokens_fresh": tokens_fresh,
+            "token_age_min": token_age_min,
+            "last_token_at": self._last_token_time.isoformat() if self._last_token_time else None,
+            "api_failures": self._consecutive_api_failures,
+            "api_age_min": api_age_min,
+            "recovery_attempts": self._recovery_attempts_since_success,
+            "timestamp": now.isoformat(),
+        }
+        self.mqttc.publish(
+            f"{MQTT_TOPIC_PREFIX}/pipeline_health",
+            json.dumps(health),
+            retain=True,
+        )
+        if status in ("critical", "dead"):
+            log.warning("PIPELINE HEALTH: %s — token_age=%.0f min, api_failures=%d, recovery_attempts=%d",
+                        status, token_age_min or -1, self._consecutive_api_failures,
+                        self._recovery_attempts_since_success)
+        else:
+            log.debug("PIPELINE HEALTH: %s", status)
+
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop_safe(self):
         """Wrapper ensuring the keepalive thread never dies silently.
@@ -8398,6 +8499,8 @@ img{{max-width:100%;height:auto}}</style></head>
                 if self._tokens_are_fresh():
                     no_token_count = 0
                     self._login_flow_active = None  # login succeeded
+                    self._recovery_attempts_since_success = 0
+                    self._consecutive_api_failures = 0
                     continue
 
                 # ── Check if login flow is active — don't kill it ──
@@ -8417,6 +8520,7 @@ img{{max-width:100%;height:auto}}</style></head>
 
                 # ── Step 2: force-restart the app + reattach Frida (~35s) ──
                 no_token_count += 1
+                self._recovery_attempts_since_success += 1
                 log.warning("No fresh tokens after wake — force-restarting "
                             "VW app + reattaching Frida (attempt %d)",
                             no_token_count)
@@ -8438,6 +8542,8 @@ img{{max-width:100%;height:auto}}</style></head>
                 if self._tokens_are_fresh():
                     log.info("Token flow recovered after force-restart")
                     no_token_count = 0
+                    self._recovery_attempts_since_success = 0
+                    self._consecutive_api_failures = 0
                     continue
 
                 # ── Step 3: wait 2 min, try once more (~2.5 min) ──
@@ -8450,6 +8556,8 @@ img{{max-width:100%;height:auto}}</style></head>
                 if self._tokens_are_fresh():
                     log.info("Token flow recovered on retry")
                     no_token_count = 0
+                    self._recovery_attempts_since_success = 0
+                    self._consecutive_api_failures = 0
                     continue
 
                 # ── Step 4: full re-login as last resort ──
@@ -8481,11 +8589,28 @@ img{{max-width:100%;height:auto}}</style></head>
                         with urlopen(req, timeout=15) as resp:
                             resp.read()
                         log.debug("Token validation: OK")
+                        self._consecutive_api_failures = 0
+                        self._last_successful_api_call = datetime.now()
+                        self._recovery_attempts_since_success = 0
                     except HTTPError as e:
                         if e.code in (401, 403):
-                            log.warning("Token validation failed (%d) — waking app for refresh", e.code)
+                            self._consecutive_api_failures += 1
+                            log.warning("Token validation failed (%d) — consecutive failures: %d — waking app for refresh",
+                                        e.code, self._consecutive_api_failures)
                             self._rehook_frida()
                             self._wake_app()
+                            # After 3+ consecutive failures, escalate to force-restart
+                            if self._consecutive_api_failures >= 3:
+                                log.warning("Token validation: %d consecutive 401/403 — escalating to force-restart",
+                                            self._consecutive_api_failures)
+                                self._recovery_attempts_since_success += 1
+                                self._keepalive_recovering = True
+                                self.session = None
+                                self.script = None
+                                try:
+                                    self._wake_app_full_restart()
+                                finally:
+                                    self._keepalive_recovering = False
                         else:
                             log.debug("Token validation: HTTP %d (non-auth, ignoring)", e.code)
                     except Exception:
@@ -8552,6 +8677,9 @@ img{{max-width:100%;height:auto}}</style></head>
 
             # Always publish current state
             self._publish_tokens()
+
+            # ── Publish comprehensive pipeline health ──
+            self._publish_pipeline_health()
 
     # ── Main ────────────────────────────────────────────────────────
     def run(self):
