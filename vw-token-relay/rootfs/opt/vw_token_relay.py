@@ -519,6 +519,7 @@ class VWTokenRelay:
         # Silent-detach recovery tracking
         self._last_recovery_time = None   # prevents recovery storm on slow phone
         self._keepalive_recovering = False  # set during keepalive recovery to suppress _on_detached reattach loop
+        self._prev_frida_diag = None      # previous rehook() diag snapshot for delta comparison
 
         # Phone health tracking
         self._phone_down_since = None     # when phone was first detected as down
@@ -1457,22 +1458,14 @@ img{{max-width:100%;height:auto}}</style></head>
         token = self._get_valid_token(vid)
         if not token:
             cmd_name = url.rsplit("/", 2)[-2] if "/" in url else "api"
-            # Fast path: direct IDP refresh (no Frida needed)
-            if self.refresh_token and self.code_verifier:
-                log.info("CMD QUEUE: No token for %s — trying direct IDP refresh...", cmd_name)
-                if self._direct_idp_refresh():
-                    token = self._get_valid_token(vid)
-                    if token:
-                        log.info("CMD QUEUE: Direct IDP refresh got token — executing %s immediately", cmd_name)
-            if not token:
-                log.info("CMD QUEUE: No valid token for %s — queuing, will retry up to 10 min...", cmd_name)
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                    json.dumps({"status": "queued", "cmd": cmd_name, "reason": "waiting_for_token",
-                                "max_wait_min": 10}),
-                )
-                # Wake app to trigger token refresh
-                self._wake_app()
+            log.info("CMD QUEUE: No valid token for %s — queuing, will retry up to 10 min...", cmd_name)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/cmd_status",
+                json.dumps({"status": "queued", "cmd": cmd_name, "reason": "waiting_for_token",
+                            "max_wait_min": 10}),
+            )
+            # Wake app to trigger token refresh
+            self._wake_app()
             # Poll for token every 30s, up to 10 minutes
             wait_start = time.time()
             max_wait = 600  # 10 minutes
@@ -1497,12 +1490,6 @@ img{{max-width:100%;height:auto}}</style></head>
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/cmd_status",
                     json.dumps({"status": "failed", "cmd": cmd_name, "reason": "token_timeout_10min"}),
-                )
-                # Publish to cmd_failed for HA notification
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/cmd_failed",
-                    json.dumps({"cmd": cmd_name, "error": "token_timeout_10min",
-                                "msg": f"{cmd_name} failed after 10 min of retries"}),
                 )
                 return None, {"error": "no_valid_token", "msg": "Token expired — no fresh token after 10 min wait"}
 
@@ -1673,49 +1660,12 @@ img{{max-width:100%;height:auto}}</style></head>
         if not oauth_token:
             oauth_token = self._get_valid_token(vehicle_id, vehicle_only=False)
         if not oauth_token:
-            # ── Fast path: direct IDP refresh ──
-            if self.refresh_token and self.code_verifier:
-                log.info("SPIN: No token — trying direct IDP refresh first...")
-                if self._direct_idp_refresh():
-                    oauth_token = self._get_valid_token(vehicle_id)
-                    if oauth_token:
-                        log.info("SPIN: Direct IDP refresh got token — proceeding immediately")
+            log.info("SPIN: No token — waking app...")
+            self._wake_app(target_vid=vehicle_id)
+            time.sleep(30)
+            oauth_token = self._get_valid_token(vehicle_id)
             if not oauth_token:
-                # ── 10-minute token queue (matches _api_request Level 0) ──
-                log.info("SPIN: No token — queuing, will retry up to 10 min...")
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                    json.dumps({"status": "queued", "cmd": f"spin_{tsp.lower()}",
-                                "reason": "waiting_for_token", "max_wait_min": 10}),
-                )
-                self._wake_app(target_vid=vehicle_id)
-            wait_start = time.time()
-            max_wait = 600  # 10 minutes
-            while time.time() - wait_start < max_wait:
-                time.sleep(30)
-                oauth_token = self._get_valid_token(vehicle_id)
-                if oauth_token:
-                    elapsed = int(time.time() - wait_start)
-                    log.info("SPIN: Token available after %ds — proceeding", elapsed)
-                    self.mqttc.publish(
-                        f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                        json.dumps({"status": "executing", "cmd": f"spin_{tsp.lower()}",
-                                    "waited_s": elapsed}),
-                    )
-                    break
-                elapsed = int(time.time() - wait_start)
-                if elapsed % 120 < 35:
-                    log.info("SPIN: Still waiting for token (%ds)... re-waking app", elapsed)
-                    self._wake_app(target_vid=vehicle_id)
-            if not oauth_token:
-                log.error("SPIN: No token after 10 min wait — giving up")
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                    json.dumps({"status": "failed", "cmd": f"spin_{tsp.lower()}",
-                                "reason": "token_timeout_10min"}),
-                )
-                return None, {"error": "no_valid_token",
-                              "msg": "No OAuth token after 10 min wait"}
+                return None, {"error": "no_valid_token", "msg": "No OAuth token available"}
 
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
         session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vehicle_id}/session"
@@ -1781,16 +1731,9 @@ img{{max-width:100%;height:auto}}</style></head>
         # ── Acquire SPIN token (EV vehicles use WCT) ──
         spin_token, spin_err = self._get_spin_token(vid, tsp="WCT")
         if spin_token is None:
-            log.error("CLIMATE: SPIN auth failed after all retries: %s", spin_err)
+            log.error("CLIMATE: SPIN auth failed: %s", spin_err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "climate_spin_failed", "action": action, **(spin_err or {})}))
-            # Publish final failure for HA notification
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/cmd_failed",
-                json.dumps({"cmd": f"climate_{action}", "vehicle": vid[:8],
-                            "error": spin_err.get("error", "unknown") if spin_err else "unknown",
-                            "msg": f"Climate {action} failed after 10 min of retries"}),
-            )
+                json.dumps({"error": f"climate_spin_failed", "action": action, **(spin_err or {})}))
             return
 
         # ── Send climate command with carnetVehicleToken ──
@@ -8003,6 +7946,24 @@ img{{max-width:100%;height:auto}}</style></head>
         elif msg_type == "hook_error":
             log.warning("Frida hook error: %s", payload.get("error", "unknown"))
 
+        elif msg_type == "diag_stats":
+            # Periodic diagnostics from agent v3.2+ — log for visibility
+            delta = payload.get("delta", {})
+            alpn = payload.get("alpn", {})
+            cumul = payload.get("cumulative", {})
+            log.info(
+                "FRIDA_DIAG: SSL_write=%d parsed=%d h2=%d | SSL_read=%d | "
+                "ALPN ssl=%d ctx=%d | tokens=%d api=%d | conns=%d",
+                delta.get("sslWriteCalls", 0), delta.get("sslWriteParsed", 0),
+                delta.get("h2Detected", 0), delta.get("sslReadCalls", 0),
+                delta.get("alpnPerSslH2Stripped", 0), delta.get("alpnCtxH2Stripped", 0),
+                cumul.get("tokenResp", 0), cumul.get("apiResp", 0),
+                cumul.get("trackedConns", 0),
+            )
+            if delta.get("h2Detected", 0) > 0:
+                log.warning("FRIDA_DIAG: HTTP/2 binary frames detected — "
+                            "ALPN forcing may not cover all connections")
+
         elif msg_type == "full_traffic":
             # Legacy handler — full_traffic capture removed in v1.13.0
             # to fix native crashes. Just log the URL for debugging.
@@ -8179,11 +8140,12 @@ img{{max-width:100%;height:auto}}</style></head>
 
 
     def _rehook_frida(self):
-        """Briefly reinstall Frida hooks so the next app wake captures tokens.
+        """Call the agent's rehook() RPC and return diagnostic data.
 
-        The capture-and-unhook agent auto-removes hooks after capture (or after
-        12 s safety timer) to avoid ART GC crashes on Android 16.  Before each
-        keepalive wake we call the agent's rehook() RPC to re-enable them.
+        For the compiled native agent (v3.2+), hooks are permanent — rehook()
+        is a status check that returns SSL activity counters.  The returned
+        diag dict lets the keepalive distinguish 'hooks alive but no OIDC
+        traffic' from 'hooks dead / process gone'.
         """
         if self.script is None:
             return False
@@ -8192,16 +8154,65 @@ img{{max-width:100%;height:auto}}</style></head>
             import json as _json
             result = _json.loads(raw)
             status = result.get('status', 'unknown')
+            diag = result.get('diag', {})
+
             if status == 'hooks_reinstalled':
                 log.info("REHOOK: Hooks reinstalled for token capture")
             elif status == 'already_hooked':
                 log.debug("REHOOK: Hooks were still active")
+            elif status == 'native_hooks_permanent':
+                # Expected for compiled agent v3.2+ — log SSL activity
+                ssl_writes = diag.get('sslWriteCalls', 0)
+                ssl_parsed = diag.get('sslWriteParsed', 0)
+                h2_frames = diag.get('h2Detected', 0)
+                uptime = result.get('uptimeSeconds', 0)
+                stats = result.get('stats', {})
+                log.info(
+                    "REHOOK: native hooks permanent | uptime=%ds | "
+                    "SSL: writes=%d parsed=%d h2=%d | "
+                    "tokens=%d api=%d auth=%d",
+                    uptime, ssl_writes, ssl_parsed, h2_frames,
+                    stats.get('tokenResp', 0), stats.get('apiResp', 0),
+                    stats.get('auth', 0),
+                )
+                # Compute delta since last check for silent-detach logic
+                if self._prev_frida_diag is not None:
+                    prev_writes = self._prev_frida_diag.get('sslWriteCalls', 0)
+                    delta_writes = ssl_writes - prev_writes
+                    if delta_writes > 0:
+                        log.debug("REHOOK: %d new SSL_write calls since last check — hooks alive",
+                                  delta_writes)
+                self._prev_frida_diag = diag
             else:
                 log.warning("REHOOK: Unexpected status: %s", status)
+
             return True
         except Exception as e:
-            log.warning("REHOOK: Failed to reinstall hooks: %s", e)
+            log.warning("REHOOK: Failed: %s", e)
             return False
+
+    def _frida_hooks_have_ssl_activity(self):
+        """Check if Frida hooks are showing SSL activity since last check.
+
+        Returns True if SSL_write/SSL_read calls have increased, indicating
+        hooks are alive even if no OIDC token traffic was captured.
+        Returns None if no diagnostic data available (old agent version).
+        """
+        if self._prev_frida_diag is None:
+            return None
+        if self.script is None:
+            return False
+        try:
+            raw = self.script.exports_sync.getStats()
+            import json as _json
+            result = _json.loads(raw)
+            diag = result.get('diag', {})
+            prev_writes = self._prev_frida_diag.get('sslWriteCalls', 0)
+            curr_writes = diag.get('sslWriteCalls', 0)
+            self._prev_frida_diag = diag
+            return curr_writes > prev_writes
+        except Exception:
+            return None
 
     def _on_detached(self, reason, crash):
         log.warning("Frida detached: reason=%s crash=%s", reason, crash)
@@ -8297,49 +8308,51 @@ img{{max-width:100%;height:auto}}</style></head>
                 return True
         return False
 
-    # ── Pipeline health publishing ──────────────────────────────────
+    # ── Pipeline health (for HA auto-recovery automation) ──────────
     def _publish_pipeline_health(self):
-        """Publish a comprehensive health status to vw/pipeline_health (retained).
-        This gives HA a single MQTT topic to monitor for auto-recovery decisions.
+        """Publish comprehensive health status to vw/pipeline_health (retained).
 
-        Status levels:
-          - healthy: tokens fresh, Frida attached, API calls succeeding
-          - degraded: tokens expiring soon or Frida recovering
-          - critical: no fresh tokens for >15 min or repeated API failures
-          - dead: no fresh tokens for >30 min and recovery has failed
+        HA auto-recovery automations consume this to decide whether to
+        restart CarConnectivity or trigger force_recovery via MQTT.
         """
         now = datetime.now()
 
-        # Determine Frida status
         frida_ok = self.session is not None and self.script is not None
         frida_status = "attached" if frida_ok else "detached"
 
-        # Token age
         token_age_min = None
         if self._last_token_time:
-            token_age_min = round((now - self._last_token_time).total_seconds() / 60, 1)
+            token_age_min = round(
+                (now - self._last_token_time).total_seconds() / 60, 1
+            )
 
-        # Token freshness
         tokens_fresh = self._tokens_are_fresh()
 
-        # Last successful API validation
         api_age_min = None
         if self._last_successful_api_call:
-            api_age_min = round((now - self._last_successful_api_call).total_seconds() / 60, 1)
+            api_age_min = round(
+                (now - self._last_successful_api_call).total_seconds() / 60, 1
+            )
 
         # Determine overall status
         if tokens_fresh and frida_ok and self._consecutive_api_failures == 0:
             status = "healthy"
-        elif token_age_min is not None and token_age_min > 30 and self._recovery_attempts_since_success >= 2:
+        elif (
+            token_age_min is not None
+            and token_age_min > 30
+            and self._recovery_attempts_since_success >= 2
+        ):
             status = "dead"
-        elif (token_age_min is not None and token_age_min > 15) or self._consecutive_api_failures >= 2:
+        elif (
+            (token_age_min is not None and token_age_min > 15)
+            or self._consecutive_api_failures >= 2
+        ):
             status = "critical"
         elif not tokens_fresh or not frida_ok or self._consecutive_api_failures > 0:
             status = "degraded"
         else:
             status = "healthy"
 
-        # Maintenance mode
         if self._maintenance.is_set():
             status = "maintenance"
 
@@ -8348,7 +8361,11 @@ img{{max-width:100%;height:auto}}</style></head>
             "frida": frida_status,
             "tokens_fresh": tokens_fresh,
             "token_age_min": token_age_min,
-            "last_token_at": self._last_token_time.isoformat() if self._last_token_time else None,
+            "last_token_at": (
+                self._last_token_time.isoformat()
+                if self._last_token_time
+                else None
+            ),
             "api_failures": self._consecutive_api_failures,
             "api_age_min": api_age_min,
             "recovery_attempts": self._recovery_attempts_since_success,
@@ -8359,12 +8376,6 @@ img{{max-width:100%;height:auto}}</style></head>
             json.dumps(health),
             retain=True,
         )
-        if status in ("critical", "dead"):
-            log.warning("PIPELINE HEALTH: %s — token_age=%.0f min, api_failures=%d, recovery_attempts=%d",
-                        status, token_age_min or -1, self._consecutive_api_failures,
-                        self._recovery_attempts_since_success)
-        else:
-            log.debug("PIPELINE HEALTH: %s", status)
 
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop_safe(self):
@@ -8476,42 +8487,58 @@ img{{max-width:100%;height:auto}}</style></head>
                 except Exception as e:
                     log.error("KEEPALIVE: Frida recovery error: %s", e)
 
-            # ── Frida silent-detach detection ──
-            # Frida session/script objects can remain non-None even when hooks
-            # have silently stopped intercepting (e.g. app process recycled by
-            # Android with no detach callback, or Frida internal state corruption).
-            # Detect this by checking: session looks alive but no fresh token
-            # has been captured in >8 minutes.
-            # IMPORTANT: After a recovery attempt, wait at least 6 minutes
-            # before trying again — the Moto G Pure is slow and needs time
-            # for React Native to init + render vehicle cards + make API calls.
-            # Without this cooldown, repeated force-restarts kill the app before
-            # it can produce a token ("recovery storm").
+            # ── Frida silent-detach detection (v3.2 — diagnostic-aware) ──
+            # With native SSL hooks (compiled agent v3.2+), hooks are permanent
+            # and do NOT auto-unhook.  "No fresh token" usually means the app
+            # simply hasn't made OIDC calls — NOT that hooks are broken.
+            #
+            # Use diagnostic counters from rehook() to distinguish:
+            #   - SSL activity present → hooks alive, just no OIDC traffic
+            #   - Zero SSL activity → hooks may be dead (process recycled)
+            #
+            # When direct IDP refresh is available (refresh_token + code_verifier
+            # captured), we don't need Frida for ongoing token refresh at all,
+            # so extend the timeout to 55 min (just before token expiry).
             elif self.session is not None and self._last_token_time:
                 silent_detach_age = (datetime.now() - self._last_token_time).total_seconds() / 60
                 recovery_cooldown_ok = (
                     self._last_recovery_time is None
                     or (datetime.now() - self._last_recovery_time).total_seconds() > 360  # 6 min
                 )
-                if silent_detach_age > 8 and recovery_cooldown_ok:
+
+                # Determine appropriate timeout based on state
+                has_direct_refresh = bool(self.refresh_token and self.code_verifier)
+                ssl_active = self._frida_hooks_have_ssl_activity()
+
+                if has_direct_refresh:
+                    # Direct IDP refresh available — Frida only needed for
+                    # initial capture.  Use long timeout (55 min).
+                    detach_threshold = 55
+                elif ssl_active is True:
+                    # Hooks alive (SSL traffic flowing) but no token traffic.
+                    # App hasn't made OIDC calls yet — normal.  Use 30 min.
+                    detach_threshold = 30
+                elif ssl_active is None:
+                    # Old agent (no diag data) — use original 8 min threshold
+                    detach_threshold = 8
+                else:
+                    # No SSL activity — hooks may actually be dead.
+                    detach_threshold = 8
+
+                if silent_detach_age > detach_threshold and recovery_cooldown_ok:
                     log.warning(
                         "KEEPALIVE: Frida session alive but no fresh token "
-                        "in %.0f min — likely silent detach. "
+                        "in %.0f min (threshold=%.0f, direct_refresh=%s, ssl_active=%s) "
+                        "— likely silent detach. "
                         "Force-restarting app + reattaching Frida...",
-                        silent_detach_age)
+                        silent_detach_age, detach_threshold,
+                        has_direct_refresh, ssl_active)
                     self._last_recovery_time = datetime.now()
                     try:
-                        # Set flag BEFORE nulling session so _on_detached
-                        # skips its own reattach loop (avoids race condition
-                        # where two threads both call _attach_frida).
                         self._keepalive_recovering = True
-                        # Invalidate the stale session — do NOT call
-                        # session.detach() as that fires _on_detached in a
-                        # separate Frida thread which starts a competing
-                        # 12-attempt reattach loop.  Just null out the refs.
                         self.session = None
                         self.script = None
-                        # Full restart: force-stop app, reattach Frida, relaunch
+                        self._prev_frida_diag = None  # reset diag on recovery
                         self._wake_app_full_restart()
                         if self.session is not None and self.script is not None:
                             log.info("KEEPALIVE: Frida recovered from silent detach")
@@ -8525,12 +8552,19 @@ img{{max-width:100%;height:auto}}</style></head>
                         log.error("KEEPALIVE: Silent-detach recovery error: %s", e)
                     finally:
                         self._keepalive_recovering = False
-                elif silent_detach_age > 8 and not recovery_cooldown_ok:
+                elif silent_detach_age > detach_threshold and not recovery_cooldown_ok:
                     cooldown_remaining = 360 - (datetime.now() - self._last_recovery_time).total_seconds()
                     log.info(
-                        "KEEPALIVE: No fresh token in %.0f min but recovery "
-                        "cooldown active (%.0fs remaining) — waiting for app to produce token...",
-                        silent_detach_age, cooldown_remaining)
+                        "KEEPALIVE: No fresh token in %.0f min (threshold=%.0f) but recovery "
+                        "cooldown active (%.0fs remaining) — waiting...",
+                        silent_detach_age, detach_threshold, cooldown_remaining)
+                elif silent_detach_age > 5:
+                    # Log at debug level when approaching threshold
+                    log.debug(
+                        "KEEPALIVE: Token age %.0f min (threshold=%.0f, "
+                        "direct_refresh=%s, ssl_active=%s)",
+                        silent_detach_age, detach_threshold,
+                        has_direct_refresh, ssl_active)
 
             with self._lock:
                 needs_refresh = False
@@ -8548,21 +8582,6 @@ img{{max-width:100%;height:auto}}</style></head>
                 has_any_token = bool(self.tokens) or self.global_token
 
             if needs_refresh or not has_any_token:
-                # ── Fast path: direct IDP refresh (no Frida needed) ──
-                # Uses the captured refresh_token + code_verifier to call
-                # VW's token endpoint directly. Sub-second, no app/Frida
-                # dependency. Falls through to Frida path if unavailable.
-                if self.refresh_token and self.code_verifier:
-                    log.info("KEEPALIVE: Tokens expiring — trying direct IDP refresh...")
-                    if self._direct_idp_refresh():
-                        log.info("KEEPALIVE: Direct IDP refresh succeeded — tokens fresh")
-                        no_token_count = 0
-                        self._recovery_attempts_since_success = 0
-                        self._consecutive_api_failures = 0
-                        continue
-                    else:
-                        log.info("KEEPALIVE: Direct IDP refresh failed — falling back to app wake")
-
                 # ── Step 1: wake the running app (~30s) ──
                 log.info("Tokens expiring/missing, waking app for refresh...")
                 self._rehook_frida()
@@ -8572,8 +8591,6 @@ img{{max-width:100%;height:auto}}</style></head>
                 if self._tokens_are_fresh():
                     no_token_count = 0
                     self._login_flow_active = None  # login succeeded
-                    self._recovery_attempts_since_success = 0
-                    self._consecutive_api_failures = 0
                     continue
 
                 # ── Check if login flow is active — don't kill it ──
@@ -8593,10 +8610,10 @@ img{{max-width:100%;height:auto}}</style></head>
 
                 # ── Step 2: force-restart the app + reattach Frida (~35s) ──
                 no_token_count += 1
-                self._recovery_attempts_since_success += 1
                 log.warning("No fresh tokens after wake — force-restarting "
                             "VW app + reattaching Frida (attempt %d)",
                             no_token_count)
+                self._recovery_attempts_since_success += 1
                 # Invalidate stale Frida session before killing the process.
                 # Do NOT call session.detach() — it fires _on_detached in a
                 # separate thread which starts a competing reattach loop.
@@ -8638,6 +8655,8 @@ img{{max-width:100%;height:auto}}</style></head>
                             "auto re-login (attempt %d)", no_token_count)
                 self._auto_relogin()
                 no_token_count = 0
+                self._recovery_attempts_since_success = 0
+                self._consecutive_api_failures = 0
                 time.sleep(15)
                 self._rehook_frida()
                 self._wake_app()
@@ -8668,13 +8687,15 @@ img{{max-width:100%;height:auto}}</style></head>
                     except HTTPError as e:
                         if e.code in (401, 403):
                             self._consecutive_api_failures += 1
-                            log.warning("Token validation failed (%d) — consecutive failures: %d — waking app for refresh",
+                            log.warning("Token validation failed (%d) — "
+                                        "consecutive failures: %d",
                                         e.code, self._consecutive_api_failures)
-                            self._rehook_frida()
-                            self._wake_app()
-                            # After 3+ consecutive failures, escalate to force-restart
                             if self._consecutive_api_failures >= 3:
-                                log.warning("Token validation: %d consecutive 401/403 — escalating to force-restart",
+                                # Escalate: 3+ consecutive auth failures →
+                                # force-restart the app
+                                log.warning("Token validation: %d consecutive "
+                                            "auth failures — escalating to "
+                                            "force-restart",
                                             self._consecutive_api_failures)
                                 self._recovery_attempts_since_success += 1
                                 self._keepalive_recovering = True
@@ -8684,6 +8705,9 @@ img{{max-width:100%;height:auto}}</style></head>
                                     self._wake_app_full_restart()
                                 finally:
                                     self._keepalive_recovering = False
+                            else:
+                                self._rehook_frida()
+                                self._wake_app()
                         else:
                             log.debug("Token validation: HTTP %d (non-auth, ignoring)", e.code)
                     except Exception:
@@ -8750,8 +8774,6 @@ img{{max-width:100%;height:auto}}</style></head>
 
             # Always publish current state
             self._publish_tokens()
-
-            # ── Publish comprehensive pipeline health ──
             self._publish_pipeline_health()
 
     # ── Main ────────────────────────────────────────────────────────
@@ -8811,6 +8833,9 @@ img{{max-width:100%;height:auto}}</style></head>
         log.info("    %s/pif_health         — PI status: healthy/degraded/cooldown (retained)", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/update_pif     — refresh Play Integrity fingerprint", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/wake_app       — force app refresh", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/force_recovery — HA auto-recovery trigger", MQTT_TOPIC_PREFIX)
+        log.info("    %s/pipeline_health    — overall pipeline status (retained)", MQTT_TOPIC_PREFIX)
+        log.info("    %s/recovery_result    — force_recovery outcome", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
         log.info("=" * 60)
 
