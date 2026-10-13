@@ -12,11 +12,19 @@ function findNativeExport(name) {
     return null;
 }
 
-// ── VW Token Relay — Frida Agent v3.1 (Native SSL Hooks) ──
+// ── VW Token Relay — Frida Agent v3.2 (Native SSL Hooks + Diagnostics) ──
+//
+// Changes from v3.1:
+//   - Hook SSL_CTX_set_alpn_protos to force HTTP/1.1 at context level
+//     (fixes h2 negotiation after OkHttp connection pool expires)
+//   - Diagnostic counters for SSL_write/SSL_read call tracking
+//   - rehook() / getStats() RPCs return hook activity data so the Python
+//     keepalive can distinguish "hooks dead" from "no OIDC traffic"
+//   - Periodic stats reporting via send() every 120s
 //
 // Hooks BoringSSL's SSL_write/SSL_read via Interceptor.attach (native C
-// function patching). Forces HTTP/1.1 by modifying ALPN negotiation.
-// Parses HTTP/1.1 traffic at the TLS layer to capture tokens.
+// function patching). Forces HTTP/1.1 by modifying ALPN negotiation at
+// both SSL_CTX and per-SSL levels.
 //
 // Why this is GC-safe:
 //   Interceptor.attach patches the first instruction of NATIVE functions
@@ -47,12 +55,81 @@ function isApiPath(p) {
 // Tracks request info so we can correlate responses with their URLs.
 var conns = {};
 
-// Counters for status reporting
+// ── Lifetime counters (cumulative, never auto-reset) ──
 var _authCount = 0;
 var _tokenRespCount = 0;
 var _apiRespCount = 0;
 var _hooksInstalled = false;
-var _alpnForced = false;
+var _alpnForced = false;         // per-SSL ALPN hook fired at least once
+var _alpnCtxForced = false;      // per-CTX ALPN hook fired at least once
+
+// ── Diagnostic counters (cumulative since agent boot) ──
+// Used by rehook()/getStats() so Python keepalive can determine
+// whether hooks are alive (SSL activity) vs. no OIDC traffic.
+var _diag = {
+    sslWriteCalls: 0,        // total SSL_write hook entries
+    sslWriteParsed: 0,       // successfully parsed as HTTP/1.x request
+    sslWriteSkipped: 0,      // skipped (too small, binary, not HTTP)
+    sslWriteError: 0,        // caught exceptions in SSL_write hook
+    sslReadCalls: 0,         // total SSL_read onLeave entries (bytes>0)
+    sslReadTracked: 0,       // matched to a tracked connection
+    sslReadUntracked: 0,     // started new untracked response entry
+    sslReadError: 0,         // caught exceptions in SSL_read hook
+    alpnPerSslCalls: 0,      // SSL_set_alpn_protos calls intercepted
+    alpnPerSslH2Stripped: 0, // h2 stripped at per-SSL level
+    alpnCtxCalls: 0,         // SSL_CTX_set_alpn_protos calls intercepted
+    alpnCtxH2Stripped: 0,    // h2 stripped at per-CTX level
+    responsesCompleted: 0,   // processCompleteResponse calls
+    h2Detected: 0,           // possible HTTP/2 binary frames in SSL_write
+};
+
+// Snapshot counters for periodic delta reporting
+var _diagSnapshot = {};
+var _diagStartTime = Date.now();
+var _lastStatsReport = Date.now();
+
+function snapshotDiag() {
+    var snap = {};
+    for (var k in _diag) snap[k] = _diag[k];
+    return snap;
+}
+
+function diagDelta(prev, curr) {
+    var d = {};
+    for (var k in curr) d[k] = curr[k] - (prev[k] || 0);
+    return d;
+}
+
+// ── ALPN forcing helper (shared between per-SSL and per-CTX hooks) ──
+function forceHttp11Alpn(args, hookCtx) {
+    try {
+        var protosLen = args[2].toInt32();
+        if (protosLen <= 0 || protosLen > 256) return false;
+        var protosBytes = args[1].readByteArray(protosLen);
+        if (!protosBytes) return false;
+        var arr = new Uint8Array(protosBytes);
+        // Check if h2 is offered (byte sequence: 0x02 0x68 0x32)
+        var hasH2 = false;
+        for (var i = 0; i < arr.length - 2; i++) {
+            if (arr[i] === 0x02 && arr[i + 1] === 0x68 && arr[i + 2] === 0x32) {
+                hasH2 = true;
+                break;
+            }
+        }
+        if (hasH2) {
+            // Replace with http/1.1 only: \x08http/1.1
+            var h11 = Memory.alloc(9);
+            h11.writeByteArray([0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31]);
+            args[1] = h11;
+            args[2] = ptr(9);
+            hookCtx._mem = h11; // prevent GC
+            return true;
+        }
+    } catch (e) {
+        send({ type: 'hook_error', error: 'ALPN force error: ' + e.toString() });
+    }
+    return false;
+}
 
 // ── Install native SSL hooks ──
 function installNativeHooks() {
@@ -64,62 +141,87 @@ function installNativeHooks() {
         return;
     }
 
-    // ── Force HTTP/1.1 via ALPN ──
-    // This makes all connections use plain-text HTTP/1.1 instead of binary
-    // HTTP/2, so we can parse traffic as simple text.
+    // ── Force HTTP/1.1 via ALPN (per-SSL connection) ──
     var SSL_set_alpn = findNativeExport('SSL_set_alpn_protos');
     if (SSL_set_alpn) {
         Interceptor.attach(SSL_set_alpn, {
             onEnter: function (args) {
-                try {
-                    var protosLen = args[2].toInt32();
-                    if (protosLen <= 0 || protosLen > 256) return;
-                    var protosBytes = args[1].readByteArray(protosLen);
-                    if (!protosBytes) return;
-                    var arr = new Uint8Array(protosBytes);
-                    // Check if h2 is offered (byte sequence: 0x02 0x68 0x32)
-                    var hasH2 = false;
-                    for (var i = 0; i < arr.length - 2; i++) {
-                        if (arr[i] === 0x02 && arr[i+1] === 0x68 && arr[i+2] === 0x32) {
-                            hasH2 = true;
-                            break;
-                        }
-                    }
-                    if (hasH2) {
-                        // Replace with http/1.1 only: \x08http/1.1
-                        var h11 = Memory.alloc(9);
-                        h11.writeByteArray([0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31]);
-                        args[1] = h11;
-                        args[2] = ptr(9);
-                        this._mem = h11; // prevent GC
-                        _alpnForced = true;
-                    }
-                } catch (e) {}
+                _diag.alpnPerSslCalls++;
+                if (forceHttp11Alpn(args, this)) {
+                    _alpnForced = true;
+                    _diag.alpnPerSslH2Stripped++;
+                }
             }
         });
-        send({ type: 'status', msg: 'ALPN hook active — will force HTTP/1.1' });
+        send({ type: 'status', msg: 'ALPN hook active (per-SSL) — will force HTTP/1.1' });
     } else {
-        send({ type: 'status', msg: 'WARN: SSL_set_alpn_protos not found — HTTP/2 traffic may be missed' });
+        send({ type: 'status', msg: 'WARN: SSL_set_alpn_protos not found' });
+    }
+
+    // ── Force HTTP/1.1 via ALPN (per-CTX — context level) ──
+    // Critical for Android 16 / OkHttp: ALPN may be set once on the
+    // SSL_CTX rather than on each SSL object.  Without this hook,
+    // connections created after the initial pool expires can negotiate
+    // HTTP/2, producing binary frames our hooks cannot parse.
+    var SSL_CTX_set_alpn = findNativeExport('SSL_CTX_set_alpn_protos');
+    if (SSL_CTX_set_alpn) {
+        Interceptor.attach(SSL_CTX_set_alpn, {
+            onEnter: function (args) {
+                _diag.alpnCtxCalls++;
+                if (forceHttp11Alpn(args, this)) {
+                    _alpnCtxForced = true;
+                    _diag.alpnCtxH2Stripped++;
+                }
+            }
+        });
+        send({ type: 'status', msg: 'ALPN hook active (per-CTX) — will force HTTP/1.1 at context level' });
+    } else {
+        send({ type: 'status', msg: 'INFO: SSL_CTX_set_alpn_protos not found (per-SSL hook will still work)' });
     }
 
     // ── Hook SSL_write: capture outgoing HTTP requests ──
     Interceptor.attach(SSL_write, {
         onEnter: function (args) {
+            _diag.sslWriteCalls++;
             var num = args[2].toInt32();
-            if (num < 16 || num > 65536) return; // skip tiny/huge writes
+            if (num < 16 || num > 65536) {
+                _diag.sslWriteSkipped++;
+                return;
+            }
             try {
                 var data = args[1].readUtf8String(num);
-                if (!data) return;
+                if (!data) {
+                    _diag.sslWriteSkipped++;
+                    return;
+                }
 
                 // Quick check: is this an HTTP/1.x request line?
-                if (data.charCodeAt(0) < 0x41 || data.charCodeAt(0) > 0x5A) return; // not uppercase letter
+                var firstByte = data.charCodeAt(0);
+                if (firstByte < 0x41 || firstByte > 0x5A) {
+                    // Not an uppercase ASCII letter.
+                    // HTTP/2 binary frames start with length (0x00-0xFF) + type;
+                    // common frame types: DATA=0x00, HEADERS=0x01, SETTINGS=0x04.
+                    if (num >= 9 && (firstByte === 0x00 || firstByte === 0x01 ||
+                                     firstByte === 0x04 || firstByte === 0x08)) {
+                        _diag.h2Detected++;
+                    }
+                    _diag.sslWriteSkipped++;
+                    return;
+                }
                 var nlPos = data.indexOf('\r\n');
-                if (nlPos < 10 || nlPos > 2048) return;
+                if (nlPos < 10 || nlPos > 2048) {
+                    _diag.sslWriteSkipped++;
+                    return;
+                }
 
                 var reqLine = data.substring(0, nlPos);
                 var reqMatch = reqLine.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) ([^\s]+) HTTP\/1\.[01]$/);
-                if (!reqMatch) return;
+                if (!reqMatch) {
+                    _diag.sslWriteSkipped++;
+                    return;
+                }
 
+                _diag.sslWriteParsed++;
                 var method = reqMatch[1];
                 var path = reqMatch[2];
 
@@ -166,7 +268,9 @@ function installNativeHooks() {
                     bodyStart: -1,
                     statusCode: 0,
                 };
-            } catch (e) {}
+            } catch (e) {
+                _diag.sslWriteError++;
+            }
         }
     });
 
@@ -180,6 +284,7 @@ function installNativeHooks() {
             var bytesRead = retval.toInt32();
             if (bytesRead <= 0) return;
 
+            _diag.sslReadCalls++;
             var key = this._ssl.toString();
             var conn = conns[key];
 
@@ -197,10 +302,16 @@ function installNativeHooks() {
                             isChunked: false, isGzip: false, bodyStart: -1, statusCode: 0,
                         };
                         conns[key] = conn;
+                        _diag.sslReadUntracked++;
                     } else {
                         return;
                     }
-                } catch (e) { return; }
+                } catch (e) {
+                    _diag.sslReadError++;
+                    return;
+                }
+            } else {
+                _diag.sslReadTracked++;
             }
 
             try {
@@ -209,6 +320,7 @@ function installNativeHooks() {
                 conn.respRaw += chunk;
             } catch (e) {
                 // Binary data — if gzip, we can't easily parse
+                _diag.sslReadError++;
                 return;
             }
 
@@ -253,6 +365,7 @@ function installNativeHooks() {
             }
 
             if (complete) {
+                _diag.responsesCompleted++;
                 processCompleteResponse(conn);
                 delete conns[key];
             }
@@ -397,7 +510,6 @@ function nativeGunzip(fullResp, bodyStartOffset) {
 // ── Connection cleanup timer ──
 // Remove stale connections every 30s to prevent memory leaks
 setInterval(function () {
-    var now = Date.now();
     var keys = Object.keys(conns);
     if (keys.length > 200) {
         // Too many tracked connections — clear old ones
@@ -408,8 +520,39 @@ setInterval(function () {
     }
 }, 30000);
 
+// ── Periodic diagnostics report (every 120s) ──
+// Sends a delta of hook activity so the addon log shows whether hooks
+// are firing even when no tokens are being captured.
+_diagSnapshot = snapshotDiag();
+setInterval(function () {
+    var current = snapshotDiag();
+    var delta = diagDelta(_diagSnapshot, current);
+    _diagSnapshot = current;
+
+    // Only send if there was any activity
+    var totalActivity = delta.sslWriteCalls + delta.sslReadCalls +
+                        delta.alpnPerSslCalls + delta.alpnCtxCalls;
+    if (totalActivity > 0) {
+        send({
+            type: 'diag_stats',
+            period_seconds: 120,
+            delta: delta,
+            cumulative: {
+                auth: _authCount,
+                tokenResp: _tokenRespCount,
+                apiResp: _apiRespCount,
+                trackedConns: Object.keys(conns).length,
+            },
+            alpn: {
+                perSslForced: _alpnForced,
+                perCtxForced: _alpnCtxForced,
+            },
+        });
+    }
+}, 120000);
+
 // ── Boot ──
-send({ type: 'status', msg: 'Agent v3.1 loaded — Native SSL approach (GC-safe, no ART modification)' });
+send({ type: 'status', msg: 'Agent v3.2 loaded — Native SSL + CTX ALPN hooks (GC-safe, no ART modification)' });
 installNativeHooks();
 
 // ── RPC exports ──
@@ -421,7 +564,11 @@ rpc.exports = {
             status: 'native_hooks_permanent',
             hooksInstalled: _hooksInstalled,
             alpnForced: _alpnForced,
-            stats: { auth: _authCount, tokenResp: _tokenRespCount, apiResp: _apiRespCount }
+            alpnCtxForced: _alpnCtxForced,
+            stats: { auth: _authCount, tokenResp: _tokenRespCount, apiResp: _apiRespCount },
+            diag: snapshotDiag(),
+            uptimeSeconds: Math.floor((Date.now() - _diagStartTime) / 1000),
+            trackedConns: Object.keys(conns).length,
         });
     },
 
@@ -432,9 +579,25 @@ rpc.exports = {
     hookStatus: function () {
         return JSON.stringify({
             hooked: _hooksInstalled,
-            approach: 'native_ssl_v3.1',
+            approach: 'native_ssl_v3.2',
             alpnForced: _alpnForced,
-            stats: { auth: _authCount, tokenResp: _tokenRespCount, apiResp: _apiRespCount }
+            alpnCtxForced: _alpnCtxForced,
+            stats: { auth: _authCount, tokenResp: _tokenRespCount, apiResp: _apiRespCount },
+            diag: snapshotDiag(),
+            uptimeSeconds: Math.floor((Date.now() - _diagStartTime) / 1000),
+        });
+    },
+
+    getStats: function () {
+        return JSON.stringify({
+            hooksInstalled: _hooksInstalled,
+            approach: 'native_ssl_v3.2',
+            alpnForced: _alpnForced,
+            alpnCtxForced: _alpnCtxForced,
+            stats: { auth: _authCount, tokenResp: _tokenRespCount, apiResp: _apiRespCount },
+            diag: snapshotDiag(),
+            uptimeSeconds: Math.floor((Date.now() - _diagStartTime) / 1000),
+            trackedConns: Object.keys(conns).length,
         });
     },
 

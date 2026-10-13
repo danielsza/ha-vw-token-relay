@@ -32,7 +32,7 @@ RUN cd /tmp/frida-agent \
     && rm -rf /tmp/frida-agent
 
 # Force layer invalidation — change this string to bust Docker cache
-RUN echo "force-rebuild-20261006-esm-java-bridge" > /tmp/.build_marker
+RUN echo "force-rebuild-20261013-agent-v3.2-diag" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /
