@@ -648,6 +648,9 @@ class VWTokenRelay:
             threading.Thread(target=self._api_remote_start_stop, args=(payload,), daemon=True).start()
         elif cmd == "ui_remote_start":
             # UI-driven remote start — drives the VW app's own buttons
+            # Ack immediately so we can tell the command was received
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{payload}/remote_start",
+                json.dumps({"status": "command_received", "cmd": "ui_remote_start"}), retain=False)
             threading.Thread(target=self._ui_remote_start_flow,
                              args=(payload, False), daemon=True).start()
         elif cmd == "ui_remote_start_dry":
@@ -655,6 +658,8 @@ class VWTokenRelay:
             threading.Thread(target=self._ui_remote_start_flow,
                              args=(payload, False, True), daemon=True).start()
         elif cmd == "ui_remote_start_stop":
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{payload}/remote_start",
+                json.dumps({"status": "command_received", "cmd": "ui_remote_start_stop"}), retain=False)
             threading.Thread(target=self._ui_remote_start_flow,
                              args=(payload, True), daemon=True).start()
         elif cmd == "get_pairing":
@@ -2643,6 +2648,9 @@ img{{max-width:100%;height:auto}}</style></head>
         if not self._ui_rst_lock.acquire(blocking=False):
             log.warning("UI_RST: Another UI remote start flow is "
                         "already running — ignoring duplicate")
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
+                json.dumps({"status": "blocked",
+                            "reason": "another_flow_running"}), retain=False)
             return False
         try:
             return self._ui_remote_start_flow_inner(
@@ -7757,7 +7765,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 f"{MQTT_TOPIC_PREFIX}/{vid}/rvs_raw",
                 json.dumps(data),
             )
-            log.info("Published RVS data for %s", vid[:8])
+            log.debug("Published RVS data for %s", vid[:8])
             return
 
         # ── EV climate ──
