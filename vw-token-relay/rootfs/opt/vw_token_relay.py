@@ -1490,12 +1490,6 @@ img{{max-width:100%;height:auto}}</style></head>
                     f"{MQTT_TOPIC_PREFIX}/cmd_status",
                     json.dumps({"status": "failed", "cmd": cmd_name, "reason": "token_timeout_10min"}),
                 )
-                # Publish to cmd_failed for HA notification
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/cmd_failed",
-                    json.dumps({"cmd": cmd_name, "error": "token_timeout_10min",
-                                "msg": f"{cmd_name} failed after 10 min of retries"}),
-                )
                 return None, {"error": "no_valid_token", "msg": "Token expired — no fresh token after 10 min wait"}
 
         max_retries = 1
@@ -1665,41 +1659,12 @@ img{{max-width:100%;height:auto}}</style></head>
         if not oauth_token:
             oauth_token = self._get_valid_token(vehicle_id, vehicle_only=False)
         if not oauth_token:
-            # ── 10-minute token queue (matches _api_request Level 0) ──
-            log.info("SPIN: No token — queuing, will retry up to 10 min...")
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                json.dumps({"status": "queued", "cmd": f"spin_{tsp.lower()}",
-                            "reason": "waiting_for_token", "max_wait_min": 10}),
-            )
+            log.info("SPIN: No token — waking app...")
             self._wake_app(target_vid=vehicle_id)
-            wait_start = time.time()
-            max_wait = 600  # 10 minutes
-            while time.time() - wait_start < max_wait:
-                time.sleep(30)
-                oauth_token = self._get_valid_token(vehicle_id)
-                if oauth_token:
-                    elapsed = int(time.time() - wait_start)
-                    log.info("SPIN: Token available after %ds — proceeding", elapsed)
-                    self.mqttc.publish(
-                        f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                        json.dumps({"status": "executing", "cmd": f"spin_{tsp.lower()}",
-                                    "waited_s": elapsed}),
-                    )
-                    break
-                elapsed = int(time.time() - wait_start)
-                if elapsed % 120 < 35:
-                    log.info("SPIN: Still waiting for token (%ds)... re-waking app", elapsed)
-                    self._wake_app(target_vid=vehicle_id)
+            time.sleep(30)
+            oauth_token = self._get_valid_token(vehicle_id)
             if not oauth_token:
-                log.error("SPIN: No token after 10 min wait — giving up")
-                self.mqttc.publish(
-                    f"{MQTT_TOPIC_PREFIX}/cmd_status",
-                    json.dumps({"status": "failed", "cmd": f"spin_{tsp.lower()}",
-                                "reason": "token_timeout_10min"}),
-                )
-                return None, {"error": "no_valid_token",
-                              "msg": "No OAuth token after 10 min wait"}
+                return None, {"error": "no_valid_token", "msg": "No OAuth token available"}
 
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
         session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vehicle_id}/session"
@@ -1765,16 +1730,9 @@ img{{max-width:100%;height:auto}}</style></head>
         # ── Acquire SPIN token (EV vehicles use WCT) ──
         spin_token, spin_err = self._get_spin_token(vid, tsp="WCT")
         if spin_token is None:
-            log.error("CLIMATE: SPIN auth failed after all retries: %s", spin_err)
+            log.error("CLIMATE: SPIN auth failed: %s", spin_err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
-                json.dumps({"error": "climate_spin_failed", "action": action, **(spin_err or {})}))
-            # Publish final failure for HA notification
-            self.mqttc.publish(
-                f"{MQTT_TOPIC_PREFIX}/cmd_failed",
-                json.dumps({"cmd": f"climate_{action}", "vehicle": vid[:8],
-                            "error": spin_err.get("error", "unknown") if spin_err else "unknown",
-                            "msg": f"Climate {action} failed after 10 min of retries"}),
-            )
+                json.dumps({"error": f"climate_spin_failed", "action": action, **(spin_err or {})}))
             return
 
         # ── Send climate command with carnetVehicleToken ──
@@ -8281,49 +8239,51 @@ img{{max-width:100%;height:auto}}</style></head>
                 return True
         return False
 
-    # ── Pipeline health publishing ──────────────────────────────────
+    # ── Pipeline health (for HA auto-recovery automation) ──────────
     def _publish_pipeline_health(self):
-        """Publish a comprehensive health status to vw/pipeline_health (retained).
-        This gives HA a single MQTT topic to monitor for auto-recovery decisions.
+        """Publish comprehensive health status to vw/pipeline_health (retained).
 
-        Status levels:
-          - healthy: tokens fresh, Frida attached, API calls succeeding
-          - degraded: tokens expiring soon or Frida recovering
-          - critical: no fresh tokens for >15 min or repeated API failures
-          - dead: no fresh tokens for >30 min and recovery has failed
+        HA auto-recovery automations consume this to decide whether to
+        restart CarConnectivity or trigger force_recovery via MQTT.
         """
         now = datetime.now()
 
-        # Determine Frida status
         frida_ok = self.session is not None and self.script is not None
         frida_status = "attached" if frida_ok else "detached"
 
-        # Token age
         token_age_min = None
         if self._last_token_time:
-            token_age_min = round((now - self._last_token_time).total_seconds() / 60, 1)
+            token_age_min = round(
+                (now - self._last_token_time).total_seconds() / 60, 1
+            )
 
-        # Token freshness
         tokens_fresh = self._tokens_are_fresh()
 
-        # Last successful API validation
         api_age_min = None
         if self._last_successful_api_call:
-            api_age_min = round((now - self._last_successful_api_call).total_seconds() / 60, 1)
+            api_age_min = round(
+                (now - self._last_successful_api_call).total_seconds() / 60, 1
+            )
 
         # Determine overall status
         if tokens_fresh and frida_ok and self._consecutive_api_failures == 0:
             status = "healthy"
-        elif token_age_min is not None and token_age_min > 30 and self._recovery_attempts_since_success >= 2:
+        elif (
+            token_age_min is not None
+            and token_age_min > 30
+            and self._recovery_attempts_since_success >= 2
+        ):
             status = "dead"
-        elif (token_age_min is not None and token_age_min > 15) or self._consecutive_api_failures >= 2:
+        elif (
+            (token_age_min is not None and token_age_min > 15)
+            or self._consecutive_api_failures >= 2
+        ):
             status = "critical"
         elif not tokens_fresh or not frida_ok or self._consecutive_api_failures > 0:
             status = "degraded"
         else:
             status = "healthy"
 
-        # Maintenance mode
         if self._maintenance.is_set():
             status = "maintenance"
 
@@ -8332,7 +8292,11 @@ img{{max-width:100%;height:auto}}</style></head>
             "frida": frida_status,
             "tokens_fresh": tokens_fresh,
             "token_age_min": token_age_min,
-            "last_token_at": self._last_token_time.isoformat() if self._last_token_time else None,
+            "last_token_at": (
+                self._last_token_time.isoformat()
+                if self._last_token_time
+                else None
+            ),
             "api_failures": self._consecutive_api_failures,
             "api_age_min": api_age_min,
             "recovery_attempts": self._recovery_attempts_since_success,
@@ -8343,12 +8307,6 @@ img{{max-width:100%;height:auto}}</style></head>
             json.dumps(health),
             retain=True,
         )
-        if status in ("critical", "dead"):
-            log.warning("PIPELINE HEALTH: %s — token_age=%.0f min, api_failures=%d, recovery_attempts=%d",
-                        status, token_age_min or -1, self._consecutive_api_failures,
-                        self._recovery_attempts_since_success)
-        else:
-            log.debug("PIPELINE HEALTH: %s", status)
 
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop_safe(self):
@@ -8541,8 +8499,6 @@ img{{max-width:100%;height:auto}}</style></head>
                 if self._tokens_are_fresh():
                     no_token_count = 0
                     self._login_flow_active = None  # login succeeded
-                    self._recovery_attempts_since_success = 0
-                    self._consecutive_api_failures = 0
                     continue
 
                 # ── Check if login flow is active — don't kill it ──
@@ -8562,10 +8518,10 @@ img{{max-width:100%;height:auto}}</style></head>
 
                 # ── Step 2: force-restart the app + reattach Frida (~35s) ──
                 no_token_count += 1
-                self._recovery_attempts_since_success += 1
                 log.warning("No fresh tokens after wake — force-restarting "
                             "VW app + reattaching Frida (attempt %d)",
                             no_token_count)
+                self._recovery_attempts_since_success += 1
                 # Invalidate stale Frida session before killing the process.
                 # Do NOT call session.detach() — it fires _on_detached in a
                 # separate thread which starts a competing reattach loop.
@@ -8607,6 +8563,8 @@ img{{max-width:100%;height:auto}}</style></head>
                             "auto re-login (attempt %d)", no_token_count)
                 self._auto_relogin()
                 no_token_count = 0
+                self._recovery_attempts_since_success = 0
+                self._consecutive_api_failures = 0
                 time.sleep(15)
                 self._rehook_frida()
                 self._wake_app()
@@ -8637,13 +8595,15 @@ img{{max-width:100%;height:auto}}</style></head>
                     except HTTPError as e:
                         if e.code in (401, 403):
                             self._consecutive_api_failures += 1
-                            log.warning("Token validation failed (%d) — consecutive failures: %d — waking app for refresh",
+                            log.warning("Token validation failed (%d) — "
+                                        "consecutive failures: %d",
                                         e.code, self._consecutive_api_failures)
-                            self._rehook_frida()
-                            self._wake_app()
-                            # After 3+ consecutive failures, escalate to force-restart
                             if self._consecutive_api_failures >= 3:
-                                log.warning("Token validation: %d consecutive 401/403 — escalating to force-restart",
+                                # Escalate: 3+ consecutive auth failures →
+                                # force-restart the app
+                                log.warning("Token validation: %d consecutive "
+                                            "auth failures — escalating to "
+                                            "force-restart",
                                             self._consecutive_api_failures)
                                 self._recovery_attempts_since_success += 1
                                 self._keepalive_recovering = True
@@ -8653,6 +8613,9 @@ img{{max-width:100%;height:auto}}</style></head>
                                     self._wake_app_full_restart()
                                 finally:
                                     self._keepalive_recovering = False
+                            else:
+                                self._rehook_frida()
+                                self._wake_app()
                         else:
                             log.debug("Token validation: HTTP %d (non-auth, ignoring)", e.code)
                     except Exception:
@@ -8719,8 +8682,6 @@ img{{max-width:100%;height:auto}}</style></head>
 
             # Always publish current state
             self._publish_tokens()
-
-            # ── Publish comprehensive pipeline health ──
             self._publish_pipeline_health()
 
     # ── Main ────────────────────────────────────────────────────────
@@ -8780,6 +8741,9 @@ img{{max-width:100%;height:auto}}</style></head>
         log.info("    %s/pif_health         — PI status: healthy/degraded/cooldown (retained)", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/update_pif     — refresh Play Integrity fingerprint", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/wake_app       — force app refresh", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/force_recovery — HA auto-recovery trigger", MQTT_TOPIC_PREFIX)
+        log.info("    %s/pipeline_health    — overall pipeline status (retained)", MQTT_TOPIC_PREFIX)
+        log.info("    %s/recovery_result    — force_recovery outcome", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
         log.info("=" * 60)
 
