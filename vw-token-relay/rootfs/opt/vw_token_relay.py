@@ -2859,11 +2859,12 @@ img{{max-width:100%;height:auto}}</style></head>
                 time.sleep(1)
             time.sleep(2)
 
-            # ── VEHICLE VERIFICATION (v1.32 strategy) ──
+            # ── VEHICLE VERIFICATION (v1.52.2 strategy) ──
             # 1. Check if we're already on Atlas (lucky path)
-            # 2. If wrong vehicle, try options menu vehicle switcher
-            # 3. If that fails, try ForcedGarageActivity as fallback
-            # 4. Use ICE-specific verification (not just header text)
+            # 2. If wrong vehicle or unknown, use ForcedGarageActivity
+            #    (most reliable) as PRIMARY strategy
+            # 3. Fall back to swipes and menu switch if needed
+            # 4. Use ICE-specific verification even when header missing
             correct_vehicle = False
             wrong_vehicle_count = 0
 
@@ -2922,21 +2923,43 @@ img{{max-width:100%;height:auto}}</style></head>
                                 "(confidence=%s, attempt %d)",
                                 vv_name, confidence, vv_attempt)
 
-                    # ── VEHICLE SWITCH STRATEGIES ──
+                    # ── VEHICLE SWITCH STRATEGIES (v1.52.2) ──
 
-                    # Strategy A: Try options menu vehicle switcher
-                    # (unexplored — the three-dot menu may have a
-                    # vehicle picker that actually works)
-                    if vv_attempt == 0:
-                        log.info("UI_RST: Trying options menu vehicle "
-                                 "switch...")
-                        if self._switch_vehicle_via_menu():
-                            correct_vehicle = True
-                            break
+                    # Strategy A: ForcedGarageActivity — most reliable,
+                    # use it FIRST (was Strategy C in v1.32)
+                    if vv_attempt <= 1:
+                        log.info("UI_RST: Using ForcedGarageActivity "
+                                 "to switch vehicle (attempt %d)",
+                                 vv_attempt)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input keyevent BACK"],
+                            capture_output=True, timeout=10)
                         time.sleep(2)
+                        subprocess.run(
+                            ["adb", "shell", "am", "start", "-W", "-n",
+                             f"{VW_PACKAGE}/com.vw.myVW.activities."
+                             "ForcedGarageActivity"],
+                            capture_output=True, timeout=30, text=True)
+                        time.sleep(5)
+                        self._dismiss_system_dialogs()
+                        self._dismiss_vw_alert_dialogs()
+
+                        retry_xml = self._dump_ui_xml()
+                        if retry_xml:
+                            at_r = self._find_ui_elements(
+                                retry_xml, text="Atlas")
+                            if at_r:
+                                self._adb_tap(
+                                    at_r[0][0], at_r[0][1],
+                                    label="garage-Atlas-primary")
+                            else:
+                                self._adb_tap(540, 1229,
+                                              label="garage-Atlas-blind")
+                        time.sleep(12)
 
                     # Strategy B: Swipe left/right on vehicle header
-                    elif vv_attempt == 1:
+                    elif vv_attempt == 2:
                         log.info("UI_RST: Trying swipe-left to switch "
                                  "vehicle on dashboard")
                         subprocess.run(
@@ -2945,7 +2968,7 @@ img{{max-width:100%;height:auto}}</style></head>
                             capture_output=True, timeout=10)
                         time.sleep(5)
 
-                    elif vv_attempt == 2:
+                    elif vv_attempt == 3:
                         log.info("UI_RST: Trying swipe-right")
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
@@ -2953,9 +2976,9 @@ img{{max-width:100%;height:auto}}</style></head>
                             capture_output=True, timeout=10)
                         time.sleep(5)
 
-                    # Strategy C: ForcedGarageActivity as fallback
-                    elif vv_attempt >= 3:
-                        log.info("UI_RST: Falling back to "
+                    # Strategy C: More ForcedGarageActivity attempts
+                    elif vv_attempt >= 4:
+                        log.info("UI_RST: Re-trying "
                                  "ForcedGarageActivity (attempt %d)",
                                  vv_attempt)
                         subprocess.run(
@@ -2986,17 +3009,69 @@ img{{max-width:100%;height:auto}}</style></head>
                         time.sleep(12)
 
                 else:
-                    # No vehicleNameTextView — loading or transitioning
+                    # No vehicleNameTextView — toolbar may be collapsed
+                    # or dashboard still loading. Use ICE content check
+                    # to verify vehicle identity even without header.
                     home_tab = self._find_ui_elements(
                         vv_xml, resource_id="home_nav_graph")
                     fg_act = self._get_foreground_activity() or ""
 
                     if (home_tab or "MainActivity" in fg_act):
-                        log.info("UI_RST: On dashboard but vehicle name "
-                                 "not yet rendered — scrolling up to "
-                                 "expand toolbar (attempt %d)", vv_attempt)
-                        # The toolbar is likely collapsed — scroll up
-                        # to expand it and reveal vehicleNameTextView
+                        # We're on a dashboard — check ICE content
+                        is_atlas, confidence = (
+                            self._verify_atlas_dashboard(vv_xml))
+                        if is_atlas:
+                            log.info("UI_RST: Atlas dashboard VERIFIED "
+                                     "via ICE content (no header) — "
+                                     "confidence=%s (attempt %d)",
+                                     confidence, vv_attempt)
+                            correct_vehicle = True
+                            break
+
+                        if confidence == "ev_content_present":
+                            # Definitely on EV dashboard — switch NOW
+                            wrong_vehicle_count += 1
+                            log.warning("UI_RST: EV content detected "
+                                        "without header — WRONG VEHICLE "
+                                        "(attempt %d, confidence=%s)",
+                                        vv_attempt, confidence)
+                            # Use ForcedGarageActivity to switch
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input keyevent BACK"],
+                                capture_output=True, timeout=10)
+                            time.sleep(2)
+                            subprocess.run(
+                                ["adb", "shell", "am", "start", "-W",
+                                 "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW.activities."
+                                 "ForcedGarageActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
+                            time.sleep(5)
+                            self._dismiss_system_dialogs()
+                            self._dismiss_vw_alert_dialogs()
+                            retry_xml = self._dump_ui_xml()
+                            if retry_xml:
+                                at_r = self._find_ui_elements(
+                                    retry_xml, text="Atlas")
+                                if at_r:
+                                    self._adb_tap(
+                                        at_r[0][0], at_r[0][1],
+                                        label="garage-Atlas-ev-fix")
+                                else:
+                                    self._adb_tap(
+                                        540, 1229,
+                                        label="garage-Atlas-blind")
+                            time.sleep(12)
+                            continue
+
+                        # Inconclusive — try scrolling up to reveal
+                        # the header for a definitive check
+                        log.info("UI_RST: On dashboard but vehicle "
+                                 "identity inconclusive (%s) — "
+                                 "scrolling up to expand toolbar "
+                                 "(attempt %d)", confidence, vv_attempt)
                         for _sw in range(2):
                             subprocess.run(
                                 ["adb", "shell", "su", "-c",
@@ -3013,9 +3088,33 @@ img{{max-width:100%;height:auto}}</style></head>
                         time.sleep(8)
 
             if not correct_vehicle and wrong_vehicle_count == 0:
-                log.warning("UI_RST: Vehicle name never appeared in "
-                            "%d checks — proceeding anyway "
-                            "(dashboard may still be loading)", 8)
+                # v1.52.2: Do one final ICE content check before
+                # proceeding — don't silently proceed on wrong vehicle
+                final_xml = self._dump_ui_xml()
+                if final_xml:
+                    is_atlas, confidence = (
+                        self._verify_atlas_dashboard(final_xml))
+                    if is_atlas:
+                        log.info("UI_RST: Final check — Atlas VERIFIED "
+                                 "via ICE content (confidence=%s)",
+                                 confidence)
+                        correct_vehicle = True
+                    elif confidence == "ev_content_present":
+                        log.error("UI_RST: Final check — EV content "
+                                  "detected! WRONG VEHICLE — aborting")
+                        return {"status": "error",
+                                "message": "EV dashboard detected "
+                                           "(expected Atlas ICE)"}
+                    else:
+                        log.warning("UI_RST: Vehicle name never "
+                                    "appeared in %d checks and ICE "
+                                    "content inconclusive (%s) — "
+                                    "proceeding cautiously", 8,
+                                    confidence)
+                else:
+                    log.warning("UI_RST: Vehicle name never appeared "
+                                "in %d checks, no XML for final check "
+                                "— proceeding cautiously", 8)
             elif not correct_vehicle:
                 log.error("UI_RST: Wrong vehicle dashboard loaded "
                           "%d times — aborting", wrong_vehicle_count)
@@ -3023,76 +3122,159 @@ img{{max-width:100%;height:auto}}</style></head>
                         "message": "Wrong vehicle dashboard loaded "
                                    "(expected Atlas)"}
 
-            # ── BLIND TAP AT KNOWN BUTTON POSITION ──
-            # Even a UI dump (uiautomator) can cause the toolbar to
-            # collapse, so skip all XML checks and directly tap the
-            # known button position. The remoteStartButton is at
-            # [35,833][685,945] center=(360,889) when the toolbar is
-            # expanded. If the button is there and enabled, this tap
-            # opens the bottom sheet. If not, the tap harmlessly hits
-            # the dashboard background and we detect it below.
+            # ── XML-BASED BUTTON SEARCH + BLIND TAP FALLBACK ──
+            # v1.52.2: Try XML-based search for remoteStartButton FIRST
+            # to get actual coordinates. Only fall back to blind tap at
+            # hardcoded position if XML search fails.
             imm_btn_clicked = False
             blind_xml = None
             BLIND_BTN_X, BLIND_BTN_Y = 360, 889
 
-            # Try blind tap up to 3 times with scroll-up between
-            for blind_attempt in range(3):
-                log.info("UI_RST: BLIND TAP attempt %d/3 at (%d,%d)",
-                         blind_attempt + 1, BLIND_BTN_X, BLIND_BTN_Y)
-                subprocess.run(
-                    ["adb", "shell", "su", "-c",
-                     f"input tap {BLIND_BTN_X} {BLIND_BTN_Y}"],
-                    capture_output=True, timeout=10)
-                time.sleep(5)
-
-                # Check if the blind tap worked
-                blind_xml = self._dump_ui_xml()
-                if blind_xml:
-                    bs_start_raw = self._find_ui_elements(
-                        blind_xml, text="Start")
-                    # Filter out "Start charging" false positives — only
-                    # accept exact "Start" text (the remote-start bottom
-                    # sheet button), not substring matches like
-                    # "Start charging" on the Buzz EV dashboard.
-                    bs_start = [
-                        e for e in bs_start_raw
-                        if e[3].get("text", "").strip().lower() == "start"
-                    ]
-                    bs_stop_btn = self._find_ui_elements(
-                        blind_xml, resource_id="stopEngineButton")
-                    bs_any = (bs_start or bs_stop_btn or
-                              self._find_ui_elements(
-                                  blind_xml, text="Enter your") or
-                              self._find_ui_elements(
-                                  blind_xml, resource_id="spinEditText"))
-                    if bs_any:
-                        log.info("UI_RST: BLIND TAP opened bottom sheet! "
-                                 "(attempt %d)", blind_attempt + 1)
-                        imm_btn_clicked = True
-                        break
-
-                    # Check if Chrome opened (disabled button)
-                    blind_fg = self._get_foreground_activity()
-                    if blind_fg and "chrome" in blind_fg.lower():
-                        log.info("UI_RST: BLIND TAP hit disabled button "
-                                 "(Chrome opened). Going back.")
+            # First: try XML-based button search (3 attempts)
+            for xml_attempt in range(3):
+                # Scroll up to expand toolbar first
+                if xml_attempt > 0:
+                    log.info("UI_RST: Scrolling up to expand toolbar "
+                             "before XML search retry...")
+                    for _sw in range(2):
                         subprocess.run(
                             ["adb", "shell", "su", "-c",
-                             "input keyevent BACK"],
+                             "input swipe 540 400 540 1200 400"],
                             capture_output=True, timeout=10)
-                        time.sleep(2)
-                        # Don't retry — button is disabled
-                        break
+                        time.sleep(1)
+                    time.sleep(3)
 
-                if blind_attempt < 2 and not imm_btn_clicked:
-                    # Scroll up to re-expand the toolbar before retry
-                    log.info("UI_RST: Scrolling up to re-expand toolbar "
-                             "before blind tap retry...")
+                pre_xml = self._dump_ui_xml()
+                if not pre_xml:
+                    time.sleep(2)
+                    continue
+
+                # Search for remoteStartButton by resource ID
+                rst_btn = self._find_ui_elements(
+                    pre_xml, resource_id="remoteStartButton")
+                if rst_btn:
+                    btn_x, btn_y = rst_btn[0][0], rst_btn[0][1]
+                    btn_enabled = rst_btn[0][3].get("enabled", "")
+                    btn_bounds = rst_btn[0][3].get("bounds", "")
+                    log.info("UI_RST: XML SEARCH found "
+                             "remoteStartButton at (%d,%d) "
+                             "enabled=%s bounds=%s (attempt %d)",
+                             btn_x, btn_y, btn_enabled, btn_bounds,
+                             xml_attempt)
+                    if btn_enabled == "true":
+                        self._adb_tap(btn_x, btn_y,
+                                      label="rst-xml-found")
+                        time.sleep(5)
+                        # Verify bottom sheet opened
+                        verify_xml = self._dump_ui_xml()
+                        if verify_xml:
+                            bs_check = (
+                                self._find_ui_elements(
+                                    verify_xml, text="Start") or
+                                self._find_ui_elements(
+                                    verify_xml,
+                                    resource_id="stopEngineButton") or
+                                self._find_ui_elements(
+                                    verify_xml, text="Enter your") or
+                                self._find_ui_elements(
+                                    verify_xml,
+                                    resource_id="spinEditText"))
+                            if bs_check:
+                                log.info("UI_RST: XML-found button "
+                                         "opened bottom sheet!")
+                                imm_btn_clicked = True
+                                blind_xml = verify_xml
+                                break
+                        # Also update blind tap coordinates from
+                        # actual button position for future use
+                        BLIND_BTN_X, BLIND_BTN_Y = btn_x, btn_y
+                        log.info("UI_RST: Updated blind tap coords "
+                                 "to (%d,%d) from XML", btn_x, btn_y)
+                    else:
+                        log.info("UI_RST: remoteStartButton found "
+                                 "but DISABLED — may need to wait")
+                        # Update coordinates anyway
+                        BLIND_BTN_X, BLIND_BTN_Y = btn_x, btn_y
+                    break  # Found button, stop XML search
+
+                # Also try "Remote start" text search
+                rst_text = self._find_ui_elements(
+                    pre_xml, text="Remote start")
+                if rst_text:
+                    txt_x, txt_y = rst_text[0][0], rst_text[0][1]
+                    log.info("UI_RST: XML SEARCH found 'Remote start' "
+                             "text at (%d,%d) (attempt %d)",
+                             txt_x, txt_y, xml_attempt)
+                    BLIND_BTN_X, BLIND_BTN_Y = txt_x, txt_y
+                    break  # Found text, stop XML search
+
+                log.info("UI_RST: XML search — no remoteStartButton "
+                         "or 'Remote start' text (attempt %d)",
+                         xml_attempt)
+                time.sleep(2)
+
+            # Second: blind tap (using XML-updated or hardcoded coords)
+            if not imm_btn_clicked:
+                for blind_attempt in range(3):
+                    log.info("UI_RST: BLIND TAP attempt %d/3 at "
+                             "(%d,%d)%s",
+                             blind_attempt + 1, BLIND_BTN_X,
+                             BLIND_BTN_Y,
+                             " (XML-updated)" if (BLIND_BTN_X != 360
+                             or BLIND_BTN_Y != 889) else "")
                     subprocess.run(
                         ["adb", "shell", "su", "-c",
-                         "input swipe 360 400 360 900 300"],
+                         f"input tap {BLIND_BTN_X} {BLIND_BTN_Y}"],
                         capture_output=True, timeout=10)
-                    time.sleep(3)
+                    time.sleep(5)
+
+                    # Check if the blind tap worked
+                    blind_xml = self._dump_ui_xml()
+                    if blind_xml:
+                        bs_start_raw = self._find_ui_elements(
+                            blind_xml, text="Start")
+                        # Filter out "Start charging" false positives
+                        bs_start = [
+                            e for e in bs_start_raw
+                            if (e[3].get("text", "").strip().lower()
+                                == "start")
+                        ]
+                        bs_stop_btn = self._find_ui_elements(
+                            blind_xml, resource_id="stopEngineButton")
+                        bs_any = (bs_start or bs_stop_btn or
+                                  self._find_ui_elements(
+                                      blind_xml, text="Enter your") or
+                                  self._find_ui_elements(
+                                      blind_xml,
+                                      resource_id="spinEditText"))
+                        if bs_any:
+                            log.info("UI_RST: BLIND TAP opened bottom "
+                                     "sheet! (attempt %d)",
+                                     blind_attempt + 1)
+                            imm_btn_clicked = True
+                            break
+
+                        # Check if Chrome opened (disabled button)
+                        blind_fg = self._get_foreground_activity()
+                        if blind_fg and "chrome" in blind_fg.lower():
+                            log.info("UI_RST: BLIND TAP hit disabled "
+                                     "button (Chrome opened). Going "
+                                     "back.")
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input keyevent BACK"],
+                                capture_output=True, timeout=10)
+                            time.sleep(2)
+                            break
+
+                    if blind_attempt < 2 and not imm_btn_clicked:
+                        log.info("UI_RST: Scrolling up to re-expand "
+                                 "toolbar before blind tap retry...")
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input swipe 360 400 360 900 300"],
+                            capture_output=True, timeout=10)
+                        time.sleep(3)
 
             if not imm_btn_clicked:
                 log.info("UI_RST: BLIND TAP did not open "
@@ -3217,17 +3399,46 @@ img{{max-width:100%;height:auto}}</style></head>
                     time.sleep(8)
                     self._dismiss_system_dialogs()
                     self._dismiss_vw_alert_dialogs()
-                    # Try options menu vehicle switch first
-                    if not self._switch_vehicle_via_menu():
-                        log.info("UI_RST: Menu switch failed in "
-                                 "re-nav — checking dashboard")
+                    # v1.52.2: Check dashboard and use
+                    # ForcedGarageActivity if wrong vehicle
                     xml2 = self._dump_ui_xml()
                     if xml2:
                         is_atlas, conf = self._verify_atlas_dashboard(
                             xml2)
                         if not is_atlas:
                             log.warning("UI_RST: Re-nav still on "
-                                        "wrong vehicle (%s)", conf)
+                                        "wrong vehicle (%s) — "
+                                        "trying ForcedGarageActivity",
+                                        conf)
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input keyevent BACK"],
+                                capture_output=True, timeout=10)
+                            time.sleep(2)
+                            subprocess.run(
+                                ["adb", "shell", "am", "start",
+                                 "-W", "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW."
+                                 "activities."
+                                 "ForcedGarageActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
+                            time.sleep(5)
+                            self._dismiss_system_dialogs()
+                            self._dismiss_vw_alert_dialogs()
+                            retry_xml = self._dump_ui_xml()
+                            if retry_xml:
+                                at_r = self._find_ui_elements(
+                                    retry_xml, text="Atlas")
+                                if at_r:
+                                    self._adb_tap(
+                                        at_r[0][0], at_r[0][1],
+                                        label="garage-Atlas-renav")
+                                else:
+                                    self._adb_tap(
+                                        540, 1229,
+                                        label="garage-Atlas-blind")
+                            time.sleep(12)
                     self._wake_screen()
                     self._dismiss_system_dialogs()
 
@@ -3276,65 +3487,57 @@ img{{max-width:100%;height:auto}}</style></head>
                                 time.sleep(3)
                     else:
                         # Verify correct vehicle (not ID. Buzz)
+                        # v1.52.2: Use ICE content check too
+                        is_atlas_sc, conf_sc = (
+                            self._verify_atlas_dashboard(
+                                dash_check_xml))
                         vn_check = self._find_ui_elements(
                             dash_check_xml,
                             resource_id="vehicleNameTextView")
-                        if (vn_check and
-                                "atlas" not in vn_check[0][3].get(
-                                    "text", "").lower()):
-                            wrong_name = vn_check[0][3].get("text", "")
+                        if not is_atlas_sc and (
+                                conf_sc == "ev_content_present" or
+                                (vn_check and "atlas" not in
+                                 vn_check[0][3].get(
+                                     "text", "").lower())):
+                            wrong_name = (
+                                vn_check[0][3].get("text", "?")
+                                if vn_check else f"(no header, "
+                                f"{conf_sc})")
                             log.warning("UI_RST: On wrong vehicle '%s'"
                                         " dashboard (attempt %d) — "
-                                        "trying vehicle switch",
+                                        "using ForcedGarageActivity",
                                         wrong_name, attempt)
-                            # Try swiping to switch vehicles on
-                            # the dashboard
+                            # v1.52.2: Use ForcedGarageActivity
+                            # (most reliable) instead of swipes/menu
                             subprocess.run(
                                 ["adb", "shell", "su", "-c",
-                                 "input swipe 900 550 100 550 400"],
+                                 "input keyevent BACK"],
                                 capture_output=True, timeout=10)
+                            time.sleep(2)
+                            subprocess.run(
+                                ["adb", "shell", "am", "start",
+                                 "-W", "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW."
+                                 "activities."
+                                 "ForcedGarageActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
                             time.sleep(5)
-                            sw_xml = self._dump_ui_xml()
-                            switched = False
-                            if sw_xml:
-                                sw_vn = self._find_ui_elements(
-                                    sw_xml,
-                                    resource_id="vehicleNameTextView")
-                                if (sw_vn and "atlas" in
-                                        sw_vn[0][3].get(
-                                            "text", "").lower()):
-                                    log.info("UI_RST: Swipe switched "
-                                             "to Atlas!")
-                                    switched = True
-                            if not switched:
-                                # Swipe right
-                                subprocess.run(
-                                    ["adb", "shell", "su", "-c",
-                                     "input swipe 100 550 900 550 "
-                                     "400"],
-                                    capture_output=True, timeout=10)
-                                time.sleep(5)
-                            if not switched:
-                                # Try options menu vehicle switch
-                                log.info("UI_RST: Trying options menu "
-                                         "vehicle switch (sanity)")
-                                if self._switch_vehicle_via_menu():
-                                    log.info("UI_RST: Menu switch "
-                                             "succeeded in sanity check")
+                            self._dismiss_system_dialogs()
+                            self._dismiss_vw_alert_dialogs()
+                            retry_xml = self._dump_ui_xml()
+                            if retry_xml:
+                                at_r = self._find_ui_elements(
+                                    retry_xml, text="Atlas")
+                                if at_r:
+                                    self._adb_tap(
+                                        at_r[0][0], at_r[0][1],
+                                        label="garage-Atlas-sanity")
                                 else:
-                                    log.warning("UI_RST: Menu switch "
-                                                "failed — trying "
-                                                "MainActivity restart")
-                                    subprocess.run(
-                                        ["adb", "shell", "am", "start",
-                                         "-W", "-n",
-                                         f"{VW_PACKAGE}/com.vw.myVW.activities.MainActivity"],
-                                        capture_output=True, timeout=30,
-                                        text=True)
-                                    time.sleep(8)
-                                    self._dismiss_system_dialogs()
-                                    self._dismiss_vw_alert_dialogs()
-                                time.sleep(5)
+                                    self._adb_tap(
+                                        540, 1229,
+                                        label="garage-Atlas-blind")
+                            time.sleep(12)
 
                 # CRITICAL: Check for the button BEFORE any UI interaction
                 # (interstitial/dialog dismissals, scrolling) which can
@@ -5827,12 +6030,22 @@ img{{max-width:100%;height:auto}}</style></head>
                 return False
 
             # Look for vehicle-related menu items
-            for kw in ["vehicle", "switch", "garage", "change vehicle",
-                        "select vehicle", "atlas", "car"]:
+            # v1.52.2: Skip known bad matches like "View vehicle
+            # information" which goes to an info page, not a picker
+            skip_texts = {"view vehicle information",
+                          "vehicle information"}
+            for kw in ["switch vehicle", "change vehicle",
+                        "select vehicle", "garage", "atlas",
+                        "vehicle", "switch", "car"]:
                 hits = self._find_ui_elements(menu_xml, text=kw)
                 if hits:
                     hx, hy = hits[0][0], hits[0][1]
                     hit_text = hits[0][3].get("text", "")
+                    # Skip known bad matches
+                    if hit_text.strip().lower() in skip_texts:
+                        log.info("MENU_SWITCH: Skipping '%s' "
+                                 "(not a vehicle picker)", hit_text)
+                        continue
                     log.info("MENU_SWITCH: Found '%s' at (%d,%d) — tapping",
                              hit_text, hx, hy)
                     self._adb_tap(hx, hy, label=f"MENU_SWITCH-{kw}")
