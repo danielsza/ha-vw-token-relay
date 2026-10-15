@@ -791,6 +791,9 @@ class VWTokenRelay:
                 results = {}
                 cmds = {
                     "fingerprint": "getprop ro.build.fingerprint",
+                    "vendor_fingerprint": "getprop ro.vendor.build.fingerprint",
+                    "bootimage_fingerprint": "getprop ro.bootimage.build.fingerprint",
+                    "screen_size": "wm size",
                     "security_patch": "getprop ro.build.version.security_patch",
                     "abilist": "getprop ro.product.cpu.abilist",
                     "abi": "getprop ro.product.cpu.abi",
@@ -823,6 +826,116 @@ class VWTokenRelay:
                     f"{MQTT_TOPIC_PREFIX}/phone_diag",
                     json.dumps(results))
             threading.Thread(target=_run_diag, daemon=True).start()
+        elif cmd == "adb_shell":
+            # Run arbitrary ADB shell command and publish result to vw/adb_result
+            # Payload = the command to run (via su -c)
+            def _run_adb_shell(cmd_str):
+                try:
+                    r = subprocess.run(
+                        ["adb", "shell", "su", "-c", cmd_str],
+                        capture_output=True, text=True, timeout=30)
+                    result = {"cmd": cmd_str, "stdout": r.stdout.strip()[:4000],
+                              "stderr": r.stderr.strip()[:2000], "rc": r.returncode}
+                except Exception as e:
+                    result = {"cmd": cmd_str, "error": str(e)}
+                log.info("ADB_SHELL: %s -> %s", cmd_str[:80], json.dumps(result)[:500])
+                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/adb_result",
+                    json.dumps(result), retain=False)
+            if payload.strip():
+                threading.Thread(target=_run_adb_shell, args=(payload.strip(),),
+                                 daemon=True).start()
+        elif cmd == "set_pif":
+            # Write a fingerprint to pif.prop and restart DroidGuard.
+            # Payload = the full fingerprint string
+            # e.g. "motorola/lamu_g/lamu:15/VVTA35.51-137/7eabca:user/release-keys"
+            def _set_pif(fp):
+                try:
+                    # Parse fingerprint into pif.prop fields
+                    # Format: brand/product/device:release/id/incremental:type/tags
+                    parts = fp.split("/")
+                    brand = parts[0]
+                    product = parts[1]
+                    rest = "/".join(parts[2:])  # device:release/id/incremental:type/tags
+                    device_rest = rest.split(":")
+                    device = device_rest[0]
+                    release = device_rest[1].split("/")[0] if len(device_rest) > 1 else ""
+                    build_id = device_rest[1].split("/")[1] if len(device_rest) > 1 and "/" in device_rest[1] else ""
+                    incremental = ""
+                    build_type = "user"
+                    tags = "release-keys"
+                    if len(device_rest) > 2:
+                        type_tags = device_rest[2]
+                        if "/" in type_tags:
+                            build_type = type_tags.split("/")[0]
+                            tags = type_tags.split("/")[1]
+                        else:
+                            tags = type_tags
+                    # Extract incremental from id field
+                    id_parts = device_rest[1].split("/") if len(device_rest) > 1 else []
+                    if len(id_parts) >= 3:
+                        build_id = id_parts[1]
+                        incremental = id_parts[2]
+                    elif len(id_parts) >= 2:
+                        build_id = id_parts[1]
+
+                    pif_path = "/data/adb/modules/playintegrityfix/pif.prop"
+
+                    # Remove any pif.json that might override pif.prop
+                    subprocess.run(["adb", "shell", "su", "-c",
+                        "rm -f /data/adb/pif.json /data/adb/modules/playintegrityfix/pif.json "
+                        "/data/adb/modules/playintegrityfix/custom.pif.json"],
+                        capture_output=True, timeout=10)
+
+                    # Build pif.prop lines
+                    lines = [
+                        f"# Stock device fingerprint - restored by set_pif command",
+                        f"# {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"PRODUCT={product}",
+                        f"DEVICE={device}",
+                        f"MANUFACTURER={brand}",
+                        f"BRAND={brand}",
+                        f"MODEL={device}",
+                        f"FINGERPRINT={fp}",
+                        f"SECURITY_PATCH=",
+                        f"FIRST_API_LEVEL=",
+                    ]
+                    # Write line-by-line via ADB to avoid shell escaping issues
+                    subprocess.run(["adb", "shell", "su", "-c",
+                        f"echo '{lines[0]}' > {pif_path}"],
+                        capture_output=True, timeout=10)
+                    for line in lines[1:]:
+                        subprocess.run(["adb", "shell", "su", "-c",
+                            f"echo '{line}' >> {pif_path}"],
+                            capture_output=True, timeout=10)
+                    log.info("SET_PIF: wrote %d lines to %s", len(lines), pif_path)
+
+                    # Verify it was written
+                    r2 = subprocess.run(["adb", "shell", "su", "-c", f"cat {pif_path}"],
+                        capture_output=True, text=True, timeout=10)
+                    log.info("SET_PIF: verify: %s", r2.stdout.strip()[:500])
+
+                    # Kill DroidGuard/GMS to force re-read
+                    subprocess.run(["adb", "shell", "su", "-c",
+                        "killall com.google.android.gms com.google.android.gms.unstable "
+                        "com.google.process.gservices 2>/dev/null"],
+                        capture_output=True, timeout=10)
+                    log.info("SET_PIF: killed GMS processes")
+
+                    result = {"status": "ok", "fingerprint": fp,
+                              "written_to": pif_path, "verify": r2.stdout.strip()[:1000]}
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/set_pif_result",
+                        json.dumps(result), retain=False)
+                except Exception as e:
+                    log.error("SET_PIF: Failed: %s", e)
+                    self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/set_pif_result",
+                        json.dumps({"status": "error", "error": str(e)}), retain=False)
+
+            if payload.strip():
+                log.info("SET_PIF: Setting fingerprint to: %s", payload.strip())
+                threading.Thread(target=_set_pif, args=(payload.strip(),),
+                                 daemon=True).start()
+            else:
+                log.warning("SET_PIF: No fingerprint in payload")
         elif cmd == "launch_app":
             # Launch any app by package name (payload = package name)
             pkg = payload.strip()

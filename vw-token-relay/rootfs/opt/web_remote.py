@@ -85,10 +85,10 @@ def take_screenshot():
 
 
 def adb_input(cmd):
-    """Run an ADB input command."""
+    """Run an ADB input command (via su for rooted devices)."""
     try:
         subprocess.run(
-            ['adb', 'shell', cmd],
+            ['adb', 'shell', 'su', '-c', cmd],
             capture_output=True, timeout=5)
     except Exception as e:
         print(f"WebRemote: input error: {e}", file=sys.stderr)
@@ -232,12 +232,16 @@ let phoneW = 720, phoneH = 1600;
 let pointerDown = false, startX = 0, startY = 0, startTime = 0;
 
 // Coordinate mapping: image pixel → phone pixel
+// Uses actual screenshot dimensions (naturalWidth/Height) instead of
+// hardcoded values — works regardless of device resolution.
 function imgToPhone(clientX, clientY) {
     const rect = img.getBoundingClientRect();
     const imgX = clientX - rect.left;
     const imgY = clientY - rect.top;
-    const scaleX = phoneW / rect.width;
-    const scaleY = phoneH / rect.height;
+    const natW = img.naturalWidth || phoneW;
+    const natH = img.naturalHeight || phoneH;
+    const scaleX = natW / rect.width;
+    const scaleY = natH / rect.height;
     return [Math.round(imgX * scaleX), Math.round(imgY * scaleY)];
 }
 
