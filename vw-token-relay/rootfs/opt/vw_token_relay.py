@@ -488,8 +488,6 @@ rpc.exports = {
 
 # Path to compiled Frida agent (bundled frida-java-bridge for Frida 17+)
 COMPILED_AGENT_PATH = "/opt/compiled_agent.js"
-
-
 class VWTokenRelay:
     def __init__(self, mqtt_host, mqtt_port=1883, mqtt_user=None, mqtt_pass=None,
                  vw_email=None, vw_password=None, vw_spin=None,
@@ -4939,7 +4937,7 @@ img{{max-width:100%;height:auto}}</style></head>
         # Swipe up to unlock — coords for 720x1600 Moto G Pure
         try:
             subprocess.run(
-                ["adb", "shell", "su", "-c", "input swipe 360 1200 360 400 300"],
+                ["adb", "shell", "su", "-c", "input swipe 540 1800 540 600 300"],
                 capture_output=True, timeout=10,
             )
             time.sleep(1)
@@ -7529,7 +7527,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     _tap(cx, cy, f"account {self.google_email}")
                 else:
                     log.warning("GOOGLE_REFRESH: account row not found — scrolling")
-                    _adb_cmd("input swipe 360 1200 360 500 300")
+                    _adb_cmd("input swipe 540 1800 540 750 300")
                     time.sleep(1)
                     xml = self._dump_ui_xml()
                     elems = self._find_ui_elements(xml, text=self.google_email)
@@ -7538,7 +7536,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         cx, cy, _, _ = elems[-1]
                         _tap(cx, cy, f"account {self.google_email} (after scroll)")
                     else:
-                        _tap(326, 1005, "account row (fallback)")
+                        _tap(490, 1508, "account row (fallback 1080x2400)")
                 time.sleep(2)
 
                 # Find and tap "Remove account" button
@@ -7549,7 +7547,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     _tap(cx, cy, "Remove account button")
                 else:
                     log.warning("GOOGLE_REFRESH: 'Remove account' not found, scrolling down")
-                    _adb_cmd("input swipe 360 1200 360 400 300")
+                    _adb_cmd("input swipe 540 1800 540 600 300")
                     time.sleep(1)
                     xml = self._dump_ui_xml()
                     elems = self._find_ui_elements(xml, text="Remove account")
@@ -7605,26 +7603,40 @@ img{{max-width:100%;height:auto}}</style></head>
                 cx, cy, _, _ = elems[0]
                 _tap(cx, cy, "Google account type")
             else:
-                _tap(180, 485, "Google account type (fallback)")
+                _tap(280, 485, "Google account type (fallback 1080x2400)")
             time.sleep(5)
 
-            # Wait for email field to appear (Google sign-in WebView)
+            # Wait for email field to appear (Google sign-in)
+            email_field_coords = None
             for attempt in range(6):
                 xml = self._dump_ui_xml()
-                # Look for email input or "Sign in" / "Email or phone" text
+                # Look for the email EditText by resource-id first
+                elems = self._find_ui_elements(xml, resource_id="identifierId")
+                if elems:
+                    email_field_coords = (elems[0][0], elems[0][1])
+                    log.info("GOOGLE_REFRESH: Email field found at (%d,%d) attempt %d",
+                             elems[0][0], elems[0][1], attempt)
+                    break
+                # Also check for sign-in page presence
                 elems = self._find_ui_elements(xml, text="Email or phone")
-                if not elems:
-                    elems = self._find_ui_elements(xml, resource_id="identifierId")
                 if not elems:
                     elems = self._find_ui_elements(xml, text="Sign in")
                 if elems:
                     log.info("GOOGLE_REFRESH: Sign-in page detected (attempt %d)", attempt)
+                    # Try one more time to find the email field
+                    elems2 = self._find_ui_elements(xml, resource_id="identifierId")
+                    if elems2:
+                        email_field_coords = (elems2[0][0], elems2[0][1])
                     break
                 log.info("GOOGLE_REFRESH: Waiting for sign-in page (attempt %d)...", attempt)
                 time.sleep(3)
 
-            # Tap the email field area and type email
-            _tap(350, 553, "email field")
+            # Tap the email field — use detected coords or fallback for 1080x2400
+            if email_field_coords:
+                _tap(email_field_coords[0], email_field_coords[1], "email field (detected)")
+            else:
+                _tap(540, 852, "email field (fallback 1080x2400)")
+
             time.sleep(1)
 
             # Type email and immediately press Enter (avoids autocomplete mangling)
@@ -7636,19 +7648,31 @@ img{{max-width:100%;height:auto}}</style></head>
             time.sleep(8)
 
             # Wait for password field
-            for attempt in range(4):
+            pw_field_coords = None
+            for attempt in range(6):
                 xml = self._dump_ui_xml()
-                elems = self._find_ui_elements(xml, text="Enter your password")
-                if not elems:
-                    elems = self._find_ui_elements(xml, resource_id="password")
+                elems = self._find_ui_elements(xml, resource_id="password")
                 if elems:
-                    log.info("GOOGLE_REFRESH: Password page detected")
+                    pw_field_coords = (elems[0][0], elems[0][1])
+                    log.info("GOOGLE_REFRESH: Password field found at (%d,%d)", elems[0][0], elems[0][1])
+                    break
+                elems = self._find_ui_elements(xml, text="Enter your password")
+                if elems:
+                    log.info("GOOGLE_REFRESH: Password page detected (attempt %d)", attempt)
+                    # Try to find the actual input field
+                    elems2 = self._find_ui_elements(xml, resource_id="password")
+                    if not elems2:
+                        elems2 = self._find_ui_elements(xml, resource_id="passwordInput")
+                    if elems2:
+                        pw_field_coords = (elems2[0][0], elems2[0][1])
                     break
                 time.sleep(3)
 
-            # Tap password field and type password
-            _tap(350, 460, "password field")
-            time.sleep(1)
+            # Tap the password field — use detected coords or fallback for 1080x2400
+            if pw_field_coords:
+                _tap(pw_field_coords[0], pw_field_coords[1], "password field (detected)")
+            else:
+                _tap(540, 852, "password field (fallback 1080x2400)")
 
             # Type password — NO trailing dot fix for password fields
             _adb_cmd(f"input text {self.google_password}")
@@ -7820,7 +7844,7 @@ img{{max-width:100%;height:auto}}</style></head>
             cx, cy, _, _ = elems[0]
             _tap(cx, cy, "2FA code field")
         else:
-            _tap(360, 500, "2FA code field (fallback)")
+            _tap(540, 750, "2FA code field (fallback 1080x2400)")
         time.sleep(1)
         _adb_cmd(f"input text {code}")
         time.sleep(0.5)
@@ -8463,8 +8487,6 @@ img{{max-width:100%;height:auto}}</style></head>
         time.sleep(5)
         log.info("Process resumed — hooks should be installing...")
         return True
-
-
     def _rehook_frida(self):
         """Call the agent's rehook() RPC and return diagnostic data.
 
@@ -9181,8 +9203,6 @@ img{{max-width:100%;height:auto}}</style></head>
         if self.mqttc:
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/status", "offline", retain=True)
             self.mqttc.disconnect()
-
-
 def main():
     p = argparse.ArgumentParser(description="VW myVW Token Relay")
     p.add_argument("--mqtt-host", required=True, help="MQTT broker IP (e.g. your HA IP)")
@@ -9212,8 +9232,6 @@ def main():
         google_email=args.google_email,
         google_password=args.google_password,
     ).run()
-
-
 if __name__ == "__main__":
     try:
         main()
