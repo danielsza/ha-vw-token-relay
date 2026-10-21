@@ -8791,14 +8791,22 @@ img{{max-width:100%;height:auto}}</style></head>
             return False
 
     def _tokens_are_fresh(self):
-        """Return True if at least one token is valid for >5 min."""
+        """Return True if ALL known tokens are valid for >5 min.
+
+        Changed from 'any token fresh' to 'all tokens fresh' so the keepalive
+        properly escalates recovery when one token (e.g. global) has expired
+        even if another (e.g. a vehicle token) is still valid.
+        """
         with self._lock:
+            if not self.tokens and not self.global_expiry:
+                return False  # no tokens at all
+            now = datetime.now()
             for vid, t in self.tokens.items():
-                if datetime.now() < t["expiry"] - timedelta(minutes=5):
-                    return True
-            if self.global_expiry and datetime.now() < self.global_expiry - timedelta(minutes=5):
-                return True
-        return False
+                if now >= t["expiry"] - timedelta(minutes=5):
+                    return False  # this token is expiring/expired
+            if self.global_expiry and now >= self.global_expiry - timedelta(minutes=5):
+                return False  # global token is expiring/expired
+        return True
 
     # ── Pipeline health (for HA auto-recovery automation) ──────────
     def _publish_pipeline_health(self):
