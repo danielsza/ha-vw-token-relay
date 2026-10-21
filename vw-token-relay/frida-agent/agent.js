@@ -337,8 +337,11 @@ function installNativeHooks() {
                 if (!conn.headersParsed) return;
             }
 
-            // For gzip responses: store raw body bytes for proper decompression
-            if (conn.headersParsed && conn.isGzip) {
+            // Store raw byte chunks for potential gzip decompression.
+            // Before headers are parsed, we must store all chunks because we
+            // do not yet know if the response is gzip. After headers, only
+            // store if isGzip to save memory on non-gzip responses.
+            if (!conn.headersParsed || conn.isGzip) {
                 if (!conn.rawBodyChunks) conn.rawBodyChunks = [];
                 try {
                     var rawCopy = Memory.alloc(bytesRead);
@@ -368,6 +371,11 @@ function installNativeHooks() {
                 // Transfer-Encoding / Content-Encoding
                 conn.isChunked = /\r\nTransfer-Encoding:\s*chunked/i.test(hdrStr);
                 conn.isGzip = /\r\nContent-Encoding:\s*gzip/i.test(hdrStr);
+            }
+
+            // Free raw chunks for non-gzip responses (save memory)
+            if (conn.headersParsed && !conn.isGzip && conn.rawBodyChunks) {
+                conn.rawBodyChunks = null;
             }
 
             // Check if response body is complete
