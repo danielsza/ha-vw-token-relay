@@ -32,7 +32,7 @@ RUN cd /tmp/frida-agent \
     && rm -rf /tmp/frida-agent
 
 # Force layer invalidation — change this string to bust Docker cache
-RUN echo "force-rebuild-20261021d-v1.53.4-url-token-extraction" > /tmp/.build_marker
+RUN echo "force-rebuild-20261021e-v1.53.5-ssl-active-fix" > /tmp/.build_marker
 
 # Copy relay script and entrypoint
 COPY rootfs /

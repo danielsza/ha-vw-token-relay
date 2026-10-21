@@ -8745,12 +8745,11 @@ img{{max-width:100%;height:auto}}</style></head>
     def _frida_hooks_have_ssl_activity(self):
         """Check if Frida hooks are showing SSL activity since last check.
 
-        Returns True if SSL_write/SSL_read calls have increased, indicating
-        hooks are alive even if no OIDC token traffic was captured.
-        Returns None if no diagnostic data available (old agent version).
+        Returns True if SSL_write/SSL_read calls have increased (or if
+        establishing baseline after recovery — optimistic).
+        Returns False if Frida script is gone.
+        Returns None if script exists but getStats() fails (silent detach).
         """
-        if self._prev_frida_diag is None:
-            return None
         if self.script is None:
             return False
         try:
@@ -8758,6 +8757,16 @@ img{{max-width:100%;height:auto}}</style></head>
             import json as _json
             result = _json.loads(raw)
             diag = result.get('diag', {})
+
+            if self._prev_frida_diag is None:
+                # First check after recovery — establish baseline.
+                # Return True (optimistic) so keepalive uses threshold=30
+                # instead of 8, avoiding premature force-restarts.
+                self._prev_frida_diag = diag
+                log.debug("SSL_ACTIVITY: baseline established (writes=%d)",
+                          diag.get('sslWriteCalls', 0))
+                return True
+
             prev_writes = self._prev_frida_diag.get('sslWriteCalls', 0)
             curr_writes = diag.get('sslWriteCalls', 0)
             self._prev_frida_diag = diag
@@ -9083,7 +9092,8 @@ img{{max-width:100%;height:auto}}</style></head>
                     # App hasn't made OIDC calls yet — normal.  Use 30 min.
                     detach_threshold = 30
                 elif ssl_active is None:
-                    # Old agent (no diag data) — use original 8 min threshold
+                    # getStats() threw an exception — script object exists but
+                    # is broken/unreachable (genuine silent detach).
                     detach_threshold = 8
                 else:
                     # No SSL activity — hooks may actually be dead.
