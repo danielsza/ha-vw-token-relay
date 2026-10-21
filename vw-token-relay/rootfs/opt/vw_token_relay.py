@@ -8796,15 +8796,20 @@ img{{max-width:100%;height:auto}}</style></head>
         Changed from 'any token fresh' to 'all tokens fresh' so the keepalive
         properly escalates recovery when one token (e.g. global) has expired
         even if another (e.g. a vehicle token) is still valid.
+
+        Uses 10-min threshold to match needs_refresh, so wake immediately
+        escalates to force-restart rather than wasting cycles on wake
+        attempts (the VW app never makes OIDC calls through BoringSSL,
+        so waking alone never produces new tokens).
         """
         with self._lock:
             if not self.tokens and not self.global_expiry:
                 return False  # no tokens at all
             now = datetime.now()
             for vid, t in self.tokens.items():
-                if now >= t["expiry"] - timedelta(minutes=5):
+                if now >= t["expiry"] - timedelta(minutes=10):
                     return False  # this token is expiring/expired
-            if self.global_expiry and now >= self.global_expiry - timedelta(minutes=5):
+            if self.global_expiry and now >= self.global_expiry - timedelta(minutes=10):
                 return False  # global token is expiring/expired
         return True
 
