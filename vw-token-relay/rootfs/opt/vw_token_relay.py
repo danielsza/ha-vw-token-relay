@@ -8286,13 +8286,17 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("Published token_relay (new token)")
 
         elif msg_type == "id_token_url":
-            # Lightweight idToken capture from URL query params (no body read)
+            # Capture ALL OAuth tokens from URL query params (redirect callback)
             url = payload.get("url", "")
             if "idToken=" in url:
                 try:
                     from urllib.parse import urlparse, parse_qs
                     parsed = urlparse(url)
                     qp = parse_qs(parsed.query)
+                    # Log all query param keys for diagnostics
+                    param_keys = sorted(qp.keys())
+                    log.info("URL_TOKEN_PARAMS: keys=%s host=%s path=%s",
+                             param_keys, parsed.hostname or "?", parsed.path[:60])
                     if "idToken" in qp:
                         captured_id = qp["idToken"][0]
                         if captured_id.startswith("eyJ") and len(captured_id) > 100:
@@ -8300,8 +8304,63 @@ img{{max-width:100%;height:auto}}</style></head>
                                 self.id_token = captured_id
                             log.info("id_token captured from URL query param! (len=%d)", len(captured_id))
                             self._expect_gc_crash = True  # token captured; suppress reattach on ART GC crash
+                    # Extract accessToken if present in the same redirect URL
+                    if "accessToken" in qp:
+                        at = qp["accessToken"][0]
+                        if at.startswith("eyJ") and len(at) > 100:
+                            log.info("ACCESS_TOKEN captured from URL query param! (len=%d)", len(at))
+                            with self._lock:
+                                self.access_token = at
+                                try:
+                                    import base64, json as _json
+                                    payload_b64 = at.split(".")[1]
+                                    payload_b64 += "=" * (4 - len(payload_b64) % 4)
+                                    claims = _json.loads(base64.urlsafe_b64decode(payload_b64))
+                                    exp_ts = claims.get("exp")
+                                    if exp_ts:
+                                        self.global_expiry = datetime.fromtimestamp(exp_ts)
+                                        log.info("Global token updated from URL accessToken (exp %s)",
+                                                 self.global_expiry.strftime("%H:%M"))
+                                except Exception as e:
+                                    log.debug("Failed to decode accessToken claims: %s", e)
+                            self._publish_tokens()
+                    # Extract refreshToken if present
+                    if "refreshToken" in qp:
+                        rt = qp["refreshToken"][0]
+                        if len(rt) > 20:
+                            log.info("REFRESH_TOKEN captured from URL query param! (len=%d)", len(rt))
+                            with self._lock:
+                                self.refresh_token = rt
+                    # Also check alternative param names (camelCase vs snake_case)
+                    for alt_at in ("access_token",):
+                        if alt_at in qp:
+                            at = qp[alt_at][0]
+                            if at.startswith("eyJ") and len(at) > 100:
+                                log.info("ACCESS_TOKEN captured from URL param '%s'! (len=%d)", alt_at, len(at))
+                                with self._lock:
+                                    self.access_token = at
+                                    try:
+                                        import base64, json as _json
+                                        payload_b64 = at.split(".")[1]
+                                        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+                                        claims = _json.loads(base64.urlsafe_b64decode(payload_b64))
+                                        exp_ts = claims.get("exp")
+                                        if exp_ts:
+                                            self.global_expiry = datetime.fromtimestamp(exp_ts)
+                                            log.info("Global token updated from URL access_token (exp %s)",
+                                                     self.global_expiry.strftime("%H:%M"))
+                                    except Exception as e:
+                                        log.debug("Failed to decode access_token claims: %s", e)
+                                self._publish_tokens()
+                    for alt_rt in ("refresh_token",):
+                        if alt_rt in qp:
+                            rt = qp[alt_rt][0]
+                            if len(rt) > 20:
+                                log.info("REFRESH_TOKEN captured from URL param '%s'! (len=%d)", alt_rt, len(rt))
+                                with self._lock:
+                                    self.refresh_token = rt
                 except Exception as e:
-                    log.debug("Failed to extract idToken from URL: %s", e)
+                    log.debug("Failed to extract tokens from URL: %s", e)
 
         elif msg_type == "hook_debug":
             # Enhanced diagnostics from agent v3.2+
