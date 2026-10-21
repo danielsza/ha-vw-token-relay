@@ -615,6 +615,12 @@ class VWTokenRelay:
                 if "access_token" in data:
                     self._store_token_from_header(data["access_token"], "mqtt_retained")
                     log.info("Restored access_token from retained MQTT message")
+                if "refresh_token" in data and not self.refresh_token:
+                    self.refresh_token = data["refresh_token"]
+                    log.info("Restored refresh_token from retained MQTT message (len=%d)", len(data["refresh_token"]))
+                if "code_verifier" in data and not self.code_verifier:
+                    self.code_verifier = data["code_verifier"]
+                    log.info("Restored code_verifier from retained MQTT message (len=%d)", len(data["code_verifier"]))
             except Exception as e:
                 log.debug("Failed to parse retained token_relay: %s", e)
             return
@@ -7993,6 +7999,10 @@ img{{max-width:100%;height:auto}}</style></head>
         # Include Play Integrity token — the connector needs this for US endpoint
         if self.play_integrity_token:
             token_relay["play_integrity_token"] = self.play_integrity_token
+        # Persist code_verifier in retained MQTT so it survives relay/app restarts
+        # (needed for _direct_idp_refresh to work after recovery)
+        if self.code_verifier:
+            token_relay["code_verifier"] = self.code_verifier
         if token_relay.get("access_token"):
             # Add issued_at so consumers can calculate real remaining TTL
             token_relay["issued_at"] = datetime.now().isoformat()
@@ -8293,6 +8303,21 @@ img{{max-width:100%;height:auto}}</style></head>
                 except Exception as e:
                     log.debug("Failed to extract idToken from URL: %s", e)
 
+        elif msg_type == "hook_debug":
+            # Enhanced diagnostics from agent v3.2+
+            debug_msg = payload.get("msg", "unknown")
+            if debug_msg == "oidc_request":
+                log.info("FRIDA_OIDC: %s request to %s", payload.get("method", "?"), payload.get("url", "?"))
+            elif debug_msg == "oidc_response_complete":
+                log.info("FRIDA_OIDC: response complete url=%s status=%s bodyLen=%s gzip=%s",
+                         payload.get("url", "?"), payload.get("status", "?"),
+                         payload.get("bodyLen", "?"), payload.get("isGzip", "?"))
+            elif debug_msg == "gzip_fail":
+                log.warning("FRIDA_GZIP: decompression failed for %s: %s",
+                            payload.get("url", "?"), payload.get("error", "?"))
+            else:
+                log.debug("FRIDA_DEBUG: %s %s", debug_msg, str(payload)[:200])
+
         elif msg_type == "hook_error":
             log.warning("Frida hook error: %s", payload.get("error", "unknown"))
 
@@ -8302,12 +8327,14 @@ img{{max-width:100%;height:auto}}</style></head>
             alpn = payload.get("alpn", {})
             cumul = payload.get("cumulative", {})
             log.info(
-                "FRIDA_DIAG: SSL_write=%d parsed=%d h2=%d | SSL_read=%d | "
-                "ALPN ssl=%d ctx=%d | tokens=%d api=%d | conns=%d",
+                "FRIDA_DIAG: SSL_write=%d parsed=%d h2=%d | SSL_read=%d readErr=%d | "
+                "ALPN ssl=%d ctx=%d | tokens=%d api=%d completed=%d | conns=%d",
                 delta.get("sslWriteCalls", 0), delta.get("sslWriteParsed", 0),
                 delta.get("h2Detected", 0), delta.get("sslReadCalls", 0),
+                delta.get("sslReadError", 0),
                 delta.get("alpnPerSslH2Stripped", 0), delta.get("alpnCtxH2Stripped", 0),
                 cumul.get("tokenResp", 0), cumul.get("apiResp", 0),
+                cumul.get("responsesCompleted", 0),
                 cumul.get("trackedConns", 0),
             )
             if delta.get("h2Detected", 0) > 0:
@@ -8486,7 +8513,18 @@ img{{max-width:100%;height:auto}}</style></head>
         # Give the app time to initialize after resume.
         time.sleep(5)
         log.info("Process resumed — hooks should be installing...")
+
+        # ── Post-attach: scan SharedPreferences for tokens (Part D) ──
+        # Give the app a few more seconds to fully initialize before scanning
+        if not self.refresh_token or not self.code_verifier:
+            try:
+                time.sleep(3)
+                self._scan_shared_prefs_for_tokens()
+            except Exception as e:
+                log.debug("Post-attach SharedPreferences scan failed: %s", e)
+
         return True
+
     def _rehook_frida(self):
         """Call the agent's rehook() RPC and return diagnostic data.
 
@@ -8538,6 +8576,112 @@ img{{max-width:100%;height:auto}}</style></head>
         except Exception as e:
             log.warning("REHOOK: Failed: %s", e)
             return False
+
+    def _scan_shared_prefs_for_tokens(self):
+        """Scan the VW app's SharedPreferences for OAuth tokens via Frida RPC.
+
+        This is a third layer of defense for token recovery:
+          1. MQTT retained message (restored on startup)
+          2. Frida OIDC capture (fixed gzip handling)
+          3. SharedPreferences scan (this method)
+
+        The VW app may persist refresh_token or access_token in its
+        SharedPreferences XML files.  We scan them and extract anything
+        useful when refresh_token or code_verifier is missing.
+
+        Returns True if we found and stored at least one new token.
+        """
+        if self.script is None:
+            return False
+
+        found_something = False
+        try:
+            # Step 1: List all SharedPreferences files
+            raw = self.script.exports_sync.read_shared_prefs("")
+            import json as _json
+            listing = _json.loads(raw)
+            if "error" in listing:
+                log.warning("SHAREDPREFS: listing error: %s", listing["error"])
+                return False
+
+            files = listing.get("files", [])
+            log.info("SHAREDPREFS: scanning %d prefs files for OAuth tokens...", len(files))
+
+            # Token-related keys to look for
+            token_keys = {
+                "refresh_token", "refreshToken", "refreshtoken",
+                "access_token", "accessToken", "accesstoken",
+                "id_token", "idToken", "idtoken",
+                "code_verifier", "codeVerifier", "codeverifier",
+                "oauth_token", "oauthToken",
+            }
+
+            for pf in files:
+                # Strip .xml extension for SharedPreferences name
+                pref_name = pf.replace(".xml", "")
+                try:
+                    raw = self.script.exports_sync.read_shared_prefs(pref_name)
+                    pdata = _json.loads(raw)
+                    if "error" in pdata:
+                        continue
+
+                    entries = pdata.get("entries", {})
+                    if not entries:
+                        continue
+
+                    # Check each key for token-like values
+                    for key, value in entries.items():
+                        if not value or len(str(value)) < 20:
+                            continue  # skip short values
+
+                        key_lower = key.lower().replace("_", "").replace("-", "")
+
+                        # Check for refresh_token
+                        if ("refreshtoken" in key_lower or key in ("refresh_token", "refreshToken")) and not self.refresh_token:
+                            self.refresh_token = str(value)
+                            log.info("SHAREDPREFS: Found refresh_token in %s key=%s (len=%d)",
+                                     pref_name, key, len(self.refresh_token))
+                            found_something = True
+
+                        # Check for code_verifier
+                        elif ("codeverifier" in key_lower or key in ("code_verifier", "codeVerifier")) and not self.code_verifier:
+                            self.code_verifier = str(value)
+                            log.info("SHAREDPREFS: Found code_verifier in %s key=%s (len=%d)",
+                                     pref_name, key, len(self.code_verifier))
+                            found_something = True
+
+                        # Check for access_token (less useful but good fallback)
+                        elif ("accesstoken" in key_lower or key in ("access_token", "accessToken")):
+                            if not self.global_token and len(str(value)) > 100:
+                                log.info("SHAREDPREFS: Found access_token in %s key=%s (len=%d) — storing",
+                                         pref_name, key, len(str(value)))
+                                self._store_token_from_header(str(value), "shared_prefs")
+                                found_something = True
+
+                        # Check for id_token
+                        elif ("idtoken" in key_lower or key in ("id_token", "idToken")) and not self.id_token:
+                            self.id_token = str(value)
+                            log.info("SHAREDPREFS: Found id_token in %s key=%s (len=%d)",
+                                     pref_name, key, len(self.id_token))
+                            found_something = True
+
+                except Exception as e:
+                    log.debug("SHAREDPREFS: error reading %s: %s", pref_name, e)
+                    continue
+
+            if found_something:
+                log.info("SHAREDPREFS: scan complete — found new tokens!")
+                # Try direct IDP refresh if we now have what we need
+                if self.refresh_token and self.code_verifier:
+                    log.info("SHAREDPREFS: Have refresh_token + code_verifier — attempting direct IDP refresh")
+                    self._direct_idp_refresh()
+            else:
+                log.info("SHAREDPREFS: scan complete — no new tokens found in %d files", len(files))
+
+        except Exception as e:
+            log.warning("SHAREDPREFS: scan failed: %s", e)
+
+        return found_something
 
     def _frida_hooks_have_ssl_activity(self):
         """Check if Frida hooks are showing SSL activity since last check.
@@ -8997,6 +9141,23 @@ img{{max-width:100%;height:auto}}</style></head>
                     self._recovery_attempts_since_success = 0
                     self._consecutive_api_failures = 0
                     continue
+
+                # ── Step 3.5: try SharedPreferences scan + direct IDP refresh ──
+                if not self.refresh_token or not self.code_verifier:
+                    log.info("RECOVERY: Scanning SharedPreferences for tokens...")
+                    try:
+                        self._scan_shared_prefs_for_tokens()
+                    except Exception as e:
+                        log.debug("RECOVERY: SharedPreferences scan error: %s", e)
+
+                if self.refresh_token and self.code_verifier:
+                    log.info("RECOVERY: Trying direct IDP refresh before full re-login...")
+                    if self._direct_idp_refresh():
+                        log.info("RECOVERY: Direct IDP refresh succeeded — tokens recovered!")
+                        no_token_count = 0
+                        self._recovery_attempts_since_success = 0
+                        self._consecutive_api_failures = 0
+                        continue
 
                 # ── Step 4: full re-login as last resort ──
                 log.warning("Persistent auth failure — attempting "

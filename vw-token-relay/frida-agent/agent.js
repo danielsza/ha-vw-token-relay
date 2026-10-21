@@ -242,6 +242,11 @@ function installNativeHooks() {
                     send({ type: 'id_token_url', url: url });
                 }
 
+                // ── Track OIDC requests for diagnostics ──
+                if (path.indexOf('/oidc/') !== -1) {
+                    send({ type: 'hook_debug', msg: 'oidc_request', method: method, url: url });
+                }
+
                 // ── Extract POST body ──
                 var reqBody = null;
                 if (method === 'POST') {
@@ -267,6 +272,9 @@ function installNativeHooks() {
                     isGzip: false,
                     bodyStart: -1,
                     statusCode: 0,
+                    // Raw byte tracking for gzip support
+                    rawBytesTotal: 0,
+                    rawBodyChunks: null,  // lazy init when isGzip
                 };
             } catch (e) {
                 _diag.sslWriteError++;
@@ -300,6 +308,7 @@ function installNativeHooks() {
                             path: '?', reqBody: null, respRaw: '',
                             headersParsed: false, contentLength: -1,
                             isChunked: false, isGzip: false, bodyStart: -1, statusCode: 0,
+                            rawBytesTotal: 0, rawBodyChunks: null,
                         };
                         conns[key] = conn;
                         _diag.sslReadUntracked++;
@@ -314,14 +323,28 @@ function installNativeHooks() {
                 _diag.sslReadTracked++;
             }
 
+            // Track total raw bytes received (not corrupted by UTF-8 decoding)
+            conn.rawBytesTotal += bytesRead;
+
             try {
                 var chunk = this._buf.readUtf8String(bytesRead);
                 if (!chunk) return;
                 conn.respRaw += chunk;
             } catch (e) {
-                // Binary data — if gzip, we can't easily parse
+                // Binary data — if gzip, we can't easily parse as string
                 _diag.sslReadError++;
-                return;
+                // Still need header parsing, so return if headers not yet parsed
+                if (!conn.headersParsed) return;
+            }
+
+            // For gzip responses: store raw body bytes for proper decompression
+            if (conn.headersParsed && conn.isGzip) {
+                if (!conn.rawBodyChunks) conn.rawBodyChunks = [];
+                try {
+                    var rawCopy = Memory.alloc(bytesRead);
+                    Memory.copy(rawCopy, this._buf, bytesRead);
+                    conn.rawBodyChunks.push({ ptr: rawCopy, len: bytesRead });
+                } catch (e) { /* non-critical */ }
             }
 
             // Parse headers if we haven't yet
@@ -348,15 +371,28 @@ function installNativeHooks() {
             }
 
             // Check if response body is complete
-            var bodyBytes = conn.respRaw.length - conn.bodyStart;
+            // Use raw byte count for gzip (string length != byte count for binary data)
+            var bodyBytes = conn.isGzip
+                ? (conn.rawBytesTotal - conn.bodyStart)
+                : (conn.respRaw.length - conn.bodyStart);
 
             var complete = false;
             if (conn.contentLength >= 0 && bodyBytes >= conn.contentLength) {
                 complete = true;
             } else if (conn.isChunked) {
-                var bodyStr = conn.respRaw.substring(conn.bodyStart);
-                if (bodyStr.indexOf('\r\n0\r\n') !== -1) {
-                    complete = true;
+                // For chunked: check raw byte stream for terminator
+                // Note: string check still works for non-gzip; for gzip
+                // we rely on content-length or safety cap
+                if (!conn.isGzip) {
+                    var bodyStr = conn.respRaw.substring(conn.bodyStart);
+                    if (bodyStr.indexOf('\r\n0\r\n') !== -1) {
+                        complete = true;
+                    }
+                } else {
+                    // For gzip+chunked, use safety cap or raw length heuristic
+                    if (bodyBytes > 0 && conn.rawBytesTotal > conn.bodyStart + 20) {
+                        complete = true;  // gzip+chunked: process what we have
+                    }
                 }
             }
             // Safety cap: don't accumulate more than 256KB
@@ -387,13 +423,18 @@ function processCompleteResponse(conn) {
         body = dechunk(body);
     }
 
-    // If gzip, try native decompression
+    // If gzip, try native decompression from raw bytes
     if (conn.isGzip) {
         try {
-            body = nativeGunzip(conn.respRaw, conn.bodyStart);
+            if (conn.rawBodyChunks && conn.rawBodyChunks.length > 0) {
+                body = nativeGunzipFromChunks(conn.rawBodyChunks, conn.bodyStart, conn.rawBytesTotal);
+            } else {
+                body = nativeGunzip(conn.respRaw, conn.bodyStart);
+            }
         } catch (e) {
             // Can't decompress — check if body has readable tokens anyway
             // (sometimes Content-Encoding header is wrong)
+            send({ type: 'hook_debug', msg: 'gzip_fail', url: conn.url, error: e.toString() });
             if (body.indexOf('access_token') === -1) return;
         }
     }
@@ -404,6 +445,12 @@ function processCompleteResponse(conn) {
     var isOidc = url.indexOf('/oidc/') !== -1;
     var hasToken = body.indexOf('access_token') !== -1 || body.indexOf('id_token') !== -1;
     var isApi = isApiPath(conn.path);
+
+    // Log all completed response URLs for diagnostics
+    if (isOidc) {
+        send({ type: 'hook_debug', msg: 'oidc_response_complete', url: url,
+               status: conn.statusCode, bodyLen: body.length, isGzip: conn.isGzip });
+    }
 
     // ── OIDC token response ──
     if (isOidc || hasToken) {
@@ -507,6 +554,84 @@ function nativeGunzip(fullResp, bodyStartOffset) {
     throw new Error('inflate produced 0 bytes, ret=' + ret);
 }
 
+// ── Native gzip decompression from raw byte chunks (fixes UTF-8 corruption) ──
+// The original nativeGunzip receives a string that was read via readUtf8String,
+// which corrupts binary gzip bytes (replacing invalid UTF-8 with U+FFFD).
+// This version works from the raw byte copies stored during SSL_read.
+function nativeGunzipFromChunks(chunks, headerByteLen, totalRawBytes) {
+    var inflateInit2Ptr = findNativeExport('inflateInit2_');
+    var inflatePtr      = findNativeExport('inflate');
+    var inflateEndPtr   = findNativeExport('inflateEnd');
+
+    if (!inflateInit2Ptr || !inflatePtr || !inflateEndPtr) {
+        throw new Error('zlib not found');
+    }
+
+    var inflateInit2 = new NativeFunction(inflateInit2Ptr, 'int', ['pointer', 'int', 'pointer', 'int']);
+    var inflateF     = new NativeFunction(inflatePtr,      'int', ['pointer', 'int']);
+    var inflateEnd   = new NativeFunction(inflateEndPtr,   'int', ['pointer']);
+
+    // Concatenate raw body chunks into a single buffer, skipping header bytes
+    // The first chunk(s) contain headers; we need to skip headerByteLen bytes total
+    var bodyLen = totalRawBytes - headerByteLen;
+    if (bodyLen <= 0) throw new Error('no body bytes');
+
+    var inBuf = Memory.alloc(bodyLen);
+    var written = 0;
+    var skipped = 0;
+
+    for (var i = 0; i < chunks.length; i++) {
+        var chk = chunks[i];
+        var chkStart = 0;
+
+        // Skip header bytes from the first chunk(s)
+        if (skipped < headerByteLen) {
+            var toSkip = Math.min(chk.len, headerByteLen - skipped);
+            skipped += toSkip;
+            chkStart = toSkip;
+        }
+
+        var remaining = chk.len - chkStart;
+        if (remaining > 0 && written < bodyLen) {
+            var toCopy = Math.min(remaining, bodyLen - written);
+            Memory.copy(inBuf.add(written), chk.ptr.add(chkStart), toCopy);
+            written += toCopy;
+        }
+    }
+
+    if (written === 0) throw new Error('no body bytes after skipping headers');
+
+    // Output buffer (4x input size, min 16KB)
+    var outLen = written * 4;
+    if (outLen < 16384) outLen = 16384;
+    if (outLen > 1048576) outLen = 1048576; // cap at 1MB
+    var outBuf = Memory.alloc(outLen);
+
+    // z_stream struct (112 bytes on arm64)
+    var stream = Memory.alloc(128);
+    stream.writeByteArray(new Array(128).fill(0));
+
+    stream.writePointer(inBuf);
+    stream.add(8).writeU32(written);
+    stream.add(16).writePointer(outBuf);
+    stream.add(24).writeU32(outLen);
+
+    var zlibVer = Memory.allocUtf8String('1.2.11');
+    var ret = inflateInit2(stream, 31, zlibVer, 128);
+    if (ret !== 0) throw new Error('inflateInit2 failed: ' + ret);
+
+    ret = inflateF(stream, 4); // Z_FINISH
+
+    var bytesWritten = outLen - stream.add(24).readU32();
+    inflateEnd(stream);
+
+    if (bytesWritten > 0) {
+        return outBuf.readUtf8String(bytesWritten);
+    }
+    throw new Error('inflate produced 0 bytes, ret=' + ret);
+}
+
+
 // ── Connection cleanup timer ──
 // Remove stale connections every 30s to prevent memory leaks
 setInterval(function () {
@@ -542,6 +667,8 @@ setInterval(function () {
                 tokenResp: _tokenRespCount,
                 apiResp: _apiRespCount,
                 trackedConns: Object.keys(conns).length,
+                responsesCompleted: _diag.responsesCompleted,
+                sslReadErrors: _diag.sslReadError,
             },
             alpn: {
                 perSslForced: _alpnForced,
