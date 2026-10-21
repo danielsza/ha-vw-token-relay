@@ -9242,6 +9242,22 @@ img{{max-width:100%;height:auto}}</style></head>
                         continue
 
                 # ── Step 4: full re-login as last resort ──
+                # Only escalate to auto re-login after 3+ failed recovery
+                # cycles (~9 min total) AND when we have no id_token
+                # (true session expiry). Normal token refreshes take 5-11
+                # min via the app's internal OIDC path — don't interrupt.
+                if no_token_count < 3:
+                    log.info("Recovery attempt %d — app may still be "
+                             "refreshing internally. Waiting for next "
+                             "keepalive cycle...", no_token_count)
+                    continue
+                if self.id_token:
+                    log.info("id_token present — session still valid. "
+                             "Skipping auto re-login (attempt %d). "
+                             "App will refresh tokens internally.",
+                             no_token_count)
+                    no_token_count = 0
+                    continue
                 log.warning("Persistent auth failure — attempting "
                             "auto re-login (attempt %d)", no_token_count)
                 self._auto_relogin()
