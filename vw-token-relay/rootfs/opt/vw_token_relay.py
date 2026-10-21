@@ -9167,6 +9167,25 @@ img{{max-width:100%;height:auto}}</style></head>
                     self._login_flow_active = None  # login succeeded
                     continue
 
+                # ── v1.53.7: Skip force-restart if tokens are near-expiry but NOT expired ──
+                # The app refreshes tokens internally via a non-BoringSSL path
+                # (invisible to Frida). Give it time — force-restarting kills that process.
+                with self._lock:
+                    any_actually_expired = False
+                    now_check = datetime.now()
+                    for vid, t in self.tokens.items():
+                        if now_check >= t["expiry"]:
+                            any_actually_expired = True
+                    if self.global_expiry and now_check >= self.global_expiry:
+                        any_actually_expired = True
+
+                if not any_actually_expired and has_any_token:
+                    log.info("Tokens still valid but nearing expiry — "
+                             "waiting for app internal refresh "
+                             "(skipping force-restart, next cycle in 3 min)")
+                    no_token_count = 0
+                    continue
+
                 # ── Check if login flow is active — don't kill it ──
                 if self._login_flow_active:
                     login_age = (datetime.now() - self._login_flow_active
