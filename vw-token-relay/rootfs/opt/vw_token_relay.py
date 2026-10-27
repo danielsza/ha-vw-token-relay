@@ -511,7 +511,7 @@ class VWTokenRelay:
         self._pif_reboot_cooldown = None  # prevent reboot loops
         self._pif_fix_attempts = 0        # count consecutive auto-fix cycles
         self._entry_stuck_count = 0       # consecutive EntryActivity stuck events
-        self._last_clear_data_time = None # cooldown for pm clear escalation
+        self._last_clear_data_time = None # last manual clear_data time
         self._login_flow_active = None   # timestamp when AzsCallbackActivity seen
 
         # Silent-detach recovery tracking
@@ -4837,45 +4837,32 @@ img{{max-width:100%;height:auto}}</style></head>
                             "force-restarting app",
                             act_name, self._entry_stuck_count)
                         # After 2 consecutive stuck cycles, escalate
-                        # to clearing app data + auto_login
-                        # (with 30-minute cooldown to prevent loops)
+                        # to PIF update + full app restart (never clear
+                        # app data — that wipes vehicle pairings and
+                        # the root cause is always PI failures, not
+                        # OAuth corruption).
                         if self._entry_stuck_count >= 2:
-                            now = datetime.now()
-                            cooldown_ok = (
-                                self._last_clear_data_time is None
-                                or (now - self._last_clear_data_time
-                                    ).total_seconds() > 1800)
-                            if cooldown_ok:
+                            log.warning(
+                                "NAV: %s stuck %d times — "
+                                "updating PIF and doing full "
+                                "app restart (no data wipe)",
+                                act_name,
+                                self._entry_stuck_count)
+                            self._entry_stuck_count = 0
+                            # Update PIF fingerprint first
+                            try:
+                                self._update_pif()
+                            except Exception as e:
                                 log.warning(
-                                    "NAV: %s stuck %d times — "
-                                    "clearing app data to reset "
-                                    "corrupted state",
-                                    act_name,
-                                    self._entry_stuck_count)
-                                subprocess.run(
-                                    ["adb", "shell", "pm", "clear",
-                                     VW_PACKAGE],
-                                    capture_output=True, timeout=15)
-                                self._last_clear_data_time = now
-                                log.info("NAV: App data cleared. "
-                                         "Triggering auto_login...")
-                                self._entry_stuck_count = 0
-                                time.sleep(3)
-                                # Trigger auto_login in background
-                                threading.Thread(
-                                    target=self._auto_login,
-                                    daemon=True).start()
-                                return True
-                            else:
-                                mins_ago = int(
-                                    (now - self._last_clear_data_time
-                                     ).total_seconds() / 60)
-                                log.warning(
-                                    "NAV: %s stuck but clear_data "
-                                    "cooldown active (%dm ago). "
-                                    "Just force-restarting.",
-                                    act_name, mins_ago)
-                                self._entry_stuck_count = 0
+                                    "NAV: PIF update failed: %s",
+                                    e)
+                            time.sleep(5)
+                            # Full restart (force-stop + relaunch
+                            # + Frida reattach) — preserves app data
+                            threading.Thread(
+                                target=self._wake_app_full_restart,
+                                daemon=True).start()
+                            return True
                     subprocess.run(
                         ["adb", "shell", "am", "force-stop", VW_PACKAGE],
                         capture_output=True, timeout=10)
@@ -6647,9 +6634,13 @@ img{{max-width:100%;height:auto}}</style></head>
         return True
 
     def _clear_app_data(self):
-        """Clear VW app data to force fresh login."""
+        """Clear VW app data (manual MQTT command only).
+        WARNING: This destroys vehicle pairings and cached sessions.
+        Should only be used as a last resort via manual MQTT command.
+        Automatic recovery paths should NEVER call this."""
         try:
-            log.info("CLEAR: Clearing VW app data...")
+            log.warning("CLEAR: ⚠ Clearing VW app data — this WILL "
+                        "destroy vehicle pairings! (manual command)")
             subprocess.run(
                 ["adb", "shell", "pm", "clear", VW_PACKAGE],
                 capture_output=True, timeout=15,
@@ -6883,15 +6874,19 @@ img{{max-width:100%;height:auto}}</style></head>
             return False
 
     def _auto_login(self):
-        """Automated login flow: clear data → launch → fill WebView credentials.
+        """Automated login flow: restart app → fill WebView credentials.
         Uses uiautomator dump to find UI elements dynamically.
+        Does NOT clear app data — that destroys vehicle pairings and
+        cached sessions.  The root cause of login issues is always
+        Play Integrity failures, not OAuth corruption.
 
-        App flow after pm clear:
-          1. Splash/Welcome screen ("We ride with Canada") → tap anywhere / swipe
-          2. "Log into myVW" native screen → tap "Log in" button (id=loginButton)
-          3. AzsCallbackActivity WebView → OIDC email page (id=input_email, btn=next-btn)
-          4. OIDC password page (id=input_password)
-          5. Redirect back to app → Frida captures token
+        App flow (without data wipe):
+          1. Force-stop app → relaunch
+          2. If on splash/welcome → dismiss
+          3. If on native login screen → tap "Log in" (id=loginButton)
+          4. AzsCallbackActivity WebView → OIDC email page (id=input_email, btn=next-btn)
+          5. OIDC password page (id=password)
+          6. Redirect back to app → Frida captures token
         """
         if not self.vw_email or not self.vw_password:
             log.error("AUTO_LOGIN: No credentials configured (vw_email/vw_password)")
@@ -6975,11 +6970,11 @@ img{{max-width:100%;height:auto}}</style></head>
         try:
             log.info("AUTO_LOGIN: ====== Starting automated login flow ======")
 
-            # Step 1: Clear app data
-            log.info("AUTO_LOGIN: Step 1 — Clearing app data...")
+            # Step 1: Force-stop app (preserve app data — never pm clear)
+            log.info("AUTO_LOGIN: Step 1 — Force-stopping app (no data wipe)...")
             subprocess.run(
-                ["adb", "shell", "pm", "clear", VW_PACKAGE],
-                capture_output=True, timeout=15,
+                ["adb", "shell", "am", "force-stop", VW_PACKAGE],
+                capture_output=True, timeout=10,
             )
             time.sleep(2)
 
