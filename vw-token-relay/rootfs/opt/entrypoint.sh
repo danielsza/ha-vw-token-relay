@@ -71,48 +71,9 @@ fi
 #   mosquitto_pub -t vw/cmd/update_pif -m ""
 echo "PIF auto-updater: DISABLED (manual via vw/cmd/update_pif)"
 
-# ── Auto-install PIF module if missing ──
-# Downloads and installs chiteroman's PlayIntegrityFix via Magisk CLI.
-# Does NOT run action.sh (which caused boot loops). Uses built-in fingerprint.
-(
-    while ! adb devices 2>/dev/null | grep -q "device$"; do sleep 5; done
-    sleep 5  # Let phone finish booting
-
-    if adb shell "su -c 'test -d /data/adb/modules/playintegrityfix'" 2>/dev/null || \
-       adb shell "su -c 'test -d /data/adb/modules/playintegrityfork'" 2>/dev/null; then
-        echo "PIF: Module already installed, skipping"
-    else
-        echo "PIF: Module not found — installing PlayIntegrityFork (osm0sis)..."
-        PIF_VERSION="v17"
-        PIF_URL="https://github.com/osm0sis/PlayIntegrityFork/releases/download/${PIF_VERSION}/PlayIntegrityFork-${PIF_VERSION}.zip"
-
-        echo "PIF: Downloading ${PIF_VERSION} from GitHub..."
-        if wget -q -O /tmp/pif_module.zip "${PIF_URL}" 2>/dev/null || \
-           /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('${PIF_URL}', '/tmp/pif_module.zip')" 2>/dev/null; then
-
-            echo "PIF: Pushing to phone..."
-            adb push /tmp/pif_module.zip /data/local/tmp/pif_module.zip 2>&1
-
-            echo "PIF: Installing via Magisk..."
-            adb shell "su -c 'magisk --install-module /data/local/tmp/pif_module.zip'" 2>&1
-            INSTALL_RC=$?
-
-            if [ "$INSTALL_RC" -eq 0 ]; then
-                echo "PIF: Module installed successfully!"
-                # Remove auto-update scripts to prevent boot loops
-                adb shell "su -c 'rm -f /data/adb/modules/playintegrityfork/action.sh'" 2>/dev/null || true
-                adb shell "su -c 'rm -f /data/adb/modules/playintegrityfork/autopif2.sh'" 2>/dev/null || true
-                echo "PIF: Rebooting phone to activate module..."
-                adb reboot 2>/dev/null || true
-            else
-                echo "PIF: Install failed (rc=${INSTALL_RC})"
-            fi
-            rm -f /tmp/pif_module.zip
-        else
-            echo "PIF: Download failed — check network"
-        fi
-    fi
-) &
+# PIF auto-install moved to ensure_pif_installed() — runs synchronously
+# inside ensure_phone_ready() BEFORE frida-server starts, so a PIF-triggered
+# reboot can never kill an already-running frida-server.
 
 # ── Web Remote Viewer ──
 # Serves phone remote control UI on ingress port (replaces old VNC + file server)
@@ -820,6 +781,71 @@ print('Saved /data/stock_boot.img',flush=True)
     fi
 }
 
+# ── Synchronous PIF install (runs BEFORE frida-server) ──
+# Checks whether PlayIntegrityFork is installed on the phone.
+# If missing, downloads + installs it via Magisk, reboots the phone,
+# and waits for ADB to come back — all synchronously so that
+# frida-server is never started on a phone that still needs a reboot.
+ensure_pif_installed() {
+    if adb shell "su -c 'test -d /data/adb/modules/playintegrityfix'" 2>/dev/null || \
+       adb shell "su -c 'test -d /data/adb/modules/playintegrityfork'" 2>/dev/null; then
+        echo "PIF: Module already installed, skipping"
+        return 0
+    fi
+
+    echo "PIF: Module not found — installing PlayIntegrityFork (osm0sis)..."
+    PIF_VERSION="v17"
+    PIF_URL="https://github.com/osm0sis/PlayIntegrityFork/releases/download/${PIF_VERSION}/PlayIntegrityFork-${PIF_VERSION}.zip"
+
+    echo "PIF: Downloading ${PIF_VERSION} from GitHub..."
+    if ! wget -q -O /tmp/pif_module.zip "${PIF_URL}" 2>/dev/null && \
+       ! /opt/venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('${PIF_URL}', '/tmp/pif_module.zip')" 2>/dev/null; then
+        echo "PIF: Download failed — check network"
+        return 1
+    fi
+
+    echo "PIF: Pushing to phone..."
+    adb push /tmp/pif_module.zip /data/local/tmp/pif_module.zip 2>&1
+
+    echo "PIF: Installing via Magisk..."
+    adb shell "su -c 'magisk --install-module /data/local/tmp/pif_module.zip'" 2>&1
+    INSTALL_RC=$?
+    rm -f /tmp/pif_module.zip
+
+    if [ "$INSTALL_RC" -ne 0 ]; then
+        echo "PIF: Install failed (rc=${INSTALL_RC})"
+        return 1
+    fi
+
+    echo "PIF: Module installed successfully!"
+    # Remove auto-update scripts to prevent boot loops
+    adb shell "su -c 'rm -f /data/adb/modules/playintegrityfork/action.sh'" 2>/dev/null || true
+    adb shell "su -c 'rm -f /data/adb/modules/playintegrityfork/autopif2.sh'" 2>/dev/null || true
+
+    echo "PIF: Rebooting phone to activate module..."
+    adb reboot 2>/dev/null || true
+
+    # Wait for phone to come back (up to 3 minutes)
+    echo "PIF: Waiting for phone to reboot..."
+    PIF_WAIT=0
+    PIF_TIMEOUT=180
+    while [ "${PIF_WAIT}" -lt "${PIF_TIMEOUT}" ]; do
+        sleep 5
+        PIF_WAIT=$((PIF_WAIT + 5))
+        if adb devices 2>/dev/null | grep -q "device$"; then
+            echo "PIF: Phone back after ${PIF_WAIT}s"
+            sleep 5  # Let boot settle
+            # Unlock screen after reboot
+            wake_screen
+            echo "PIF: Install + reboot complete"
+            return 0
+        fi
+    done
+
+    echo "PIF: WARNING — phone did not come back after ${PIF_TIMEOUT}s reboot wait"
+    return 1
+}
+
 ensure_phone_ready() {
     # Check for fastboot-mode phone BEFORE starting ADB
     check_fastboot_flash
@@ -859,6 +885,12 @@ ensure_phone_ready() {
         echo "ADB key persisted on phone (will survive reboots)" || \
         echo "ADB key persist failed (non-fatal)"
     fi
+
+    # ── Ensure PIF is installed BEFORE starting Frida ──
+    # This is synchronous: if PIF needs installing, the phone reboots and
+    # we wait here until it's back. Frida-server has not started yet, so
+    # the reboot can't kill it.
+    ensure_pif_installed
 
     # ── Frida server version check + auto-upgrade ──
     FRIDA_CLIENT_VER=$(/opt/venv/bin/python3 -c "import frida; print(frida.__version__)" 2>/dev/null || echo "unknown")
