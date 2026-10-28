@@ -569,6 +569,11 @@ class VWTokenRelay:
         # touching the screen so long-running UI tasks (e.g. Google account
         # refresh) can drive Settings without the loop relaunching the VW app.
         self._maintenance = threading.Event()
+        # Recovery wakeup: poked by _on_detached to wake the keepalive thread
+        # immediately instead of waiting for the 3-minute sleep to expire.
+        # This ensures the keepalive thread is the SOLE owner of Frida
+        # recovery — no competing reattach loops from callback threads.
+        self._recovery_event = threading.Event()
         # 2FA relay: a verification code supplied by the user via the web UI
         # (published to vw/cmd/twofa_code) during a Google account refresh.
         self._twofa_code = None
@@ -5592,7 +5597,7 @@ img{{max-width:100%;height:auto}}</style></head>
         log.info("WAKE: Waiting 12s for React Native to init before Frida attach...")
         time.sleep(12)
         try:
-            self._attach_frida()
+            self._attach_frida_safe(timeout=60)
         except Exception as e:
             log.error("WAKE: Failed to reattach Frida: %s", e)
 
@@ -7188,15 +7193,11 @@ img{{max-width:100%;height:auto}}</style></head>
             # Step 8: Reattach Frida and wait for tokens
             log.info("AUTO_LOGIN: Step 8 — Reattaching Frida...")
             time.sleep(5)
-            try:
-                self._attach_frida()
-            except Exception as e:
-                log.warning("AUTO_LOGIN: Frida attach failed: %s, retrying...", e)
+            if not self._attach_frida_safe(timeout=60):
+                log.warning("AUTO_LOGIN: Frida attach failed, retrying...")
                 time.sleep(5)
-                try:
-                    self._attach_frida()
-                except Exception as e2:
-                    log.error("AUTO_LOGIN: Frida attach failed again: %s", e2)
+                if not self._attach_frida_safe(timeout=60):
+                    log.error("AUTO_LOGIN: Frida attach failed again")
 
             # Wait for app to make API calls and capture tokens
             log.info("AUTO_LOGIN: Waiting 30s for app to load and make API calls...")
@@ -7410,7 +7411,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     # Re-attach Frida
                     try:
                         self._ensure_frida_server()
-                        self._attach_frida()
+                        self._attach_frida_safe(timeout=60)
                     except Exception as e:
                         log.warning("PHONE RECOVERY: Frida re-attach failed: %s", e)
                 else:
@@ -8483,6 +8484,44 @@ img{{max-width:100%;height:auto}}</style></head>
             log.error("FRIDA_SERVER: Restart error: %s", e)
             return False
 
+    def _attach_frida_safe(self, timeout=90):
+        """Run _attach_frida in a daemon thread with a timeout guard.
+
+        Frida USB operations (spawn, attach, load, resume) have no built-in
+        timeout and can hang indefinitely if the USB transport is in a bad
+        state — especially after a process crash or when another thread is
+        also using the USB device.  Running the attach sequence in a
+        timeout-guarded thread prevents the caller (keepalive) from blocking
+        forever.
+
+        v1.53.13: Added to prevent the process-freeze deadlock.
+        """
+        result = [False]
+        exc_info = [None]
+
+        def _worker():
+            try:
+                result[0] = self._attach_frida()
+            except Exception as e:
+                exc_info[0] = e
+                result[0] = False
+
+        t = threading.Thread(target=_worker, daemon=True,
+                             name="frida-attach-safe")
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            log.error("FRIDA ATTACH: Timed out after %ds — aborting "
+                      "(stuck thread will be abandoned as daemon)", timeout)
+            # Invalidate refs — the stuck daemon thread may still hold
+            # the old session/script objects but we treat them as dead.
+            self.session = None
+            self.script = None
+            return False
+        if exc_info[0]:
+            log.error("FRIDA ATTACH: Error: %s", exc_info[0])
+        return result[0]
+
     def _attach_frida(self):
         """Attach to the VW app via USB using spawn gating.
 
@@ -8768,6 +8807,16 @@ img{{max-width:100%;height:auto}}</style></head>
             return None
 
     def _on_detached(self, reason, crash):
+        """Handle Frida session detach.
+
+        v1.53.13: Removed the reattach loop that ran in Frida's callback
+        thread.  That loop competed with the keepalive thread for USB/Frida
+        resources, causing C-level deadlocks that froze the entire process.
+
+        Now _on_detached just marks the session as dead and signals the
+        keepalive thread (via _recovery_event) to handle recovery.  This
+        ensures a single thread owns all Frida USB operations at any time.
+        """
         log.warning("Frida detached: reason=%s crash=%s", reason, crash)
         if not self._running:
             return
@@ -8776,47 +8825,22 @@ img{{max-width:100%;height:auto}}</style></head>
         self.script = None
 
         # ── Keepalive is already recovering ──
-        # If the keepalive thread triggered this detach (by nulling the
-        # session) or is in the middle of its own recovery, don't start
-        # a competing reattach loop — the keepalive handles it.
         if self._keepalive_recovering:
-            log.info("Detach during keepalive recovery — skipping reattach "
-                     "loop (keepalive thread is handling it)")
+            log.info("Detach during keepalive recovery — keepalive thread "
+                     "is handling it")
             return
 
         # ── Expected ART GC crash (Android 16) ──
-        # Frida's .implementation replacement corrupts ART CodeInfo metadata.
-        # The GC crashes ~22s after spawn even after hooks are removed.
-        # If we already captured tokens, skip the reattach storm — the
-        # keepalive loop will do a clean _wake_app_full_restart when needed.
         if self._expect_gc_crash and reason == "process-terminated":
             log.info("Expected ART GC crash — tokens already captured. "
-                     "Skipping reattach loop; keepalive will recover.")
+                     "Keepalive will recover when needed.")
             self._expect_gc_crash = False
             return
 
-        # Escalating backoff: 10,10,15,15,20,20,30,30,30,30,30,30 = ~270s total
-        delays = [10, 10, 15, 15, 20, 20, 30, 30, 30, 30, 30, 30]
-
-        for attempt, delay in enumerate(delays, 1):
-            log.info("Reattach attempt %d/%d in %ds...", attempt, len(delays), delay)
-            time.sleep(delay)
-            if not self._running:
-                return
-            try:
-                # Ensure frida-server is running (critical after phone reboot)
-                self._ensure_frida_server()
-                if self._attach_frida():
-                    log.info("Frida reattached successfully on attempt %d", attempt)
-                    self.mqttc.publish(
-                        f"{MQTT_TOPIC_PREFIX}/status", "connected", retain=True)
-                    return
-            except Exception as e:
-                log.error("Reattach attempt %d failed: %s", attempt, e)
-
-        log.error("Frida reattach exhausted (%d attempts). "
-                  "Keepalive loop will continue retrying.", len(delays))
-        self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/status", "error", retain=True)
+        # ── Unexpected detach — wake keepalive immediately ──
+        log.info("Unexpected Frida detach — signaling keepalive for "
+                 "immediate recovery")
+        self._recovery_event.set()
 
     # ── Auto re-login ──────────────────────────────────────────────
     def _auto_relogin(self):
@@ -8992,7 +9016,10 @@ img{{max-width:100%;height:auto}}</style></head>
         no_token_count = 0
 
         while self._running:
-            time.sleep(180)  # 3 minutes — keep tokens fresh for CC MQTT consumer
+            # Wait up to 3 minutes — _recovery_event wakes us immediately
+            # when _on_detached fires (instead of waiting the full 180s).
+            self._recovery_event.wait(timeout=180)
+            self._recovery_event.clear()
 
             # ── Maintenance mode: pause all screen-touching recovery so a
             #    long-running UI task (Google account refresh) can run alone.
@@ -9070,7 +9097,7 @@ img{{max-width:100%;height:auto}}</style></head>
                             "attempting recovery...")
                 try:
                     self._ensure_frida_server()
-                    if self._attach_frida():
+                    if self._attach_frida_safe():
                         log.info("KEEPALIVE: Frida recovered successfully")
                         self.mqttc.publish(
                             f"{MQTT_TOPIC_PREFIX}/status",
@@ -9497,7 +9524,7 @@ img{{max-width:100%;height:auto}}</style></head>
 
         frida_ok = False
         try:
-            frida_ok = self._attach_frida()
+            frida_ok = self._attach_frida_safe()
         except Exception as e:
             log.warning("Frida attach failed (phone unavailable?): %s", e)
 
@@ -9509,7 +9536,7 @@ img{{max-width:100%;height:auto}}</style></head>
             t.start()
 
         log.info("=" * 60)
-        log.info("VW Token Relay running%s", " (NO FRIDA)" if not frida_ok else "")
+        log.info("VW Token Relay v1.53.13 running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
         log.info("  Topics:")
         log.info("    %s/tokens       — current token state (retained)", MQTT_TOPIC_PREFIX)
