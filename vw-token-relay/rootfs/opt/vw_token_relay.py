@@ -645,9 +645,9 @@ class VWTokenRelay:
         elif cmd == "vehicle_status":
             self._api_call("GET", payload)
         elif cmd == "lock":
-            self._api_lock(payload, lock=True)
+            threading.Thread(target=self._api_lock, args=(payload, True), daemon=True).start()
         elif cmd == "unlock":
-            self._api_lock(payload, lock=False)
+            threading.Thread(target=self._api_lock, args=(payload, False), daemon=True).start()
         elif cmd == "climate_start":
             threading.Thread(target=self._api_climate, args=(payload, True), daemon=True).start()
         elif cmd == "climate_stop":
@@ -1739,19 +1739,70 @@ img{{max-width:100%;height:auto}}</style></head>
             log.error("API call failed: %s", err)
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error", json.dumps(err))
 
+    # Known vehicle UUID prefixes → TSP mapping
+    _VEHICLE_TSP = {
+        "90bf07c5": "ATC",  # Atlas (ICE)
+        "702b3cc5": "WCT",  # ID. Buzz (EV/MEB)
+    }
+
+    def _get_vehicle_tsp(self, vid):
+        """Determine Telematics Service Provider for a vehicle.
+        ATC = ICE vehicles (Atlas), WCT = EV/MEB vehicles (Buzz).
+        Falls back to WCT (EV) for unknown vehicles."""
+        prefix = vid[:8].lower()
+        tsp = self._VEHICLE_TSP.get(prefix, "WCT")
+        log.info("TSP: vehicle %s → %s", vid[:16], tsp)
+        return tsp
+
     def _api_lock(self, vehicle_id, lock=True):
-        """Send lock/unlock command with auto-retry."""
+        """Send lock/unlock command with SPIN authentication.
+
+        v1.53.14: Lock/unlock requires a SPIN-authenticated
+        carnetVehicleToken — a plain Bearer token returns 403
+        USER_NOT_AUTHORIZED on ICE vehicles (Atlas).
+        """
         vid = vehicle_id.strip()
         action = "lock" if lock else "unlock"
+
+        # Resolve short vehicle ID to full UUID
+        resolved_vid = self._resolve_vehicle_id(vid)
+        if resolved_vid != vid:
+            log.info("LOCK: Resolved vehicle ID: %s → %s", vid, resolved_vid)
+        vid = resolved_vid
+
+        log.info("═══ %s ═══ vehicle=%s", action.upper(), vid[:16])
+
+        # Determine TSP based on vehicle type
+        tsp = self._get_vehicle_tsp(vid)
+
+        # Acquire SPIN token
+        spin_token, spin_err = self._get_spin_token(vid, tsp=tsp)
+        if spin_token is None:
+            log.error("%s: SPIN auth failed: %s", action.upper(), spin_err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": f"{action}_spin_failed",
+                            **(spin_err or {})}))
+            return
+
+        # Send lock/unlock command with carnetVehicleToken
         url = f"{BASE_URL}/lockunlock/v1/vehicle/{vid}"
         body = json.dumps({"lock": lock}).encode()
+        log.info("%s: PUT %s (SPIN token, %d chars)",
+                 action.upper(), url[-50:], len(spin_token))
 
-        result, err = self._api_request("PUT", url, body=body, vid=vid)
+        result, err = self._api_request_with_token(
+            "PUT", url, body=body, bearer_token=spin_token)
         if result is not None:
-            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/response/{action}", result)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/response/{action}", result)
             log.info("%s success: %s", action.upper(), result[:200])
         else:
             log.error("%s failed: %s", action, err)
+            self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/error",
+                json.dumps({"error": f"{action}_failed",
+                            "action": action,
+                            **(err if isinstance(err, dict) else
+                               {"msg": str(err)})}))
 
     def _get_spin_token(self, vehicle_id, tsp="WCT"):
         """Acquire a SPIN-authenticated carnetVehicleToken for vehicle commands.
@@ -3005,13 +3056,7 @@ img{{max-width:100%;height:auto}}</style></head>
                 if garage_title:
                     log.info("UI_RST: On Garage screen — tapping Atlas "
                              "card (attempt %d)", vv_attempt)
-                    atlas_card = self._find_ui_elements(vv_xml, text="Atlas")
-                    if atlas_card:
-                        self._adb_tap(atlas_card[0][0], atlas_card[0][1],
-                                      label="garage-Atlas")
-                    else:
-                        # Atlas card at known lower position
-                        self._adb_tap(540, 1229, label="garage-Atlas-blind")
+                    self._tap_atlas_in_garage(vv_xml, "screen")
                     time.sleep(10)
                     continue
 
@@ -3066,16 +3111,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         self._dismiss_vw_alert_dialogs()
 
                         retry_xml = self._dump_ui_xml()
-                        if retry_xml:
-                            at_r = self._find_ui_elements(
-                                retry_xml, text="Atlas")
-                            if at_r:
-                                self._adb_tap(
-                                    at_r[0][0], at_r[0][1],
-                                    label="garage-Atlas-primary")
-                            else:
-                                self._adb_tap(540, 1229,
-                                              label="garage-Atlas-blind")
+                        self._tap_atlas_in_garage(retry_xml, "primary")
                         time.sleep(12)
 
                     # Strategy B: Swipe left/right on vehicle header
@@ -3116,16 +3152,7 @@ img{{max-width:100%;height:auto}}</style></head>
                         self._dismiss_vw_alert_dialogs()
 
                         retry_xml = self._dump_ui_xml()
-                        if retry_xml:
-                            at_r = self._find_ui_elements(
-                                retry_xml, text="Atlas")
-                            if at_r:
-                                self._adb_tap(
-                                    at_r[0][0], at_r[0][1],
-                                    label="garage-Atlas-retry")
-                            else:
-                                self._adb_tap(540, 1229,
-                                              label="garage-Atlas-blind")
+                        self._tap_atlas_in_garage(retry_xml, "retry")
                         time.sleep(12)
 
                 else:
@@ -3172,17 +3199,8 @@ img{{max-width:100%;height:auto}}</style></head>
                             self._dismiss_system_dialogs()
                             self._dismiss_vw_alert_dialogs()
                             retry_xml = self._dump_ui_xml()
-                            if retry_xml:
-                                at_r = self._find_ui_elements(
-                                    retry_xml, text="Atlas")
-                                if at_r:
-                                    self._adb_tap(
-                                        at_r[0][0], at_r[0][1],
-                                        label="garage-Atlas-ev-fix")
-                                else:
-                                    self._adb_tap(
-                                        540, 1229,
-                                        label="garage-Atlas-blind")
+                            self._tap_atlas_in_garage(
+                                retry_xml, "ev-fix")
                             time.sleep(12)
                             continue
 
@@ -3547,17 +3565,8 @@ img{{max-width:100%;height:auto}}</style></head>
                             self._dismiss_system_dialogs()
                             self._dismiss_vw_alert_dialogs()
                             retry_xml = self._dump_ui_xml()
-                            if retry_xml:
-                                at_r = self._find_ui_elements(
-                                    retry_xml, text="Atlas")
-                                if at_r:
-                                    self._adb_tap(
-                                        at_r[0][0], at_r[0][1],
-                                        label="garage-Atlas-renav")
-                                else:
-                                    self._adb_tap(
-                                        540, 1229,
-                                        label="garage-Atlas-blind")
+                            self._tap_atlas_in_garage(
+                                retry_xml, "renav")
                             time.sleep(12)
                     self._wake_screen()
                     self._dismiss_system_dialogs()
@@ -3646,17 +3655,8 @@ img{{max-width:100%;height:auto}}</style></head>
                             self._dismiss_system_dialogs()
                             self._dismiss_vw_alert_dialogs()
                             retry_xml = self._dump_ui_xml()
-                            if retry_xml:
-                                at_r = self._find_ui_elements(
-                                    retry_xml, text="Atlas")
-                                if at_r:
-                                    self._adb_tap(
-                                        at_r[0][0], at_r[0][1],
-                                        label="garage-Atlas-sanity")
-                                else:
-                                    self._adb_tap(
-                                        540, 1229,
-                                        label="garage-Atlas-blind")
+                            self._tap_atlas_in_garage(
+                                retry_xml, "sanity")
                             time.sleep(12)
 
                 # CRITICAL: Check for the button BEFORE any UI interaction
@@ -6449,16 +6449,25 @@ img{{max-width:100%;height:auto}}</style></head>
 
             # Compose fallback: use VIN-based card detection
             if not found_target and not found_current:
-                compose_cards, _ = self._find_compose_vehicle_cards(xml)
-                for cx, cy, bounds, attrs in compose_cards:
+                compose_cards, compose_vins = self._find_compose_vehicle_cards(xml)
+                # Map target vehicle to its VIN prefix for matching
+                vin_prefixes = {"Atlas": self._ATLAS_VIN_PREFIX,
+                                "Buzz": "WVG"}
+                target_vin_pfx = vin_prefixes.get(target_name, "")
+                for i, (cx, cy, bounds, attrs) in enumerate(compose_cards):
                     txt = attrs.get("text", "").lower()
-                    if target_name.lower() in txt:
+                    vin = compose_vins[i][3].get("text", "") if i < len(compose_vins) else ""
+                    # Match by name OR by VIN prefix
+                    if (target_name.lower() in txt or
+                            (target_vin_pfx and vin.startswith(target_vin_pfx))):
                         found_target = (cx, cy, bounds, attrs)
-                        log.info("SWITCH: Compose found TARGET '%s' at (%d,%d)",
-                                target_name, cx, cy)
+                        log.info("SWITCH: Compose found TARGET '%s' "
+                                 "(VIN=%s) at (%d,%d)",
+                                 target_name, vin[:8], cx, cy)
                     elif any(v in txt for v in ["buzz", "atlas"]):
                         found_current = (cx, cy, bounds, attrs)
-                        log.info("SWITCH: Compose found CURRENT at (%d,%d) text='%s'",
+                        log.info("SWITCH: Compose found CURRENT at "
+                                 "(%d,%d) text='%s'",
                                  cx, cy, attrs.get("text", "")[:40])
 
             # If target vehicle is directly visible, tap it
@@ -6830,6 +6839,59 @@ img{{max-width:100%;height:auto}}</style></head>
                             vin_text)
 
         return cards, vins_found
+
+    # Atlas VIN prefix — first 3 chars of VIN 1V2FR2CA1RC525711
+    _ATLAS_VIN_PREFIX = "1V2"
+
+    def _tap_atlas_in_garage(self, xml, label_suffix=""):
+        """Find and tap the Atlas card in the Garage screen.
+
+        v1.53.14: Tries three methods in order:
+          1. Text search for "Atlas" (classic View-based UI)
+          2. Compose vehicle cards via VIN matching (Jetpack Compose UI)
+          3. Blind tap at known position (540, 1229) as last resort
+
+        Returns True if a tap was issued, False if no XML provided.
+        """
+        if not xml:
+            return False
+
+        label = f"garage-Atlas-{label_suffix}" if label_suffix else "garage-Atlas"
+
+        # Method 1: Text-based search for "Atlas"
+        at_r = self._find_ui_elements(xml, text="Atlas")
+        if at_r:
+            self._adb_tap(at_r[0][0], at_r[0][1],
+                          label=f"{label}-text")
+            log.info("GARAGE_TAP: Found 'Atlas' text at (%d,%d)",
+                     at_r[0][0], at_r[0][1])
+            return True
+
+        # Method 2: Compose vehicle cards (VIN-based detection)
+        cards, vins = self._find_compose_vehicle_cards(xml)
+        if cards:
+            for i, (vcx, vcy, vbounds, vattrs) in enumerate(vins):
+                vin = vattrs.get("text", "")
+                if vin.startswith(self._ATLAS_VIN_PREFIX):
+                    ccx, ccy = cards[i][0], cards[i][1]
+                    self._adb_tap(ccx, ccy,
+                                  label=f"{label}-compose")
+                    log.info("GARAGE_TAP: Found Atlas via VIN %s "
+                             "at (%d,%d)", vin[:8], ccx, ccy)
+                    return True
+            # Cards found but none matched Atlas VIN — log what we see
+            log.warning("GARAGE_TAP: Compose cards found but no Atlas "
+                        "VIN (prefix %s). Cards: %s",
+                        self._ATLAS_VIN_PREFIX,
+                        [(v[3].get("text", "?")[:8],
+                          c[3].get("text", "?"))
+                         for c, v in zip(cards, vins)])
+
+        # Method 3: Blind tap at known garage position
+        log.info("GARAGE_TAP: No Atlas text or VIN found — blind tap "
+                 "at (540, 1229)")
+        self._adb_tap(540, 1229, label=f"{label}-blind")
+        return True
 
     def _log_dashboard_buttons(self, xml_str):
         """Log all clickable/visible elements on the dashboard for debugging."""
