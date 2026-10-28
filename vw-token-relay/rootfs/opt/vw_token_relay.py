@@ -2812,30 +2812,15 @@ img{{max-width:100%;height:auto}}</style></head>
         """Inner implementation (called under _ui_rst_lock)."""
         log.info("═══ UI REMOTE %s ═══ vehicle=%s", action.upper(), vid)
 
-        # ── Wait for tokens if relay is recovering ──
-        # UI remote start needs the app and Frida to be healthy. If no tokens
-        # are available, the relay is likely mid-recovery. Wait up to 10 min
-        # for tokens to come back before driving the UI.
-        if not self._tokens_are_fresh():
-            log.info("UI_RST: No fresh tokens — queuing command, waiting up to 10 min...")
+        # ── Pre-flight: just check ADB is connected ──
+        # UI remote start drives the app's own buttons via uiautomator —
+        # it does NOT need OAuth tokens.  The app handles its own auth.
+        # We only need the phone to be reachable over ADB.
+        if not self._adb_check():
+            log.error("UI_RST: ADB not connected — cannot drive app UI")
             self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
-                json.dumps({"status": "queued", "reason": "waiting_for_token",
-                            "max_wait_min": 10}), retain=False)
-            self._wake_app()
-            wait_start = time.time()
-            while time.time() - wait_start < 600:
-                time.sleep(30)
-                if self._tokens_are_fresh():
-                    elapsed = int(time.time() - wait_start)
-                    log.info("UI_RST: Tokens available after %ds — proceeding", elapsed)
-                    break
-                if int(time.time() - wait_start) % 120 == 0:
-                    self._wake_app()
-            if not self._tokens_are_fresh():
-                log.error("UI_RST: No tokens after 10 min — aborting")
-                self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
-                    json.dumps({"status": "failed", "reason": "token_timeout_10min"}), retain=False)
-                return False
+                json.dumps({"status": "failed", "reason": "adb_not_connected"}), retain=False)
+            return False
 
         self.mqttc.publish(f"{MQTT_TOPIC_PREFIX}/{vid}/remote_start",
             json.dumps({"status": f"ui_{action.lower()}_initiated"}), retain=False)
