@@ -8861,6 +8861,28 @@ img{{max-width:100%;height:auto}}</style></head>
                 return False  # global token is expiring/expired
         return True
 
+    def _token_pipeline_active(self):
+        """Return True if auth_header tokens have been captured recently.
+
+        Global and vehicle tokens refresh on different ~75-min cycles,
+        offset by ~15 minutes.  Each has a ~30-min lifetime and there's
+        a ~7-min gap after expiry before a new one appears via
+        auth_header.  This means _tokens_are_fresh() (which requires ALL
+        tokens valid) returns False for ~14 out of every 30 minutes —
+        even though the Frida pipeline is perfectly healthy.
+
+        This method checks whether any token was captured within the last
+        PIPELINE_GRACE_MIN minutes.  If so, the pipeline is alive and the
+        keepalive should NOT escalate to force-restart — the app is
+        refreshing tokens internally on its own staggered schedule.
+        """
+        PIPELINE_GRACE_MIN = 12  # slightly > the ~7-min refresh gap
+        with self._lock:
+            if not self._last_token_time:
+                return False
+            age = (datetime.now() - self._last_token_time).total_seconds() / 60
+            return age < PIPELINE_GRACE_MIN
+
     # ── Pipeline health (for HA auto-recovery automation) ──────────
     def _publish_pipeline_health(self):
         """Publish comprehensive health status to vw/pipeline_health (retained).
@@ -8880,6 +8902,7 @@ img{{max-width:100%;height:auto}}</style></head>
             )
 
         tokens_fresh = self._tokens_are_fresh()
+        pipeline_active = self._token_pipeline_active()
 
         api_age_min = None
         if self._last_successful_api_call:
@@ -8888,7 +8911,11 @@ img{{max-width:100%;height:auto}}</style></head>
             )
 
         # Determine overall status
-        if tokens_fresh and frida_ok and self._consecutive_api_failures == 0:
+        # v1.53.11: pipeline_active means auth_headers are flowing even if
+        # not all tokens pass the 10-min freshness gate (staggered refresh).
+        # Treat pipeline_active + frida attached as "healthy" to avoid
+        # spurious HA recovery automations.
+        if (tokens_fresh or pipeline_active) and frida_ok and self._consecutive_api_failures == 0:
             status = "healthy"
         elif (
             token_age_min is not None
@@ -8913,6 +8940,7 @@ img{{max-width:100%;height:auto}}</style></head>
             "status": status,
             "frida": frida_status,
             "tokens_fresh": tokens_fresh,
+            "pipeline_active": pipeline_active,
             "token_age_min": token_age_min,
             "last_token_at": (
                 self._last_token_time.isoformat()
@@ -9147,9 +9175,20 @@ img{{max-width:100%;height:auto}}</style></head>
                     self._login_flow_active = None  # login succeeded
                     continue
 
-                # ── v1.53.7: Skip force-restart if tokens are near-expiry but NOT expired ──
-                # The app refreshes tokens internally via a non-BoringSSL path
-                # (invisible to Frida). Give it time — force-restarting kills that process.
+                # ── v1.53.11: Skip force-restart when pipeline is active ──
+                # Global and vehicle tokens refresh on staggered ~75-min
+                # cycles with ~15-min offset.  One token being expired while
+                # another is valid is NORMAL — not a failure.  The old
+                # "all tokens fresh" gate triggered force-restart during
+                # these routine gaps, which killed the app's own internal
+                # OIDC refresh and made things worse.
+                #
+                # New logic: if we captured ANY auth_header token recently
+                # (<12 min), the Frida pipeline is alive and the app is
+                # actively refreshing.  Don't force-restart — wait for
+                # the staggered refresh to complete.
+                pipeline_active = self._token_pipeline_active()
+
                 with self._lock:
                     any_actually_expired = False
                     now_check = datetime.now()
@@ -9158,6 +9197,15 @@ img{{max-width:100%;height:auto}}</style></head>
                             any_actually_expired = True
                     if self.global_expiry and now_check >= self.global_expiry:
                         any_actually_expired = True
+
+                if pipeline_active and has_any_token:
+                    # Pipeline is alive — tokens are flowing, just not ALL
+                    # fresh at this instant due to staggered refresh cycles.
+                    log.info("Token pipeline active (recent auth_header capture) — "
+                             "skipping force-restart. Staggered refresh in progress "
+                             "(expired=%s, next cycle in 3 min)", any_actually_expired)
+                    no_token_count = 0
+                    continue
 
                 if not any_actually_expired and has_any_token:
                     log.info("Tokens still valid but nearing expiry — "
