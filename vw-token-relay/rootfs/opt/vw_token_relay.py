@@ -1777,12 +1777,25 @@ img{{max-width:100%;height:auto}}</style></head>
         if not oauth_token:
             oauth_token = self._get_valid_token(vehicle_id, vehicle_only=False)
         if not oauth_token:
-            log.info("SPIN: No token — waking app...")
+            # v1.53.11: Poll for up to 3 minutes instead of a single 30s wait.
+            # Global and vehicle tokens refresh on staggered cycles with a
+            # ~7-min gap after expiry.  A command arriving during that gap
+            # needs patience — the token will appear when the app's internal
+            # OIDC refresh completes.
+            log.info("SPIN: No token — waking app and polling up to 3 min...")
             self._wake_app(target_vid=vehicle_id)
-            time.sleep(30)
-            oauth_token = self._get_valid_token(vehicle_id)
+            poll_deadline = time.time() + 180  # 3 minutes
+            while time.time() < poll_deadline:
+                time.sleep(30)
+                oauth_token = self._get_valid_token(vehicle_id, vehicle_only=True)
+                if not oauth_token:
+                    oauth_token = self._get_valid_token(vehicle_id, vehicle_only=False)
+                if oauth_token:
+                    log.info("SPIN: Token arrived after %.0fs wait",
+                             180 - (poll_deadline - time.time()))
+                    break
             if not oauth_token:
-                return None, {"error": "no_valid_token", "msg": "No OAuth token available"}
+                return None, {"error": "no_valid_token", "msg": "No OAuth token available after 3 min wait"}
 
         challenge_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/challenge"
         session_url = f"{BASE_URL}/ss/v1/user/{self.user_id}/vehicle/{vehicle_id}/session"
@@ -9199,13 +9212,37 @@ img{{max-width:100%;height:auto}}</style></head>
                         any_actually_expired = True
 
                 if pipeline_active and has_any_token:
-                    # Pipeline is alive — tokens are flowing, just not ALL
-                    # fresh at this instant due to staggered refresh cycles.
-                    log.info("Token pipeline active (recent auth_header capture) — "
-                             "skipping force-restart. Staggered refresh in progress "
-                             "(expired=%s, next cycle in 3 min)", any_actually_expired)
-                    no_token_count = 0
-                    continue
+                    # v1.53.12: Only skip force-restart when expired tokens
+                    # are within a short grace window (≤3 min).  Beyond
+                    # that the app failed to refresh — pipeline "activity"
+                    # from stale auth_header echoes is misleading and we
+                    # must restart to get a fresh OIDC exchange.
+                    max_expired_min = 0
+                    with self._lock:
+                        now_exp = datetime.now()
+                        if self.global_expiry and now_exp >= self.global_expiry:
+                            max_expired_min = max(max_expired_min,
+                                (now_exp - self.global_expiry).total_seconds() / 60)
+                        for vid, t in self.tokens.items():
+                            if now_exp >= t["expiry"]:
+                                max_expired_min = max(max_expired_min,
+                                    (now_exp - t["expiry"]).total_seconds() / 60)
+
+                    if max_expired_min <= 3:
+                        log.info("Token pipeline active — skipping "
+                                 "force-restart. Staggered refresh in "
+                                 "progress (expired=%s, "
+                                 "max_expired_age=%.1fmin, "
+                                 "next cycle in 3 min)",
+                                 any_actually_expired, max_expired_min)
+                        no_token_count = 0
+                        continue
+                    else:
+                        log.warning("Pipeline active but token expired "
+                                    "%.1f min ago — NOT skipping "
+                                    "force-restart (app failed to "
+                                    "refresh)", max_expired_min)
+                        # Fall through to force-restart below
 
                 if not any_actually_expired and has_any_token:
                     log.info("Tokens still valid but nearing expiry — "
