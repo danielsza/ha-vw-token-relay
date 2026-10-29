@@ -3030,6 +3030,21 @@ img{{max-width:100%;height:auto}}</style></head>
                 time.sleep(1)
             time.sleep(2)
 
+            # v1.53.17: Dismiss PIN entry dialog if present on cold
+            # launch.  The VW app sometimes shows a 'Enter PIN'
+            # bottom sheet that covers the entire dashboard.
+            cold_xml = self._dump_ui_xml()
+            if cold_xml and self._dismiss_pin_dialog(cold_xml):
+                log.info("UI_RST: PIN dialog dismissed after cold "
+                         "launch — re-expanding toolbar")
+                for _swipe in range(3):
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 540 400 540 1200 400"],
+                        capture_output=True, timeout=10)
+                    time.sleep(1)
+                time.sleep(2)
+
             # ── VEHICLE VERIFICATION (v1.52.2 strategy) ──
             # 1. Check if we're already on Atlas (lucky path)
             # 2. If wrong vehicle or unknown, use ForcedGarageActivity
@@ -3046,6 +3061,18 @@ img{{max-width:100%;height:auto}}</style></head>
                                 "(attempt %d)", vv_attempt)
                     time.sleep(3)
                     continue
+
+                # v1.53.17: Check for and dismiss PIN dialog on
+                # every attempt — it blocks all dashboard elements
+                if self._dismiss_pin_dialog(vv_xml):
+                    log.info("UI_RST: PIN dialog dismissed during "
+                             "vehicle verify (attempt %d) — "
+                             "re-dumping XML", vv_attempt)
+                    time.sleep(2)
+                    vv_xml = self._dump_ui_xml()
+                    if not vv_xml:
+                        time.sleep(3)
+                        continue
 
                 # Log all dashboard elements for diagnostics
                 if vv_attempt == 0:
@@ -3277,6 +3304,19 @@ img{{max-width:100%;height:auto}}</style></head>
             imm_btn_clicked = False
             blind_xml = None
             BLIND_BTN_X, BLIND_BTN_Y = 360, 889
+
+            # v1.53.17: One more PIN dialog check before button search
+            pre_btn_xml = self._dump_ui_xml()
+            if pre_btn_xml and self._dismiss_pin_dialog(pre_btn_xml):
+                log.info("UI_RST: PIN dialog dismissed before button "
+                         "search — re-expanding toolbar")
+                for _sw in range(2):
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input swipe 540 400 540 1200 400"],
+                        capture_output=True, timeout=10)
+                    time.sleep(1)
+                time.sleep(2)
 
             # First: try XML-based button search (3 attempts)
             for xml_attempt in range(3):
@@ -5475,6 +5515,100 @@ img{{max-width:100%;height:auto}}</style></head>
         if dismissed_any:
             log.info("VW_DIALOG: Dismissed %d alert dialog(s)", attempt + 1)
         return dismissed_any
+
+
+    def _dismiss_pin_dialog(self, xml=None):
+        """v1.53.17: Dismiss the VW app PIN entry bottom sheet.
+
+        On cold launch the VW app sometimes shows a 'Enter PIN' bottom
+        sheet that covers the entire dashboard, preventing vehicle
+        detection and button access.  Detect it by the
+        title_pin_management or pin_entry resource-id and tap Cancel
+        to dismiss.  Returns True if a PIN dialog was found and
+        dismissed."""
+        if not xml:
+            xml = self._dump_ui_xml()
+        if not xml:
+            return False
+
+        # Check for PIN dialog indicators
+        has_pin_title = bool(self._find_ui_elements(
+            xml, resource_id="title_pin_management"))
+        has_pin_entry = bool(self._find_ui_elements(
+            xml, resource_id="pin_entry"))
+
+        # Also check for subtitle text as backup
+        has_pin_subtitle = bool(self._find_ui_elements(
+            xml, resource_id="subtitle_pin_desc"))
+
+        if not (has_pin_title or has_pin_entry or has_pin_subtitle):
+            return False
+
+        log.info("PIN_DISMISS: PIN entry bottom sheet detected "
+                 "(title=%s entry=%s subtitle=%s) — dismissing",
+                 has_pin_title, has_pin_entry, has_pin_subtitle)
+
+        # Strategy 1: Tap the Cancel button (most reliable)
+        cancel_btn = self._find_ui_elements(
+            xml, resource_id="button_cancel")
+        if cancel_btn:
+            cx, cy = cancel_btn[0][0], cancel_btn[0][1]
+            log.info("PIN_DISMISS: Tapping Cancel button at (%d,%d)",
+                     cx, cy)
+            subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 f"input tap {cx} {cy}"],
+                capture_output=True, timeout=10)
+            time.sleep(2)
+        else:
+            # Strategy 2: Tap Cancel by text
+            cancel_text = self._find_ui_elements(xml, text="Cancel")
+            if cancel_text:
+                cx, cy = cancel_text[0][0], cancel_text[0][1]
+                log.info("PIN_DISMISS: Tapping 'Cancel' text at "
+                         "(%d,%d)", cx, cy)
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"input tap {cx} {cy}"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+            else:
+                # Strategy 3: Tap outside the bottom sheet to dismiss
+                # The bottom sheet starts at y~984, so tap above it
+                log.info("PIN_DISMISS: No Cancel button found — "
+                         "tapping outside bottom sheet at (540, 500)")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input tap 540 500"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+
+        # Verify dismissal
+        verify_xml = self._dump_ui_xml()
+        if verify_xml:
+            still_has_pin = bool(self._find_ui_elements(
+                verify_xml, resource_id="title_pin_management"))
+            if still_has_pin:
+                log.warning("PIN_DISMISS: PIN dialog still present "
+                            "after first dismiss — pressing BACK")
+                subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     "input keyevent BACK"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+                # One more check
+                verify_xml2 = self._dump_ui_xml()
+                if verify_xml2 and self._find_ui_elements(
+                        verify_xml2,
+                        resource_id="title_pin_management"):
+                    log.error("PIN_DISMISS: PIN dialog persists "
+                              "after Cancel + BACK — may need to "
+                              "force-restart app")
+                    return False
+            else:
+                log.info("PIN_DISMISS: PIN dialog dismissed "
+                         "successfully")
+        return True
 
     def _dismiss_vw_interstitials(self, xml=None, max_attempts=3):
         """Dismiss VW app interstitial pages (maintenance notices, announcements).
