@@ -9769,7 +9769,7 @@ img{{max-width:100%;height:auto}}</style></head>
             t.start()
 
         log.info("=" * 60)
-        log.info("VW Token Relay v1.53.16 running%s", " (NO FRIDA)" if not frida_ok else "")
+        log.info("VW Token Relay v1.53.17 running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
         log.info("  Topics:")
         log.info("    %s/tokens       — current token state (retained)", MQTT_TOPIC_PREFIX)
