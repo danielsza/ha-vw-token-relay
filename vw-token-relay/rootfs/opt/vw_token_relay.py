@@ -9351,9 +9351,28 @@ img{{max-width:100%;height:auto}}</style></head>
                         time.sleep(30)
                         continue
                     else:
-                        log.warning("Login flow stale (%.0fs ago) — "
-                                    "clearing flag", login_age)
+                        # v1.53.15: Login flow stale — the WebView
+                        # didn't complete on its own.  Trigger auto-
+                        # login to fill email/password instead of
+                        # force-restarting (which just cycles back to
+                        # the same stuck login screen).
+                        log.warning(
+                            "Login flow stale (%.0fs ago) — triggering "
+                            "auto-login to fill credentials", login_age)
                         self._login_flow_active = None
+                        try:
+                            self._auto_login()
+                        except Exception as e:
+                            log.error("Auto-login from stale login "
+                                      "flow failed: %s", e)
+                        time.sleep(15)
+                        if self._tokens_are_fresh():
+                            log.info("Token flow recovered after "
+                                     "auto-login from stale login")
+                            no_token_count = 0
+                            self._recovery_attempts_since_success = 0
+                            self._consecutive_api_failures = 0
+                        continue
 
                 # ── Step 2: force-restart the app + reattach Frida (~35s) ──
                 no_token_count += 1
@@ -9424,10 +9443,18 @@ img{{max-width:100%;height:auto}}</style></head>
                              "refreshing internally. Waiting for next "
                              "keepalive cycle...", no_token_count)
                     continue
-                if self.id_token:
-                    log.info("id_token present — session still valid. "
-                             "Skipping auto re-login (attempt %d). "
-                             "App will refresh tokens internally.",
+                # v1.53.15: Check if id_token is actually VALID, not
+                # just present.  A stale id_token from a previous
+                # session was blocking auto re-login forever.
+                id_token_valid = (self.id_token and
+                                  self.global_expiry and
+                                  self.global_expiry > datetime.now())
+                if id_token_valid:
+                    log.info("id_token present and not expired (exp %s) "
+                             "— session still valid. Skipping auto "
+                             "re-login (attempt %d). App will refresh "
+                             "tokens internally.",
+                             self.global_expiry.strftime("%H:%M"),
                              no_token_count)
                     no_token_count = 0
                     continue
@@ -9598,7 +9625,7 @@ img{{max-width:100%;height:auto}}</style></head>
             t.start()
 
         log.info("=" * 60)
-        log.info("VW Token Relay v1.53.13 running%s", " (NO FRIDA)" if not frida_ok else "")
+        log.info("VW Token Relay v1.53.15 running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
         log.info("  Topics:")
         log.info("    %s/tokens       — current token state (retained)", MQTT_TOPIC_PREFIX)
