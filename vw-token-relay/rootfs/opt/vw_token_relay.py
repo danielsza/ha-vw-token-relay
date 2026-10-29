@@ -3083,9 +3083,19 @@ img{{max-width:100%;height:auto}}</style></head>
                                     " — dashboard NOT actually Atlas",
                                     vv_name, confidence)
 
-                    wrong_vehicle_count += 1
-                    log.warning("UI_RST: WRONG VEHICLE: '%s' "
+                    # v1.53.16: Only count as 'wrong vehicle'
+                    # when we have definitive evidence (EV content
+                    # or header says Buzz).  Empty name + no
+                    # indicators = 'can't tell', not 'wrong'.
+                    is_definitive_wrong = (
+                        confidence != "inconclusive" or
+                        (vv_name and "atlas" not in vv_name.lower()))
+                    if is_definitive_wrong:
+                        wrong_vehicle_count += 1
+                    log.warning("UI_RST: %s: '%s' "
                                 "(confidence=%s, attempt %d)",
+                                "WRONG VEHICLE" if is_definitive_wrong
+                                else "VEHICLE UNKNOWN (Compose UI?)",
                                 vv_name, confidence, vv_attempt)
 
                     # ── VEHICLE SWITCH STRATEGIES (v1.52.2) ──
@@ -9625,7 +9635,7 @@ img{{max-width:100%;height:auto}}</style></head>
             t.start()
 
         log.info("=" * 60)
-        log.info("VW Token Relay v1.53.15 running%s", " (NO FRIDA)" if not frida_ok else "")
+        log.info("VW Token Relay v1.53.16 running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
         log.info("  Topics:")
         log.info("    %s/tokens       — current token state (retained)", MQTT_TOPIC_PREFIX)
