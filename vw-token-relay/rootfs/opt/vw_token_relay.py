@@ -3380,9 +3380,92 @@ img{{max-width:100%;height:auto}}</style></head>
                                  "to (%d,%d) from XML", btn_x, btn_y)
                     else:
                         log.info("UI_RST: remoteStartButton found "
-                                 "but DISABLED — may need to wait")
-                        # Update coordinates anyway
+                                 "but DISABLED — waiting for enable")
+                        # v1.53.18: Wait up to 30s for button to
+                        # become enabled (app loading after cold
+                        # launch). Poll every 5 seconds.
+                        btn_became_enabled = False
+                        for wait_i in range(6):
+                            time.sleep(5)
+                            wait_xml = self._dump_ui_xml()
+                            if not wait_xml:
+                                continue
+                            wait_btn = self._find_ui_elements(
+                                wait_xml,
+                                resource_id="remoteStartButton")
+                            if wait_btn:
+                                we = wait_btn[0][3].get(
+                                    "enabled", "false")
+                                btn_x = wait_btn[0][0]
+                                btn_y = wait_btn[0][1]
+                                log.info(
+                                    "UI_RST: Wait %d/6 — enabled=%s "
+                                    "at (%d,%d)", wait_i + 1, we,
+                                    btn_x, btn_y)
+                                if we == "true":
+                                    btn_became_enabled = True
+                                    break
+                            else:
+                                log.info(
+                                    "UI_RST: Wait %d/6 — button "
+                                    "gone from XML", wait_i + 1)
                         BLIND_BTN_X, BLIND_BTN_Y = btn_x, btn_y
+                        if btn_became_enabled:
+                            log.info("UI_RST: Button now ENABLED — "
+                                     "tapping at (%d,%d)",
+                                     btn_x, btn_y)
+                            self._adb_tap(btn_x, btn_y,
+                                          label="rst-enabled-wait")
+                            time.sleep(5)
+                            ve_xml = self._dump_ui_xml()
+                            if ve_xml:
+                                bs_chk = (
+                                    self._find_ui_elements(
+                                        ve_xml, text="Start") or
+                                    self._find_ui_elements(
+                                        ve_xml,
+                                        resource_id=(
+                                            "stopEngineButton")) or
+                                    self._find_ui_elements(
+                                        ve_xml,
+                                        text="Enter your") or
+                                    self._find_ui_elements(
+                                        ve_xml,
+                                        resource_id="spinEditText"))
+                                if bs_chk:
+                                    log.info("UI_RST: Bottom sheet "
+                                             "opened after enable "
+                                             "wait!")
+                                    imm_btn_clicked = True
+                                    blind_xml = ve_xml
+                        else:
+                            log.warning(
+                                "UI_RST: Button still disabled after "
+                                "30s wait — tapping anyway")
+                            self._adb_tap(btn_x, btn_y,
+                                          label="rst-still-disabled")
+                            time.sleep(5)
+                            ve_xml = self._dump_ui_xml()
+                            if ve_xml:
+                                bs_chk = (
+                                    self._find_ui_elements(
+                                        ve_xml, text="Start") or
+                                    self._find_ui_elements(
+                                        ve_xml,
+                                        resource_id=(
+                                            "stopEngineButton")) or
+                                    self._find_ui_elements(
+                                        ve_xml,
+                                        text="Enter your") or
+                                    self._find_ui_elements(
+                                        ve_xml,
+                                        resource_id="spinEditText"))
+                                if bs_chk:
+                                    log.info("UI_RST: Bottom sheet "
+                                             "opened despite disabled"
+                                             " flag!")
+                                    imm_btn_clicked = True
+                                    blind_xml = ve_xml
                     break  # Found button, stop XML search
 
                 # Also try "Remote start" text search
@@ -3991,16 +4074,41 @@ img{{max-width:100%;height:auto}}</style></head>
                     xml, resource_id="closeButton")
                 if maint_close:
                     mcx, mcy = maint_close[0][0], maint_close[0][1]
-                    log.info("UI_RST: Dismissing maintenance/promo banner "
-                             "at (%d,%d)", mcx, mcy)
-                    subprocess.run(
-                        ["adb", "shell", "su", "-c",
-                         f"input tap {mcx} {mcy}"],
-                        capture_output=True, timeout=10)
-                    time.sleep(4)
+                    # v1.53.18: Verify this closeButton is actually
+                    # a banner close and not a nav element that will
+                    # take us to Help & Support.  Banner closes are
+                    # typically in the upper portion of the screen.
+                    if mcy > 1500:
+                        log.info("UI_RST: Skipping closeButton at "
+                                 "(%d,%d) — too low on screen, "
+                                 "likely not a banner close",
+                                 mcx, mcy)
+                    else:
+                        log.info("UI_RST: Dismissing maintenance/promo "
+                                 "banner at (%d,%d)", mcx, mcy)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input tap {mcx} {mcy}"],
+                            capture_output=True, timeout=10)
+                        time.sleep(4)
                     # Re-dump XML after banner dismissal — button may
                     # have become enabled once the overlay is gone.
                     xml_fresh = self._dump_ui_xml()
+                    # v1.53.18: Check if we navigated away (e.g. to
+                    # Help and Support page)
+                    if xml_fresh:
+                        help_check = self._find_ui_elements(
+                            xml_fresh, text="Help and Support")
+                        if help_check:
+                            log.warning(
+                                "UI_RST: Banner dismiss navigated to "
+                                "Help and Support — pressing BACK")
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input keyevent BACK"],
+                                capture_output=True, timeout=10)
+                            time.sleep(3)
+                            xml_fresh = self._dump_ui_xml()
                     if xml_fresh:
                         xml = xml_fresh
                         fresh_btn = self._find_ui_elements(
@@ -4063,15 +4171,29 @@ img{{max-width:100%;height:auto}}</style></head>
                         if not xml:
                             continue
                         # Also dismiss any banner that reappeared
+                        # v1.53.18: Only tap closeButton if it's in
+                        # upper screen (not a nav element)
                         mc2 = self._find_ui_elements(
                             xml, resource_id="closeButton")
-                        if mc2:
+                        if mc2 and mc2[0][1] <= 1500:
                             subprocess.run(
                                 ["adb", "shell", "su", "-c",
                                  f"input tap {mc2[0][0]} {mc2[0][1]}"],
                                 capture_output=True, timeout=10)
                             time.sleep(3)
                             xml = self._dump_ui_xml() or xml
+                            # Check for Help nav
+                            hlp = self._find_ui_elements(
+                                xml, text="Help and Support")
+                            if hlp:
+                                log.warning("UI_RST: closeButton went "
+                                            "to Help page — BACK")
+                                subprocess.run(
+                                    ["adb", "shell", "su", "-c",
+                                     "input keyevent BACK"],
+                                    capture_output=True, timeout=10)
+                                time.sleep(3)
+                                xml = self._dump_ui_xml() or xml
                         check = self._find_ui_elements(
                             xml, resource_id="remoteStartButton")
                         if check and check[0][3].get("enabled") == "true":
@@ -9769,7 +9891,7 @@ img{{max-width:100%;height:auto}}</style></head>
             t.start()
 
         log.info("=" * 60)
-        log.info("VW Token Relay v1.53.17 running%s", " (NO FRIDA)" if not frida_ok else "")
+        log.info("VW Token Relay v1.53.18 running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
         log.info("  Topics:")
         log.info("    %s/tokens       — current token state (retained)", MQTT_TOPIC_PREFIX)
