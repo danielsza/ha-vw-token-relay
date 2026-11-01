@@ -183,7 +183,32 @@ The relay was originally developed on a Moto G Pure (XT2163-4, `ellis`, armeabi-
 
 ## Region Notes
 
-Tested on Canadian endpoint (`b-h-s.spr.ca00.p.con-veh.net`). The US endpoint uses the same API — change the base URL to `b-h-s.spr.us00.p.con-veh.net`. No code changes needed.
+Tested on Canadian endpoint (`b-h-s.spr.ca00.p.con-veh.net`). For the US
+endpoint, set both add-on options — the app flavour and the API host must
+match, as they share the same region token (`ca00` vs `us00`):
+
+| Option | Canada | US |
+|--------|--------|----|
+| `vw_package` | `com.vw.carnet.releaseca` | `com.vw.carnet.release` |
+| `base_url` | `https://b-h-s.spr.ca00.p.con-veh.net` | `https://b-h-s.spr.us00.p.con-veh.net` |
+
+With those two set, the relay derives everything else per-region:
+
+- The OIDC `client_id` and token-endpoint URL are **captured from the app's own
+  token requests** (and persisted over retained MQTT), so the direct refresh
+  fallback always targets the IDP that minted your refresh_token. A US
+  refresh_token posted to the CA IDP (or vice versa) fails
+  `invalid_client`/`invalid_grant`, which previously caused needless re-login
+  and reboot escalation.
+- `x-user-country` / `x-user-locale` API headers are derived from the
+  `base_url` region (`CA`/`en-CA` vs `US`/`en-US`); mismatched headers get
+  market-gating 403s from the middleware. Override manually with the
+  `VW_USER_COUNTRY`, `VW_USER_LOCALE`, and `VW_APP_VERSION` environment
+  variables if needed.
+- Auto-login (`vw_auto_login.py`) follows `vw_package` automatically.
+
+> **Note:** `x-app-uuid` is currently a fixed constant. If it turns out to be
+> flavour-specific, capture it from a US token request and report it.
 
 ## Troubleshooting
 

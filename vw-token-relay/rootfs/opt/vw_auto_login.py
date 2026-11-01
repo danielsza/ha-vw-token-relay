@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import subprocess
 import time
 import sys
@@ -19,7 +20,10 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vw-auto-login")
 
-VW_PACKAGE = "com.vw.carnet.releaseca"
+# Must match the installed flavour (releaseca = Canada, release = US).
+# vw_token_relay.py exports VW_PACKAGE into the environment when it invokes
+# this script as a subprocess; entrypoint.sh exports it for add-on runs.
+VW_PACKAGE = os.environ.get("VW_PACKAGE", "com.vw.carnet.releaseca")
 VW_ACTIVITY = "com.vw.myVW.activities.RoutingActivity"
 
 

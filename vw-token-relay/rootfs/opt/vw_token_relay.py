@@ -62,20 +62,32 @@ VW_PACKAGE = os.environ.get("VW_PACKAGE", "com.vw.carnet.releaseca")
 MQTT_TOPIC_PREFIX = "vw"
 BASE_URL = os.environ.get("BASE_URL", "https://b-h-s.spr.ca00.p.con-veh.net")
 
+# Region derived from the base URL host: ca00 → Canada, us00 → US.
+# The app flavour decides (com.vw.carnet.releaseca → ca00, com.vw.carnet.release
+# → us00); keep these in sync with the installed flavour.  All three are
+# env-overridable for unusual setups (e.g. en-US locale on a CA account).
+_REGION = "US" if ".us00." in BASE_URL else "CA"
+VW_USER_COUNTRY = os.environ.get("VW_USER_COUNTRY", _REGION)
+VW_USER_LOCALE = os.environ.get("VW_USER_LOCALE", f"en-{_REGION}")
+VW_APP_VERSION = os.environ.get("VW_APP_VERSION", "2026.6.12-9207")
+
 # Respect LOG_LEVEL env var from add-on config
 _log_level = os.environ.get("LOG_LEVEL", "info").upper()
 if _log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
     logging.getLogger().setLevel(getattr(logging, _log_level))
 
-# Headers the VW API expects on every request
+# Headers the VW API expects on every request.
+# NOTE: x-user-country/x-user-locale must match the region of the tokens —
+# sending CA headers with US tokens (or vice versa) gets market-gating 403s
+# from the middleware, which the keepalive misreads as a PI failure.
 VW_API_HEADERS = {
     "x-user-agent": "mobile-android",
     "x-app-uuid": "ff11f6c3-d7b8-4a93-aac7-475783fab95b",
-    "x-user-country": "CA",
-    "x-app-version": "2026.6.12-9207",
+    "x-user-country": VW_USER_COUNTRY,
+    "x-app-version": VW_APP_VERSION,
     "x-app-device-model": "moto g15 power",
     "x-app-device-os": "36",
-    "x-user-locale": "en-CA",
+    "x-user-locale": VW_USER_LOCALE,
     "Content-Type": "application/json;charset=UTF-8",
 }
 
@@ -537,6 +549,8 @@ class VWTokenRelay:
         self.id_token = None
         self.code_verifier = None  # PKCE verifier from OIDC token exchange
         self.play_integrity_token = None  # PI token from OIDC token grant request
+        self.idp_client_id = None   # OIDC client_id captured from app token requests
+        self.idp_token_url = None   # OIDC token endpoint URL captured from app traffic
         self.vehicle_ids = []
         self.user_id = None
 
@@ -626,6 +640,16 @@ class VWTokenRelay:
                 if "code_verifier" in data and not self.code_verifier:
                     self.code_verifier = data["code_verifier"]
                     log.info("Restored code_verifier from retained MQTT message (len=%d)", len(data["code_verifier"]))
+                if "play_integrity_token" in data and not self.play_integrity_token:
+                    self.play_integrity_token = data["play_integrity_token"]
+                    log.info("Restored play_integrity_token from retained MQTT message (len=%d)",
+                             len(data["play_integrity_token"]))
+                if "idp_client_id" in data and not self.idp_client_id:
+                    self.idp_client_id = data["idp_client_id"]
+                    log.info("Restored idp_client_id from retained MQTT message: %s", self.idp_client_id)
+                if "idp_token_url" in data and not self.idp_token_url:
+                    self.idp_token_url = data["idp_token_url"]
+                    log.info("Restored idp_token_url from retained MQTT message: %s", self.idp_token_url)
             except Exception as e:
                 log.debug("Failed to parse retained token_relay: %s", e)
             return
@@ -8251,10 +8275,15 @@ img{{max-width:100%;height:auto}}</style></head>
         except Exception as e:
             log.debug("Token parse error: %s", e)
 
-    def _store_tokens_from_response(self, body_str, request_body_str=None):
+    def _store_tokens_from_response(self, body_str, request_body_str=None, url=None):
         """Parse and store tokens from an OIDC token response.
         VW IDP returns camelCase keys (idToken, accessToken, refreshToken)
         so we normalize to snake_case before processing."""
+        # Remember the real token endpoint the app used (region-dependent:
+        # ca00 for Canada, us00 for US) so _direct_idp_refresh targets the
+        # same IDP that minted the refresh_token, regardless of BASE_URL.
+        if url and url.endswith("/token"):
+            self.idp_token_url = url
         try:
             body = json.loads(body_str)
         except json.JSONDecodeError:
@@ -8293,6 +8322,12 @@ img{{max-width:100%;height:auto}}</style></head>
                 if "code_verifier" in req_params:
                     self.code_verifier = req_params["code_verifier"][0]
                     log.info("Captured code_verifier from token request (len=%d)", len(self.code_verifier))
+                # The client_id differs per app flavour/region — capture the
+                # real one so _direct_idp_refresh doesn't post US credentials
+                # to the CA IDP (which fails invalid_client/invalid_grant).
+                if "client_id" in req_params and req_params["client_id"][0] != self.idp_client_id:
+                    self.idp_client_id = req_params["client_id"][0]
+                    log.info("Captured OIDC client_id from token request: %s", self.idp_client_id)
                 if "play_integrity_token" in req_params:
                     pi_token = req_params["play_integrity_token"][0]
                     if pi_token and pi_token != "unavailable":
@@ -8333,6 +8368,12 @@ img{{max-width:100%;height:auto}}</style></head>
         # (needed for _direct_idp_refresh to work after recovery)
         if self.code_verifier:
             token_relay["code_verifier"] = self.code_verifier
+        # Persist region-specific IDP parameters so direct refresh keeps
+        # working after a relay restart without waiting for fresh app traffic
+        if self.idp_client_id:
+            token_relay["idp_client_id"] = self.idp_client_id
+        if self.idp_token_url:
+            token_relay["idp_token_url"] = self.idp_token_url
         if token_relay.get("access_token"):
             # Add issued_at so consumers can calculate real remaining TTL
             token_relay["issued_at"] = datetime.now().isoformat()
@@ -8345,8 +8386,12 @@ img{{max-width:100%;height:auto}}</style></head>
                      MQTT_TOPIC_PREFIX, "yes" if "id_token" in token_relay else "no")
 
     # ── Direct IDP token refresh (fallback for id_token capture) ──
-    VW_CA_CLIENT_ID = "69eb3c39-d2be-4006-8197-37cc4971e8fe_MYVW_ANDROID"
-    VW_CA_TOKEN_URL = "https://b-h-s.spr.ca00.p.con-veh.net/oidc/v1/token"
+    # Fallbacks only: the preferred values (idp_client_id / idp_token_url)
+    # are captured from the app's own token requests, so the relay targets
+    # whichever regional IDP the installed flavour uses — releaseca → CA
+    # (ca00), release → US (us00).  Posting a refresh_token to the wrong
+    # region's IDP fails with invalid_client/invalid_grant.
+    VW_DEFAULT_CLIENT_ID = "69eb3c39-d2be-4006-8197-37cc4971e8fe_MYVW_ANDROID"
 
     def _direct_idp_refresh(self):
         """Call the VW IDP token endpoint directly with refresh_token grant.
@@ -8359,10 +8404,13 @@ img{{max-width:100%;height:auto}}</style></head>
             log.warning("IDP refresh: no code_verifier — need app to do a full login first")
             return False
 
-        log.info("IDP refresh: calling token endpoint directly...")
+        client_id = self.idp_client_id or self.VW_DEFAULT_CLIENT_ID
+        token_url = self.idp_token_url or f"{BASE_URL}/oidc/v1/token"
+        log.info("IDP refresh: calling token endpoint directly (%s, client_id=...%s)",
+                 token_url, client_id[-24:])
         data = (
             f"grant_type=refresh_token"
-            f"&client_id={self.VW_CA_CLIENT_ID}"
+            f"&client_id={client_id}"
             f"&code_verifier={self.code_verifier}"
             f"&refresh_token={self.refresh_token}"
         )
@@ -8371,7 +8419,7 @@ img{{max-width:100%;height:auto}}</style></head>
             "User-Agent": "Car-Net/60 CFNetwork/1121.2.2 Darwin/19.3.0",
             "Accept": "*/*",
         }
-        req = Request(self.VW_CA_TOKEN_URL, data=data.encode(), headers=headers, method="POST")
+        req = Request(token_url, data=data.encode(), headers=headers, method="POST")
         try:
             with urlopen(req, timeout=15) as resp:
                 body_str = resp.read().decode()
@@ -8568,7 +8616,8 @@ img{{max-width:100%;height:auto}}</style></head>
         elif msg_type == "token_response":
             log.info("TOKEN_RESP from URL: %s %s",
                      payload.get("method", "?"), payload.get("url", "?"))
-            self._store_tokens_from_response(payload["body"], payload.get("requestBody"))
+            self._store_tokens_from_response(payload["body"], payload.get("requestBody"),
+                                             payload.get("url"))
             self._publish_tokens()
             self._expect_gc_crash = True  # tokens captured; suppress reattach on ART GC crash
 
@@ -8607,6 +8656,10 @@ img{{max-width:100%;height:auto}}</style></head>
                     relay_data["id_token"] = id_tok
                 if self.play_integrity_token:
                     relay_data["play_integrity_token"] = self.play_integrity_token
+                if self.idp_client_id:
+                    relay_data["idp_client_id"] = self.idp_client_id
+                if self.idp_token_url:
+                    relay_data["idp_token_url"] = self.idp_token_url
                 self.mqttc.publish(
                     f"{MQTT_TOPIC_PREFIX}/token_relay",
                     json.dumps(relay_data),
