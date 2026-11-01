@@ -5055,10 +5055,18 @@ img{{max-width:100%;height:auto}}</style></head>
                 # Set a flag so the keepalive loop doesn't force-restart
                 # the app while the user is logging in.
                 if "AzsCall" in fg:
-                    self._login_flow_active = datetime.now()
-                    log.info("NAV: On AzsCallbackActivity (login flow) — "
-                             "waiting for login to complete (suppressing "
-                             "force-restart for 5 min)...")
+                    if self._login_flow_active is None:
+                        self._login_flow_active = datetime.now()
+                        log.info("NAV: On AzsCallbackActivity (login flow) — "
+                                 "waiting for login to complete (auto-login "
+                                 "triggers after 5 min if stuck)...")
+                    else:
+                        login_stuck_min = (
+                            datetime.now() - self._login_flow_active
+                        ).total_seconds() / 60
+                        log.info("NAV: Still on AzsCallbackActivity — login "
+                                 "flow stuck for %.1f min (auto-login "
+                                 "triggers after 5 min)", login_stuck_min)
                     time.sleep(15)
                     return True
 
