@@ -7278,13 +7278,18 @@ img{{max-width:100%;height:auto}}</style></head>
             time.sleep(1)
 
         def _get_activity():
-            r = subprocess.run(
-                ["adb", "shell", "dumpsys", "activity", "top"],
-                capture_output=True, text=True, timeout=10)
-            for line in r.stdout.split('\n'):
-                if 'ACTIVITY' in line and VW_PACKAGE in line:
-                    return line.strip()
-            return "unknown"
+            try:
+                r = subprocess.run(
+                    ["adb", "shell",
+                     "dumpsys activity activities | grep -F mResumedActivity"],
+                    capture_output=True, text=True, timeout=20)
+                out = r.stdout.strip()
+                if VW_PACKAGE in out:
+                    return out
+                return out if out else "unknown"
+            except subprocess.TimeoutExpired:
+                log.warning("AUTO_LOGIN: _get_activity timed out — continuing")
+                return "unknown (timeout)"
 
         def _wait_for_ui_element(desc, timeout=20, interval=3, **kwargs):
             """Retry uiautomator dump until element appears. Returns (xml, True) or (last_xml, False)."""
