@@ -3284,7 +3284,24 @@ img{{max-width:100%;height:auto}}</style></head>
                                  "(attempt %d, fg=%s)",
                                  vv_attempt,
                                  (fg_act or "?")[:60])
-                        time.sleep(8)
+                        # v1.55: If VW app is NOT in foreground,
+                        # re-launch it instead of just waiting
+                        if VW_PACKAGE not in fg_act:
+                            log.info("UI_RST: VW app not in foreground"
+                                     " — re-launching (attempt %d)",
+                                     vv_attempt)
+                            subprocess.run(
+                                ["adb", "shell", "am", "start",
+                                 "-W", "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW."
+                                 "activities.MainActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
+                            time.sleep(8)
+                            self._dismiss_system_dialogs()
+                            self._dismiss_vw_alert_dialogs()
+                        else:
+                            time.sleep(8)
 
             if not correct_vehicle and wrong_vehicle_count == 0:
                 # v1.52.2: Do one final ICE content check before
@@ -3308,12 +3325,73 @@ img{{max-width:100%;height:auto}}</style></head>
                         log.warning("UI_RST: Vehicle name never "
                                     "appeared in %d checks and ICE "
                                     "content inconclusive (%s) — "
-                                    "proceeding cautiously", 8,
-                                    confidence)
+                                    "trying ForcedGarageActivity",
+                                    8, confidence)
+                        # v1.55: Try ForcedGarageActivity before
+                        # giving up — don't just proceed cautiously
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input keyevent BACK"],
+                            capture_output=True, timeout=10)
+                        time.sleep(2)
+                        subprocess.run(
+                            ["adb", "shell", "am", "start",
+                             "-W", "-n",
+                             f"{VW_PACKAGE}/com.vw.myVW."
+                             "activities."
+                             "ForcedGarageActivity"],
+                            capture_output=True, timeout=30,
+                            text=True)
+                        time.sleep(5)
+                        self._dismiss_system_dialogs()
+                        self._dismiss_vw_alert_dialogs()
+                        garage_xml = self._dump_ui_xml()
+                        self._tap_atlas_in_garage(
+                            garage_xml, "last-resort")
+                        time.sleep(12)
+                        # Re-verify after ForcedGarageActivity
+                        final2_xml = self._dump_ui_xml()
+                        if final2_xml:
+                            is_atlas2, conf2 = (
+                                self._verify_atlas_dashboard(
+                                    final2_xml))
+                            if is_atlas2:
+                                log.info("UI_RST: Atlas VERIFIED "
+                                         "after ForcedGarageActivity"
+                                         " last-resort "
+                                         "(confidence=%s)", conf2)
+                                correct_vehicle = True
+                            else:
+                                log.warning("UI_RST: Still not Atlas"
+                                            " after "
+                                            "ForcedGarageActivity "
+                                            "last-resort (%s) — "
+                                            "proceeding cautiously",
+                                            conf2)
                 else:
                     log.warning("UI_RST: Vehicle name never appeared "
-                                "in %d checks, no XML for final check "
-                                "— proceeding cautiously", 8)
+                                "in %d checks, no XML for final "
+                                "check — trying ForcedGarageActivity",
+                                8)
+                    # v1.55: Try ForcedGarageActivity even without
+                    # XML from final check
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         "input keyevent BACK"],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-W", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities."
+                         "ForcedGarageActivity"],
+                        capture_output=True, timeout=30, text=True)
+                    time.sleep(5)
+                    self._dismiss_system_dialogs()
+                    self._dismiss_vw_alert_dialogs()
+                    garage_xml = self._dump_ui_xml()
+                    self._tap_atlas_in_garage(
+                        garage_xml, "no-xml-last-resort")
+                    time.sleep(12)
             elif not correct_vehicle:
                 log.error("UI_RST: Wrong vehicle dashboard loaded "
                           "%d times — aborting", wrong_vehicle_count)
@@ -4055,12 +4133,32 @@ img{{max-width:100%;height:auto}}</style></head>
                         if not is_atlas:
                             log.warning("UI_RST: Recovery restart "
                                         "wrong vehicle (%s) — "
-                                        "trying swipe", conf)
+                                        "trying ForcedGarageActivity",
+                                        conf)
+                            # v1.55: Use ForcedGarageActivity (most
+                            # reliable) instead of just a swipe
                             subprocess.run(
                                 ["adb", "shell", "su", "-c",
-                                 "input swipe 900 520 100 520 400"],
+                                 "input keyevent BACK"],
                                 capture_output=True, timeout=10)
+                            time.sleep(2)
+                            subprocess.run(
+                                ["adb", "shell", "am", "start",
+                                 "-W", "-n",
+                                 f"{VW_PACKAGE}/com.vw.myVW."
+                                 "activities."
+                                 "ForcedGarageActivity"],
+                                capture_output=True, timeout=30,
+                                text=True)
                             time.sleep(5)
+                            self._dismiss_system_dialogs()
+                            self._dismiss_vw_alert_dialogs()
+                            rec_garage_xml = (
+                                self._dump_ui_xml())
+                            self._tap_atlas_in_garage(
+                                rec_garage_xml,
+                                "recovery-phase2")
+                            time.sleep(12)
                     rec_xml = self._dump_ui_xml()
                     if rec_xml:
                         for rid in search_rids:
