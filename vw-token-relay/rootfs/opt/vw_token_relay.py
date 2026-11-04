@@ -7359,6 +7359,8 @@ img{{max-width:100%;height:auto}}</style></head>
           4. AzsCallbackActivity WebView → OIDC email page (id=input_email, btn=next-btn)
           5. OIDC password page (id=password)
           6. Redirect back to app → Frida captures token
+          7. Enter S-PIN if PIN screen is showing (id=pin_entry)
+             Required for Atlas UI-based remote start.
         """
         if not self.vw_email or not self.vw_password:
             log.error("AUTO_LOGIN: No credentials configured (vw_email/vw_password)")
@@ -7809,6 +7811,93 @@ img{{max-width:100%;height:auto}}</style></head>
                                 "msg": "Login completed but token "
                                        "not refreshed"}),
                 )
+
+            # Step 9: Enter S-PIN if the PIN screen is showing
+            # After successful OIDC login, the app may show a PIN entry
+            # screen before becoming fully functional.  The Atlas remote
+            # start requires the UI to be fully usable, so we auto-enter
+            # the S-PIN from the relay config.
+            if self.vw_spin:
+                log.info("AUTO_LOGIN: Step 9 — Checking for S-PIN entry screen...")
+                time.sleep(5)  # Let the app UI settle after Frida reattach
+                xml = self._dump_ui_xml()
+                pin_elems = self._find_ui_elements(
+                    xml, resource_id="pin_entry")
+                pin_title = self._find_ui_elements(
+                    xml, resource_id="title_pin_management")
+                if pin_elems or pin_title:
+                    log.info("AUTO_LOGIN: PIN screen detected — "
+                             "entering S-PIN...")
+                    # Tap the first PIN entry field to focus it
+                    if pin_elems:
+                        cx, cy, bounds, attrs = pin_elems[0]
+                        log.info("AUTO_LOGIN: tap_pin_field(%d,%d) "
+                                 "bounds=%s", cx, cy, bounds)
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             f"input tap {cx} {cy}"],
+                            capture_output=True, timeout=10)
+                    else:
+                        # Fallback: tap where PIN field usually is
+                        log.info("AUTO_LOGIN: tap_pin_field(540,900) "
+                                 "fallback coords")
+                        subprocess.run(
+                            ["adb", "shell", "su", "-c",
+                             "input tap 540 900"],
+                            capture_output=True, timeout=10)
+                    time.sleep(0.5)
+
+                    # Type the S-PIN
+                    log.info("AUTO_LOGIN: Entering S-PIN (%d digits)",
+                             len(self.vw_spin))
+                    subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"input text {self.vw_spin}"],
+                        capture_output=True, timeout=10)
+                    time.sleep(3)
+
+                    # Verify we left the PIN screen
+                    xml2 = self._dump_ui_xml()
+                    pin_still = self._find_ui_elements(
+                        xml2, resource_id="pin_entry")
+                    if pin_still:
+                        log.warning("AUTO_LOGIN: PIN screen still "
+                                    "showing — trying confirm button")
+                        # Try tapping a confirm/submit button
+                        for btn in [{"text": "Confirm"},
+                                    {"text": "Submit"},
+                                    {"text": "Done"},
+                                    {"text": "OK"},
+                                    {"text": "Next"}]:
+                            if self._tap_element(
+                                    xml2, "PIN confirm", **btn):
+                                time.sleep(3)
+                                break
+                        # Final check
+                        xml3 = self._dump_ui_xml()
+                        pin_final = self._find_ui_elements(
+                            xml3, resource_id="pin_entry")
+                        if pin_final:
+                            log.warning("AUTO_LOGIN: PIN entry may "
+                                        "have failed — screen still "
+                                        "showing PIN fields")
+                        else:
+                            log.info("AUTO_LOGIN: PIN accepted after "
+                                     "confirm tap — app fully "
+                                     "functional")
+                    else:
+                        log.info("AUTO_LOGIN: PIN accepted — app "
+                                 "fully functional")
+
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/auto_login",
+                        json.dumps({"status": "pin_entered",
+                                    "msg": "S-PIN entered "
+                                           "successfully"}))
+                else:
+                    log.info("AUTO_LOGIN: No PIN screen detected — "
+                             "app already past PIN entry or PIN "
+                             "not required")
 
         except Exception as e:
             log.error("AUTO_LOGIN: Failed: %s", e)
