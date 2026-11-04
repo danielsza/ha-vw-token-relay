@@ -787,9 +787,10 @@ print('Saved /data/stock_boot.img',flush=True)
 # and waits for ADB to come back — all synchronously so that
 # frida-server is never started on a phone that still needs a reboot.
 ensure_pif_installed() {
-    if adb shell "su -c 'test -d /data/adb/modules/playintegrityfix'" 2>/dev/null || \
+    if adb shell "su -c 'test -d /data/adb/modules/tricky_store'" 2>/dev/null || \
+       adb shell "su -c 'test -d /data/adb/modules/playintegrityfix'" 2>/dev/null || \
        adb shell "su -c 'test -d /data/adb/modules/playintegrityfork'" 2>/dev/null; then
-        echo "PIF: Module already installed, skipping"
+        echo "PIF: Module already installed (or AlwaysStrong present), skipping"
         return 0
     fi
 
@@ -935,7 +936,7 @@ ensure_phone_ready() {
     echo "Force-restarting VW app..."
     adb shell "am force-stop ${VW_PACKAGE}" 2>/dev/null || true
     sleep 2
-    adb shell "am start -n ${VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity" 2>/dev/null || true
+    adb shell "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER ${VW_PACKAGE}" 2>/dev/null || true
     sleep 5
 
     # Keep screen on while plugged in (developer setting)
