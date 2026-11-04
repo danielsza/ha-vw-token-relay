@@ -7469,14 +7469,91 @@ img{{max-width:100%;height:auto}}</style></head>
                 capture_output=True, timeout=10)
             time.sleep(10)  # Longer wait for splash/welcome
 
+            # v1.55.1: Verify VW app is actually in the foreground.
+            # If another app (e.g. Clock alarm settings) is on top,
+            # the UI dumps will show that app's elements instead of
+            # VW's login screen, and all searches will fail.
             activity = _get_activity()
             log.info("AUTO_LOGIN: After launch, activity: %s", activity)
+            fg = self._get_foreground_activity() or ""
+            if VW_PACKAGE not in fg:
+                log.warning("AUTO_LOGIN: VW app NOT in foreground! "
+                            "fg=%s — clearing and relaunching", fg)
+                # Press HOME to dismiss whatever app is on top
+                subprocess.run(
+                    ["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
+                    capture_output=True, timeout=10)
+                time.sleep(2)
+                # Relaunch VW with force-stop flag
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-S", "-W", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    capture_output=True, timeout=30)
+                time.sleep(8)
+                # Retry foreground check up to 3 times
+                for fg_retry in range(3):
+                    fg = self._get_foreground_activity() or ""
+                    if VW_PACKAGE in fg:
+                        log.info("AUTO_LOGIN: VW app now in "
+                                 "foreground (retry %d)", fg_retry)
+                        break
+                    log.warning("AUTO_LOGIN: VW still not in fg "
+                                "(retry %d): %s", fg_retry, fg)
+                    # Press BACK to dismiss any overlay, then relaunch
+                    subprocess.run(
+                        ["adb", "shell", "input", "keyevent",
+                         "KEYCODE_BACK"],
+                        capture_output=True, timeout=10)
+                    time.sleep(1)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-W", "-n",
+                         f"{VW_PACKAGE}/com.vw.myVW.activities."
+                         "RoutingActivity"],
+                        capture_output=True, timeout=30)
+                    time.sleep(8)
+                else:
+                    log.error("AUTO_LOGIN: Could not bring VW app "
+                              "to foreground after 3 retries — "
+                              "aborting login flow")
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/auto_login",
+                        json.dumps({"status": "error",
+                                    "msg": "VW app not in foreground"
+                                           " — another app blocking"}),
+                    )
+                    return
+                self._dismiss_system_dialogs()
+                self._dismiss_vw_alert_dialogs()
 
             # Step 4: Dismiss welcome/splash screen(s)
             # The app shows "We ride with Canada" splash. Tap through it.
             log.info("AUTO_LOGIN: Step 4 — Dismissing welcome screen(s)...")
             for attempt in range(3):
                 xml = self._dump_ui_xml()
+
+                # v1.55.1: Sanity-check that this XML belongs to VW,
+                # not a stray app.  If VW package isn't anywhere in
+                # the XML AND the foreground isn't VW, skip this
+                # iteration and relaunch.
+                fg_check = self._get_foreground_activity() or ""
+                if (xml and VW_PACKAGE not in xml
+                        and VW_PACKAGE not in fg_check):
+                    log.warning("AUTO_LOGIN: UI XML does not belong "
+                                "to VW app (attempt %d) — relaunching",
+                                attempt)
+                    subprocess.run(
+                        ["adb", "shell", "input", "keyevent",
+                         "KEYCODE_HOME"],
+                        capture_output=True, timeout=10)
+                    time.sleep(1)
+                    subprocess.run(
+                        ["adb", "shell", "am", "start", "-S", "-W",
+                         "-n", f"{VW_PACKAGE}/com.vw.myVW.activities."
+                         "RoutingActivity"],
+                        capture_output=True, timeout=30)
+                    time.sleep(8)
+                    continue
+
                 _log_ui_elements(xml, f"screen_{attempt}")
 
                 # Check if we've reached the native login screen (has loginButton)
@@ -7531,6 +7608,17 @@ img{{max-width:100%;height:auto}}</style></head>
 
             # Step 5: Tap "Log in" on native login screen
             log.info("AUTO_LOGIN: Step 5 — Tapping native 'Log in' button...")
+            # v1.55.1: One final foreground check before blind taps
+            fg_pre5 = self._get_foreground_activity() or ""
+            if VW_PACKAGE not in fg_pre5:
+                log.warning("AUTO_LOGIN: VW not in fg before Step 5 "
+                            "(%s) — relaunching", fg_pre5)
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-S", "-W", "-n",
+                     f"{VW_PACKAGE}/com.vw.myVW.activities."
+                     "RoutingActivity"],
+                    capture_output=True, timeout=30)
+                time.sleep(10)
             xml = self._dump_ui_xml()
             _log_ui_elements(xml, "native_login")
 
