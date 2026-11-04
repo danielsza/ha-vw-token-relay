@@ -8547,7 +8547,7 @@ img{{max-width:100%;height:auto}}</style></head>
             parts = token.split(".")
             if len(parts) != 3:
                 return
-            payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
             claims = json.loads(base64.urlsafe_b64decode(payload))
 
             expiry = datetime.fromtimestamp(claims["exp"])
@@ -8941,13 +8941,24 @@ img{{max-width:100%;height:auto}}</style></head>
                 # from original OAuth grant)
                 try:
                     jwt_parts = token.split(".")
-                    jwt_b64 = jwt_parts[1] + "=" * (4 - len(jwt_parts[1]) % 4)
+                    jwt_b64 = jwt_parts[1] + "=" * (-len(jwt_parts[1]) % 4)
                     jwt_claims = json.loads(base64.urlsafe_b64decode(jwt_b64))
                     exp = jwt_claims.get("exp")
                     if exp:
                         relay_data["expires_in"] = int(exp - time.time())
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("JWT decode failed for expires_in: %s", e)
+                # Fallback: use global_expiry already computed by
+                # _store_token_from_header (always available after a
+                # successful auth_header capture)
+                if "expires_in" not in relay_data:
+                    with self._lock:
+                        ge = getattr(self, 'global_expiry', None)
+                    if ge:
+                        relay_data["expires_in"] = int(
+                            (ge - datetime.now()).total_seconds())
+                        log.info("expires_in from global_expiry fallback: %d",
+                                 relay_data["expires_in"])
                 if refresh:
                     relay_data["refresh_token"] = refresh
                 if id_tok:
@@ -8964,7 +8975,7 @@ img{{max-width:100%;height:auto}}</style></head>
                     retain=True,
                 )
                 self._publish_tokens()
-                log.info("Published token_relay (new token)")
+                log.info("Published token_relay (new token, expires_in=%s)", relay_data.get("expires_in", "MISSING"))
 
         elif msg_type == "id_token_url":
             # Capture ALL OAuth tokens from URL query params (redirect callback)
