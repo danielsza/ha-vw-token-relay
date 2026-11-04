@@ -4900,8 +4900,10 @@ img{{max-width:100%;height:auto}}</style></head>
                          fg[:40] if fg else 'none')
                 try:
                     subprocess.run(
-                        ["adb", "shell", "am", "start", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                        ["adb", "shell", "am", "start",
+                         "-a", "android.intent.action.MAIN",
+                         "-c", "android.intent.category.LAUNCHER",
+                         VW_PACKAGE],
                         capture_output=True, timeout=10,
                     )
                     time.sleep(6)
@@ -5048,8 +5050,10 @@ img{{max-width:100%;height:auto}}</style></head>
                         capture_output=True, timeout=10)
                     time.sleep(2)
                     subprocess.run(
-                        ["adb", "shell", "am", "start", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                        ["adb", "shell", "am", "start",
+                         "-a", "android.intent.action.MAIN",
+                         "-c", "android.intent.category.LAUNCHER",
+                         VW_PACKAGE],
                         capture_output=True, timeout=10)
                     time.sleep(8)
                     return True
@@ -5165,9 +5169,10 @@ img{{max-width:100%;height:auto}}</style></head>
                         capture_output=True, timeout=10)
                     time.sleep(2)
                     subprocess.run(
-                        ["adb", "shell", "am", "start", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities."
-                         f"RoutingActivity"],
+                        ["adb", "shell", "am", "start",
+                         "-a", "android.intent.action.MAIN",
+                         "-c", "android.intent.category.LAUNCHER",
+                         VW_PACKAGE],
                         capture_output=True, timeout=10)
                     time.sleep(8)
                     return True
@@ -5948,8 +5953,10 @@ img{{max-width:100%;height:auto}}</style></head>
             log.info("WAKE: VW app not in foreground — launching...")
             try:
                 subprocess.run(
-                    ["adb", "shell", "am", "start", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    ["adb", "shell", "am", "start",
+                     "-a", "android.intent.action.MAIN",
+                     "-c", "android.intent.category.LAUNCHER",
+                     VW_PACKAGE],
                     capture_output=True, timeout=10,
                 )
                 time.sleep(10)
@@ -5982,8 +5989,10 @@ img{{max-width:100%;height:auto}}</style></head>
             time.sleep(3)
             log.info("WAKE: Relaunching VW app...")
             subprocess.run(
-                ["adb", "shell", "am", "start", "-n",
-                 f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                ["adb", "shell", "am", "start",
+                 "-a", "android.intent.action.MAIN",
+                 "-c", "android.intent.category.LAUNCHER",
+                 VW_PACKAGE],
                 capture_output=True, timeout=10,
             )
         except Exception as e:
@@ -6774,8 +6783,10 @@ img{{max-width:100%;height:auto}}</style></head>
                                capture_output=True, timeout=10)
                 time.sleep(3)
                 subprocess.run(
-                    ["adb", "shell", "am", "start", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    ["adb", "shell", "am", "start",
+                     "-a", "android.intent.action.MAIN",
+                     "-c", "android.intent.category.LAUNCHER",
+                     VW_PACKAGE],
                     capture_output=True, timeout=10)
                 time.sleep(8)
                 xml = self._dump_ui_xml()
@@ -7464,8 +7475,10 @@ img{{max-width:100%;height:auto}}</style></head>
             # Step 3: Launch app fresh
             log.info("AUTO_LOGIN: Step 3 — Launching VW app fresh...")
             subprocess.run(
-                ["adb", "shell", "am", "start", "-n",
-                 f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                ["adb", "shell", "am", "start",
+                 "-a", "android.intent.action.MAIN",
+                 "-c", "android.intent.category.LAUNCHER",
+                 VW_PACKAGE],
                 capture_output=True, timeout=10)
             time.sleep(10)  # Longer wait for splash/welcome
 
@@ -7486,8 +7499,10 @@ img{{max-width:100%;height:auto}}</style></head>
                 time.sleep(2)
                 # Relaunch VW with force-stop flag
                 subprocess.run(
-                    ["adb", "shell", "am", "start", "-S", "-W", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities.RoutingActivity"],
+                    ["adb", "shell", "am", "start", "-S", "-W",
+                     "-a", "android.intent.action.MAIN",
+                     "-c", "android.intent.category.LAUNCHER",
+                     VW_PACKAGE],
                     capture_output=True, timeout=30)
                 time.sleep(8)
                 # Retry foreground check up to 3 times
@@ -7506,9 +7521,10 @@ img{{max-width:100%;height:auto}}</style></head>
                         capture_output=True, timeout=10)
                     time.sleep(1)
                     subprocess.run(
-                        ["adb", "shell", "am", "start", "-W", "-n",
-                         f"{VW_PACKAGE}/com.vw.myVW.activities."
-                         "RoutingActivity"],
+                        ["adb", "shell", "am", "start", "-W",
+                         "-a", "android.intent.action.MAIN",
+                         "-c", "android.intent.category.LAUNCHER",
+                         VW_PACKAGE],
                         capture_output=True, timeout=30)
                     time.sleep(8)
                 else:
@@ -7548,8 +7564,9 @@ img{{max-width:100%;height:auto}}</style></head>
                     time.sleep(1)
                     subprocess.run(
                         ["adb", "shell", "am", "start", "-S", "-W",
-                         "-n", f"{VW_PACKAGE}/com.vw.myVW.activities."
-                         "RoutingActivity"],
+                         "-a", "android.intent.action.MAIN",
+                         "-c", "android.intent.category.LAUNCHER",
+                         VW_PACKAGE],
                         capture_output=True, timeout=30)
                     time.sleep(8)
                     continue
@@ -7614,9 +7631,10 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.warning("AUTO_LOGIN: VW not in fg before Step 5 "
                             "(%s) — relaunching", fg_pre5)
                 subprocess.run(
-                    ["adb", "shell", "am", "start", "-S", "-W", "-n",
-                     f"{VW_PACKAGE}/com.vw.myVW.activities."
-                     "RoutingActivity"],
+                    ["adb", "shell", "am", "start", "-S", "-W",
+                     "-a", "android.intent.action.MAIN",
+                     "-c", "android.intent.category.LAUNCHER",
+                     VW_PACKAGE],
                     capture_output=True, timeout=30)
                 time.sleep(10)
             xml = self._dump_ui_xml()
