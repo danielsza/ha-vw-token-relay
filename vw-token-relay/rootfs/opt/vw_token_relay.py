@@ -4928,6 +4928,23 @@ img{{max-width:100%;height:auto}}</style></head>
                 # Re-dump after dismissals in case the UI changed
                 xml = self._dump_ui_xml()
 
+            # v1.55.6: Check for PIN screen after launch/wake and
+            # auto-enter S-PIN if present.  The PIN bottom sheet can
+            # appear on any cold or warm launch, not just during
+            # _auto_login, and blocks all further navigation until
+            # it is handled.
+            if xml and self.vw_spin:
+                spin_entered = self._enter_spin_if_present(xml)
+                if spin_entered:
+                    log.info("NAV: S-PIN entered via auto-entry — "
+                             "waiting for app to process...")
+                    time.sleep(5)
+                    xml = self._dump_ui_xml()
+                    # Re-check foreground in case we moved screens
+                    fg = self._get_foreground_activity() or ""
+                    on_garage = "ForcedGarageActivity" in fg
+                    on_main = "MainActivity" in fg
+
             # ── Garage screen: tap a vehicle card ──
             if on_garage and xml:
                 log.info("NAV: On Garage — looking for vehicle cards")
@@ -9004,10 +9021,10 @@ img{{max-width:100%;height:auto}}</style></head>
                             with self._lock:
                                 self.access_token = at
                                 try:
-                                    import base64, json as _json
+                                    import base64 as _b64, json as _json
                                     payload_b64 = at.split(".")[1]
                                     payload_b64 += "=" * (4 - len(payload_b64) % 4)
-                                    claims = _json.loads(base64.urlsafe_b64decode(payload_b64))
+                                    claims = _json.loads(_b64.urlsafe_b64decode(payload_b64))
                                     exp_ts = claims.get("exp")
                                     if exp_ts:
                                         self.global_expiry = datetime.fromtimestamp(exp_ts)
@@ -9032,10 +9049,10 @@ img{{max-width:100%;height:auto}}</style></head>
                                 with self._lock:
                                     self.access_token = at
                                     try:
-                                        import base64, json as _json
+                                        import base64 as _b64, json as _json
                                         payload_b64 = at.split(".")[1]
                                         payload_b64 += "=" * (4 - len(payload_b64) % 4)
-                                        claims = _json.loads(base64.urlsafe_b64decode(payload_b64))
+                                        claims = _json.loads(_b64.urlsafe_b64decode(payload_b64))
                                         exp_ts = claims.get("exp")
                                         if exp_ts:
                                             self.global_expiry = datetime.fromtimestamp(exp_ts)
