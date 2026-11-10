@@ -10114,6 +10114,15 @@ img{{max-width:100%;height:auto}}</style></head>
                         all_expired = False
                 has_any_token = bool(self.tokens) or self.global_token
 
+            # ── Periodic vehicle swap ──
+            # Rotate between vehicles so both get fresh tokens.
+            # Must run BEFORE the token-refresh block, which can
+            # 'continue' on success and would skip this code.
+            try:
+                self._periodic_vehicle_swap()
+            except Exception as e:
+                log.error("KEEPALIVE: Vehicle swap error (non-fatal): %s", e)
+
             if needs_refresh or not has_any_token:
                 # ── Step 1: wake the running app (~30s) ──
                 log.info("Tokens expiring/missing, waking app for refresh...")
@@ -10427,14 +10436,6 @@ img{{max-width:100%;height:auto}}</style></head>
                 }),
                 retain=True,
             )
-
-            # ── Periodic vehicle swap ──
-            # Rotate between vehicles so both get fresh tokens.
-            # Runs after all recovery/health checks — only when healthy.
-            try:
-                self._periodic_vehicle_swap()
-            except Exception as e:
-                log.error("KEEPALIVE: Vehicle swap error (non-fatal): %s", e)
 
             # Always publish current state
             self._publish_tokens()
