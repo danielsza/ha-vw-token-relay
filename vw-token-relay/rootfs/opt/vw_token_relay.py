@@ -593,6 +593,17 @@ class VWTokenRelay:
         self._twofa_code = None
         self._twofa_event = threading.Event()
 
+        # Periodic vehicle swap: rotate the VW app between vehicles so
+        # Frida captures fresh tokens for both.  The swap skips if a UI
+        # remote start is in progress or maintenance mode is active.
+        self._vehicle_swap_interval = 30  # minutes between swaps
+        self._last_vehicle_swap = None    # datetime of last swap
+        self._vehicle_swap_enabled = True
+        # Ordered list of vehicle UUIDs to rotate through.
+        # The swap cycles through this list round-robin.
+        self._swap_vehicle_list = []  # populated from vehicle_ids once known
+        self._swap_vehicle_index = 0  # index into _swap_vehicle_list
+
     # ── MQTT ────────────────────────────────────────────────────────
     def _setup_mqtt(self):
         # paho-mqtt v2 requires callback_api_version
@@ -1537,6 +1548,69 @@ img{{max-width:100%;height:auto}}</style></head>
                 log.info("VNC: Stopped")
             except Exception as e:
                 log.error("VNC: Stop failed: %s", e)
+        elif cmd == "vehicle_swap":
+            # Control periodic vehicle swap.  Payloads:
+            #   "on"  / "enable"  — enable periodic swap
+            #   "off" / "disable" — disable periodic swap
+            #   "now"             — swap immediately (one-shot)
+            #   "status"          — publish current swap state
+            #   "30"  (number)    — set interval in minutes
+            sub = payload.strip().lower()
+            if sub in ("on", "1", "true", "enable"):
+                self._vehicle_swap_enabled = True
+                log.info("VEHICLE_SWAP: Enabled (interval=%d min)",
+                         self._vehicle_swap_interval)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+                    json.dumps({"status": "enabled",
+                                "interval_min": self._vehicle_swap_interval}),
+                    retain=True)
+            elif sub in ("off", "0", "false", "disable"):
+                self._vehicle_swap_enabled = False
+                log.info("VEHICLE_SWAP: Disabled")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+                    json.dumps({"status": "disabled"}), retain=True)
+            elif sub == "now":
+                log.info("VEHICLE_SWAP: Manual swap requested")
+                # Force immediate swap by clearing the last-swap time
+                self._last_vehicle_swap = None
+                self._vehicle_swap_enabled = True
+                threading.Thread(
+                    target=self._periodic_vehicle_swap,
+                    daemon=True).start()
+            elif sub == "status":
+                vid_names = {"702b3cc5": "Buzz", "90bf07c5": "Atlas"}
+                cur_vid = (self._swap_vehicle_list[self._swap_vehicle_index]
+                           if self._swap_vehicle_list else None)
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+                    json.dumps({
+                        "status": "enabled" if self._vehicle_swap_enabled else "disabled",
+                        "interval_min": self._vehicle_swap_interval,
+                        "current_vehicle": cur_vid,
+                        "current_name": vid_names.get(cur_vid[:8], cur_vid[:8]) if cur_vid else None,
+                        "last_swap": self._last_vehicle_swap.isoformat() if self._last_vehicle_swap else None,
+                        "vehicle_list": [v[:8] for v in self._swap_vehicle_list],
+                    }),
+                    retain=True)
+            else:
+                # Try to parse as interval in minutes
+                try:
+                    interval = int(sub)
+                    if 5 <= interval <= 240:
+                        self._vehicle_swap_interval = interval
+                        log.info("VEHICLE_SWAP: Interval set to %d min", interval)
+                        self.mqttc.publish(
+                            f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+                            json.dumps({"status": "interval_set",
+                                        "interval_min": interval}),
+                            retain=True)
+                    else:
+                        log.warning("VEHICLE_SWAP: Interval %d out of "
+                                    "range (5-240 min)", interval)
+                except ValueError:
+                    log.warning("VEHICLE_SWAP: Unknown sub-command: %s", sub)
         else:
             log.warning("Unknown command: %s", cmd)
 
@@ -9710,6 +9784,119 @@ img{{max-width:100%;height:auto}}</style></head>
             retain=True,
         )
 
+    # ── Periodic vehicle swap ──────────────────────────────────────
+    def _periodic_vehicle_swap(self):
+        """Rotate the VW app to the next vehicle so Frida captures fresh
+        tokens for all vehicles (not just whichever one the app landed on).
+
+        Called from the keepalive loop.  Skips silently when:
+          - vehicle swap is disabled
+          - not enough time has elapsed since the last swap
+          - a UI remote start is in progress (_ui_rst_lock held)
+          - maintenance mode is active
+          - fewer than 2 vehicles are known
+          - the phone is down or Frida is detached
+        """
+        if not self._vehicle_swap_enabled:
+            return
+
+        # Populate swap list from discovered vehicle_ids (once we know them)
+        with self._lock:
+            known_vids = list(self.vehicle_ids)
+        if len(known_vids) < 2:
+            return  # nothing to rotate
+
+        if sorted(self._swap_vehicle_list) != sorted(known_vids):
+            self._swap_vehicle_list = list(known_vids)
+            self._swap_vehicle_index = 0
+            log.info("VEHICLE_SWAP: Vehicle list updated: %s",
+                     [v[:8] for v in self._swap_vehicle_list])
+
+        # Check time elapsed
+        now = datetime.now()
+        if self._last_vehicle_swap is not None:
+            elapsed = (now - self._last_vehicle_swap).total_seconds() / 60
+            if elapsed < self._vehicle_swap_interval:
+                return  # too soon
+
+        # Skip if maintenance mode is on (another UI flow is running)
+        if self._maintenance.is_set():
+            log.debug("VEHICLE_SWAP: Skipping — maintenance mode active")
+            return
+
+        # Skip if a UI remote start is in progress.  Try to acquire the
+        # lock non-blocking — if we can't, a remote start is running and
+        # we must not interfere.  Daniel's rule: let the start phase
+        # finish before swapping.
+        if not hasattr(self, '_ui_rst_lock'):
+            self._ui_rst_lock = threading.Lock()
+        if not self._ui_rst_lock.acquire(blocking=False):
+            log.info("VEHICLE_SWAP: Skipping — UI remote start in progress")
+            return
+        # Release immediately — we just needed to check, not hold it
+        # during the swap.  The swap uses _switch_vehicle which sets
+        # maintenance mode internally if needed.
+        self._ui_rst_lock.release()
+
+        # Skip if Frida is not attached (tokens can't be captured anyway)
+        if self.session is None or self.script is None:
+            log.debug("VEHICLE_SWAP: Skipping — Frida not attached")
+            return
+
+        # Determine next vehicle
+        next_idx = (self._swap_vehicle_index + 1) % len(self._swap_vehicle_list)
+        next_vid = self._swap_vehicle_list[next_idx]
+
+        # Map short IDs to names for logging
+        vid_names = {"702b3cc5": "Buzz", "90bf07c5": "Atlas"}
+        next_name = vid_names.get(next_vid[:8], next_vid[:8])
+
+        log.info("VEHICLE_SWAP: Rotating to %s (%s) — interval %d min",
+                 next_name, next_vid[:16], self._vehicle_swap_interval)
+
+        self._last_vehicle_swap = now
+        self._swap_vehicle_index = next_idx
+
+        # Publish swap status
+        self.mqttc.publish(
+            f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+            json.dumps({
+                "status": "swapping",
+                "target": next_vid,
+                "target_name": next_name,
+                "timestamp": now.isoformat(),
+            }),
+            retain=True,
+        )
+
+        try:
+            self._switch_vehicle(next_vid)
+            log.info("VEHICLE_SWAP: Swap to %s complete", next_name)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+                json.dumps({
+                    "status": "completed",
+                    "target": next_vid,
+                    "target_name": next_name,
+                    "timestamp": datetime.now().isoformat(),
+                }),
+                retain=True,
+            )
+        except Exception as e:
+            log.error("VEHICLE_SWAP: Failed to swap to %s: %s",
+                      next_name, e, exc_info=True)
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/vehicle_swap",
+                json.dumps({
+                    "status": "error",
+                    "target": next_vid,
+                    "target_name": next_name,
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat(),
+                }),
+                retain=True,
+            )
+
     # ── Keep-alive loop ─────────────────────────────────────────────
     def _keepalive_loop_safe(self):
         """Wrapper ensuring the keepalive thread never dies silently.
@@ -10231,6 +10418,14 @@ img{{max-width:100%;height:auto}}</style></head>
                 }),
                 retain=True,
             )
+
+            # ── Periodic vehicle swap ──
+            # Rotate between vehicles so both get fresh tokens.
+            # Runs after all recovery/health checks — only when healthy.
+            try:
+                self._periodic_vehicle_swap()
+            except Exception as e:
+                log.error("KEEPALIVE: Vehicle swap error (non-fatal): %s", e)
 
             # Always publish current state
             self._publish_tokens()
