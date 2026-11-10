@@ -8860,6 +8860,15 @@ img{{max-width:100%;height:auto}}</style></head>
                     json.dumps(vehicles), retain=True,
                 )
                 log.info("Published garage data (%d vehicles)", len(vehicles))
+                # Populate vehicle_ids from garage so the swap feature
+                # knows about all vehicles before tokens arrive.
+                with self._lock:
+                    for v in data["vehicles"]:
+                        gvid = v.get("vehicleId")
+                        if gvid and gvid not in self.vehicle_ids:
+                            self.vehicle_ids.append(gvid)
+                            log.info("GARAGE: Discovered vehicle %s (%s)",
+                                     gvid[:8], v.get("vehicleNickName", ""))
             return
 
         # ── RVS vehicle status ──
