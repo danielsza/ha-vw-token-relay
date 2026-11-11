@@ -8890,9 +8890,51 @@ img{{max-width:100%;height:auto}}</style></head>
                 result["verified"] = True
             elif post_check and post_check.get("has_mismatch"):
                 remaining = post_check.get("mismatches", {})
-                log.warning("PROP_UNIFY: Partial success — remaining mismatches: %s", remaining)
-                result["verified"] = False
-                result["remaining_mismatches"] = remaining
+                # Step 4b: If script left mismatches, fix them with manual resetprop
+                if script_found and remaining:
+                    log.info("PROP_UNIFY: Script left %d mismatches — patching with resetprop", len(remaining))
+                    patch_cmds = []
+                    for mm_key, mm_val in remaining.items():
+                        ev = mm_val["expected"]
+                        if mm_key == "model":
+                            patch_cmds += [f"resetprop -n ro.product.model '{ev}'", f"resetprop -n ro.product.system.model '{ev}'"]
+                        elif mm_key == "device":
+                            patch_cmds += [f"resetprop -n ro.product.device '{ev}'", f"resetprop -n ro.build.product '{ev}'"]
+                        elif mm_key == "brand":
+                            patch_cmds.append(f"resetprop -n ro.product.brand '{ev}'")
+                        elif mm_key == "manufacturer":
+                            patch_cmds.append(f"resetprop -n ro.product.manufacturer '{ev}'")
+                        elif mm_key == "product":
+                            patch_cmds.append(f"resetprop -n ro.product.name '{ev}'")
+                        elif mm_key == "fingerprint":
+                            patch_cmds += [
+                                f"resetprop -n ro.build.fingerprint '{ev}'",
+                                f"resetprop -n ro.vendor.build.fingerprint '{ev}'",
+                                f"resetprop -n ro.system.build.fingerprint '{ev}'",
+                                f"resetprop -n ro.bootimage.build.fingerprint '{ev}'",
+                            ]
+                    if patch_cmds:
+                        full_cmd = " && ".join(patch_cmds)
+                        r2 = subprocess.run(
+                            ["adb", "shell", "su", "-c", full_cmd],
+                            capture_output=True, text=True, timeout=30)
+                        log.info("PROP_UNIFY [patch]: rc=%d, fixed %d remaining props", r2.returncode, len(patch_cmds))
+                        # Re-verify after patch
+                        post_check2 = self._check_prop_mismatch()
+                        if post_check2 and not post_check2.get("has_mismatch"):
+                            log.info("PROP_UNIFY: SUCCESS — all props now match after patch")
+                            result["verified"] = True
+                            result["status"] = "unified_via_script_plus_patch"
+                            result.pop("remaining_mismatches", None)
+                        else:
+                            remaining = post_check2.get("mismatches", {}) if post_check2 else remaining
+                            log.warning("PROP_UNIFY: Still mismatched after patch: %s", remaining)
+                            result["verified"] = False
+                            result["remaining_mismatches"] = remaining
+                else:
+                    log.warning("PROP_UNIFY: Partial success — remaining mismatches: %s", remaining)
+                    result["verified"] = False
+                    result["remaining_mismatches"] = remaining
 
             # Step 5: Create boot persistence script if requested
             if persist and result.get("status", "").startswith("unified"):
