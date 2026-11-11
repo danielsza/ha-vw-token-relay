@@ -856,6 +856,18 @@ class VWTokenRelay:
                     "denylist_status": "magisk --denylist status 2>/dev/null; echo rc=$?",
                     "rezygisk_status": "cat /data/adb/modules/rezygisk/module.prop 2>/dev/null || echo NOT_FOUND",
                     "installed_packages": "pm list packages 2>/dev/null | grep -E 'playintegrity|spic|yasnac|keyattest' || echo NONE_FOUND",
+                    # Device identity props (for prop_unify mismatch detection)
+                    "product_model": "getprop ro.product.model",
+                    "product_device": "getprop ro.product.device",
+                    "product_brand": "getprop ro.product.brand",
+                    "product_manufacturer": "getprop ro.product.manufacturer",
+                    "product_name": "getprop ro.product.name",
+                    # Tricky Store / AlwaysStrong PIF config (uses cp workaround for SELinux)
+                    "ts_custom_pif": "cp /data/adb/modules/tricky_store/custom.pif.prop /data/local/tmp/_diag_pif.tmp 2>/dev/null && cat /data/local/tmp/_diag_pif.tmp && rm /data/local/tmp/_diag_pif.tmp || echo NOT_FOUND",
+                    "ts_pif": "cp /data/adb/modules/tricky_store/pif.prop /data/local/tmp/_diag_pif2.tmp 2>/dev/null && cat /data/local/tmp/_diag_pif2.tmp && rm /data/local/tmp/_diag_pif2.tmp || echo NOT_FOUND",
+                    "prop_unify_sh": "test -f /data/adb/modules/tricky_store/prop_unify.sh && echo FOUND || echo NOT_FOUND",
+                    "service_d_scripts": "ls /data/adb/service.d/ 2>/dev/null || echo NO_DIR",
+                    "resetprop_available": "which resetprop 2>/dev/null || echo NOT_FOUND",
                 }
                 for key, cmd_str in cmds.items():
                     try:
@@ -980,6 +992,26 @@ class VWTokenRelay:
                                  daemon=True).start()
             else:
                 log.warning("SET_PIF: No fingerprint in payload")
+        elif cmd == "prop_unify":
+            # Unify system props with PIF-spoofed identity to close the
+            # device mismatch that causes VW 401s on older/spoofed devices.
+            # Payload: empty or "check" = just check mismatch; "run" or "fix" = fix it;
+            # "persist" = fix + create boot script (default).
+            def _prop_unify(action):
+                if action in ("check", "status"):
+                    mismatch = self._check_prop_mismatch()
+                    self.mqttc.publish(
+                        f"{MQTT_TOPIC_PREFIX}/prop_unify",
+                        json.dumps(mismatch or {"status": "no_pif_config"}),
+                        retain=True)
+                elif action in ("run", "fix"):
+                    self._run_prop_unify(persist=False)
+                else:
+                    # Default: fix + persist
+                    self._run_prop_unify(persist=True)
+            action = payload.strip().lower() if payload.strip() else "persist"
+            log.info("PROP_UNIFY: Command received (action=%s)", action)
+            threading.Thread(target=_prop_unify, args=(action,), daemon=True).start()
         elif cmd == "launch_app":
             # Launch any app by package name (payload = package name)
             pkg = payload.strip()
@@ -8622,6 +8654,17 @@ img{{max-width:100%;height:auto}}</style></head>
                 f"{MQTT_TOPIC_PREFIX}/pif_update",
                 json.dumps({"status": status, "output": result.stdout[-500:]}),
             )
+            # After PIF update, also unify system props to close identity mismatch.
+            # The phone reboots after PIF update, so wait for it to come back first.
+            if status == "success":
+                try:
+                    log.info("PIF UPDATE: Waiting for phone to come back after reboot...")
+                    subprocess.run(["adb", "wait-for-device"], capture_output=True, timeout=120)
+                    time.sleep(30)  # let boot + modules initialize
+                    log.info("PIF UPDATE: Phone back — running prop_unify to close identity gap")
+                    self._run_prop_unify(persist=True)
+                except Exception as e:
+                    log.warning("PIF UPDATE: prop_unify after PIF update failed: %s", e)
         except subprocess.TimeoutExpired:
             log.error("PIF update timed out")
             self.mqttc.publish(
@@ -8631,7 +8674,299 @@ img{{max-width:100%;height:auto}}</style></head>
         except Exception as e:
             log.error("PIF update error: %s", e)
 
-    # ── Token management ────────────────────────────────────────────
+    # ── Prop Unify — close device identity mismatch ─────────────────
+    def _check_prop_mismatch(self):
+        """Compare PIF-spoofed identity vs real system props.
+
+        Returns dict with mismatch details or None if no mismatch / no PIF config.
+        PIF spoofs Build.* inside GMS only; ro.product.* stays real. If the VW
+        server cross-checks PI-attested device vs the app's Build.MODEL header,
+        the mismatch triggers a 401. prop_unify closes this gap.
+        """
+        try:
+            # Read the active PIF config (custom.pif.prop takes precedence)
+            pif_values = {}
+            for pif_path in [
+                "/data/adb/tricky_store/custom.pif.prop",
+                "/data/adb/modules/tricky_store/custom.pif.prop",
+                "/data/adb/tricky_store/pif.prop",
+                "/data/adb/modules/tricky_store/pif.prop",
+                "/data/adb/modules/playintegrityfix/custom.pif.prop",
+                "/data/adb/modules/playintegrityfix/pif.prop",
+            ]:
+                r = subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"cp {pif_path} /data/local/tmp/_pif_check.tmp 2>/dev/null && "
+                     f"cat /data/local/tmp/_pif_check.tmp && "
+                     f"rm /data/local/tmp/_pif_check.tmp"],
+                    capture_output=True, text=True, timeout=10)
+                if r.returncode == 0 and r.stdout.strip():
+                    for line in r.stdout.strip().splitlines():
+                        line = line.strip()
+                        if line.startswith("#") or "=" not in line:
+                            continue
+                        key, _, val = line.partition("=")
+                        pif_values[key.strip()] = val.strip()
+                    if pif_values.get("FINGERPRINT"):
+                        log.info("PROP_UNIFY: Found PIF config at %s", pif_path)
+                        break
+
+            if not pif_values.get("FINGERPRINT"):
+                log.debug("PROP_UNIFY: No PIF fingerprint config found — no spoofing active")
+                return None
+
+            # Parse PIF fingerprint to derive expected values
+            fp = pif_values["FINGERPRINT"]
+            # Format: brand/product/device:release/id/incremental:type/tags
+            parts = fp.split("/")
+            fp_brand = parts[0] if len(parts) > 0 else ""
+            fp_product = parts[1] if len(parts) > 1 else ""
+            rest = "/".join(parts[2:])
+            fp_device = rest.split(":")[0] if ":" in rest else rest
+
+            expected = {
+                "model": pif_values.get("MODEL", fp_device),
+                "device": pif_values.get("DEVICE", fp_device),
+                "brand": pif_values.get("BRAND", fp_brand),
+                "manufacturer": pif_values.get("MANUFACTURER", fp_brand),
+                "product": pif_values.get("PRODUCT", fp_product),
+                "fingerprint": fp,
+            }
+
+            # Read current system props
+            actual = {}
+            prop_map = {
+                "model": "ro.product.model",
+                "device": "ro.product.device",
+                "brand": "ro.product.brand",
+                "manufacturer": "ro.product.manufacturer",
+                "product": "ro.product.name",
+                "fingerprint": "ro.build.fingerprint",
+            }
+            for key, prop in prop_map.items():
+                r = subprocess.run(
+                    ["adb", "shell", "su", "-c", f"resetprop {prop}"],
+                    capture_output=True, text=True, timeout=5)
+                actual[key] = r.stdout.strip() if r.returncode == 0 else ""
+
+            # Compare
+            mismatches = {}
+            for key in expected:
+                if expected[key] and actual.get(key) and expected[key] != actual[key]:
+                    mismatches[key] = {"expected": expected[key], "actual": actual[key]}
+
+            if mismatches:
+                log.warning("PROP_UNIFY: Device identity mismatch detected! %s",
+                            json.dumps(mismatches))
+                return {
+                    "has_mismatch": True,
+                    "mismatches": mismatches,
+                    "pif_fingerprint": fp,
+                    "pif_model": expected["model"],
+                    "real_model": actual.get("model", ""),
+                }
+            else:
+                log.info("PROP_UNIFY: System props already unified with PIF config")
+                return {"has_mismatch": False}
+
+        except Exception as e:
+            log.error("PROP_UNIFY: Mismatch check failed: %s", e)
+            return None
+
+    def _run_prop_unify(self, persist=True):
+        """Unify ro.product.* system props with the active PIF fingerprint.
+
+        If AlwaysStrong's prop_unify.sh exists on the phone, delegates to it.
+        Otherwise does the resetprop commands directly. Optionally creates a
+        /data/adb/service.d/ boot script so the fix persists across reboots.
+
+        Returns dict with status and details.
+        """
+        result = {"status": "unknown"}
+        try:
+            # Step 1: Check for mismatch first
+            mismatch = self._check_prop_mismatch()
+            if mismatch is None:
+                result = {"status": "skipped", "reason": "no PIF config found"}
+                log.info("PROP_UNIFY: Skipped — no PIF config active")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/prop_unify",
+                    json.dumps(result), retain=True)
+                return result
+            if not mismatch.get("has_mismatch"):
+                result = {"status": "already_unified", "reason": "props already match PIF config"}
+                log.info("PROP_UNIFY: Already unified — nothing to do")
+                self.mqttc.publish(
+                    f"{MQTT_TOPIC_PREFIX}/prop_unify",
+                    json.dumps(result), retain=True)
+                return result
+
+            log.info("PROP_UNIFY: Mismatch detected — unifying props. PIF model=%s, real model=%s",
+                     mismatch.get("pif_model"), mismatch.get("real_model"))
+
+            # Step 2: Try AlwaysStrong's prop_unify.sh first
+            prop_unify_paths = [
+                "/data/adb/modules/tricky_store/prop_unify.sh",
+                "/data/adb/modules/playintegrityfix/prop_unify.sh",
+            ]
+            script_found = False
+            for script_path in prop_unify_paths:
+                check = subprocess.run(
+                    ["adb", "shell", "su", "-c", f"test -f {script_path} && echo EXISTS"],
+                    capture_output=True, text=True, timeout=5)
+                if "EXISTS" in check.stdout:
+                    script_found = True
+                    log.info("PROP_UNIFY: Found prop_unify.sh at %s — executing", script_path)
+                    # Run it with MODPATH set to the module directory
+                    mod_dir = script_path.rsplit("/", 1)[0]
+                    r = subprocess.run(
+                        ["adb", "shell", "su", "-c",
+                         f"MODPATH={mod_dir} sh {script_path} 2>&1"],
+                        capture_output=True, text=True, timeout=30)
+                    for line in r.stdout.splitlines():
+                        log.info("PROP_UNIFY [script]: %s", line)
+                    if r.returncode == 0:
+                        result = {
+                            "status": "unified_via_script",
+                            "script": script_path,
+                            "output": r.stdout[-500:],
+                            "mismatches_fixed": mismatch.get("mismatches", {}),
+                        }
+                    else:
+                        log.warning("PROP_UNIFY: Script returned rc=%d, falling back to manual", r.returncode)
+                        script_found = False  # fall through to manual
+                    break
+
+            # Step 3: Manual resetprop if no script or script failed
+            if not script_found:
+                log.info("PROP_UNIFY: No prop_unify.sh found — doing manual resetprop")
+                resetprop_cmds = []
+                for mm_key, mm_val in mismatch.get("mismatches", {}).items():
+                    expected_val = mm_val["expected"]
+                    if mm_key == "model":
+                        resetprop_cmds.append(f"resetprop -n ro.product.model '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.product.system.model '{expected_val}'")
+                    elif mm_key == "device":
+                        resetprop_cmds.append(f"resetprop -n ro.product.device '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.build.product '{expected_val}'")
+                    elif mm_key == "brand":
+                        resetprop_cmds.append(f"resetprop -n ro.product.brand '{expected_val}'")
+                    elif mm_key == "manufacturer":
+                        resetprop_cmds.append(f"resetprop -n ro.product.manufacturer '{expected_val}'")
+                    elif mm_key == "product":
+                        resetprop_cmds.append(f"resetprop -n ro.product.name '{expected_val}'")
+                    elif mm_key == "fingerprint":
+                        resetprop_cmds.append(f"resetprop -n ro.build.fingerprint '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.vendor.build.fingerprint '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.system.build.fingerprint '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.bootimage.build.fingerprint '{expected_val}'")
+
+                # Also scrub OEM-specific product props that leak real identity
+                for part in ["odm", "vendor", "product", "system_ext"]:
+                    for field in ["model", "brand", "manufacturer", "device", "name"]:
+                        resetprop_cmds.append(f"resetprop --delete ro.product.{part}.{field} 2>/dev/null")
+
+                if resetprop_cmds:
+                    full_cmd = " && ".join(resetprop_cmds)
+                    r = subprocess.run(
+                        ["adb", "shell", "su", "-c", full_cmd],
+                        capture_output=True, text=True, timeout=30)
+                    log.info("PROP_UNIFY [manual]: rc=%d stdout=%s",
+                             r.returncode, r.stdout.strip()[:300])
+                    if r.stderr:
+                        log.warning("PROP_UNIFY [manual] stderr: %s", r.stderr.strip()[:300])
+                    result = {
+                        "status": "unified_manual",
+                        "commands_run": len(resetprop_cmds),
+                        "mismatches_fixed": mismatch.get("mismatches", {}),
+                    }
+                else:
+                    result = {"status": "no_action", "reason": "no resetprop commands needed"}
+
+            # Step 4: Verify the fix worked
+            post_check = self._check_prop_mismatch()
+            if post_check and not post_check.get("has_mismatch"):
+                log.info("PROP_UNIFY: SUCCESS — all props now match PIF config")
+                result["verified"] = True
+            elif post_check and post_check.get("has_mismatch"):
+                remaining = post_check.get("mismatches", {})
+                log.warning("PROP_UNIFY: Partial success — remaining mismatches: %s", remaining)
+                result["verified"] = False
+                result["remaining_mismatches"] = remaining
+
+            # Step 5: Create boot persistence script if requested
+            if persist and result.get("status", "").startswith("unified"):
+                self._create_prop_unify_boot_script()
+
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/prop_unify",
+                json.dumps(result), retain=True)
+            return result
+
+        except Exception as e:
+            log.error("PROP_UNIFY: Failed: %s", e)
+            result = {"status": "error", "error": str(e)}
+            self.mqttc.publish(
+                f"{MQTT_TOPIC_PREFIX}/prop_unify",
+                json.dumps(result), retain=True)
+            return result
+
+    def _create_prop_unify_boot_script(self):
+        """Create a /data/adb/service.d/ boot script that re-runs prop_unify on boot.
+
+        This ensures resetprops persist across reboots without needing the relay
+        to be running at boot time.
+        """
+        try:
+            script_name = "50_prop_unify_relay.sh"
+            script_path = f"/data/adb/service.d/{script_name}"
+
+            # The boot script delegates to AlwaysStrong's prop_unify.sh if present,
+            # otherwise it's a no-op (the relay will handle it when it starts).
+            boot_script = """#!/system/bin/sh
+# prop_unify_relay.sh — created by VW Token Relay
+# Ensures PIF-spoofed identity is applied system-wide at boot.
+# Delegates to AlwaysStrong's prop_unify.sh if available.
+
+sleep 15  # wait for modules to initialize
+
+PROP_UNIFY=""
+for p in /data/adb/modules/tricky_store/prop_unify.sh /data/adb/modules/playintegrityfix/prop_unify.sh; do
+  [ -f "$p" ] && PROP_UNIFY="$p" && break
+done
+
+if [ -n "$PROP_UNIFY" ]; then
+  MODPATH="$(dirname "$PROP_UNIFY")"
+  log -t PropUnifyRelay "Running $PROP_UNIFY (MODPATH=$MODPATH)"
+  MODPATH="$MODPATH" sh "$PROP_UNIFY" 2>&1 | log -t PropUnifyRelay
+  log -t PropUnifyRelay "prop_unify complete (rc=$?)"
+else
+  log -t PropUnifyRelay "No prop_unify.sh found — relay will handle on startup"
+fi
+"""
+            # Create service.d directory if needed, write the script
+            cmds = [
+                "mkdir -p /data/adb/service.d",
+                f"cat > {script_path} << 'BOOTEOF'\n{boot_script}BOOTEOF",
+                f"chmod 755 {script_path}",
+                f"chown root:root {script_path}",
+            ]
+            for cmd in cmds:
+                subprocess.run(
+                    ["adb", "shell", "su", "-c", cmd],
+                    capture_output=True, text=True, timeout=10)
+
+            # Verify
+            r = subprocess.run(
+                ["adb", "shell", "su", "-c", f"test -x {script_path} && echo OK"],
+                capture_output=True, text=True, timeout=5)
+            if "OK" in r.stdout:
+                log.info("PROP_UNIFY: Boot script created at %s", script_path)
+            else:
+                log.warning("PROP_UNIFY: Boot script may not have been created properly")
+
+        except Exception as e:
+            log.error("PROP_UNIFY: Failed to create boot script: %s", e)
     def _store_token_from_header(self, token, url):
         """Store an access token captured from an Authorization header."""
         try:
@@ -10482,6 +10817,23 @@ img{{max-width:100%;height:auto}}</style></head>
             t = threading.Thread(target=self._keepalive_loop_safe, daemon=True)
             t.start()
 
+        # Check for device identity mismatch on startup and fix if needed.
+        # Runs in background so it doesn't delay startup.
+        def _startup_prop_check():
+            try:
+                time.sleep(10)  # let phone settle
+                mismatch = self._check_prop_mismatch()
+                if mismatch and mismatch.get("has_mismatch"):
+                    log.info("STARTUP: Device identity mismatch detected — auto-running prop_unify")
+                    self._run_prop_unify(persist=True)
+                elif mismatch and not mismatch.get("has_mismatch"):
+                    log.info("STARTUP: Device identity props unified — no action needed")
+                else:
+                    log.info("STARTUP: No PIF config active — prop_unify not needed")
+            except Exception as e:
+                log.warning("STARTUP: prop_unify check failed: %s", e)
+        threading.Thread(target=_startup_prop_check, daemon=True).start()
+
         log.info("=" * 60)
         log.info("VW Token Relay v1.53.18 running%s", " (NO FRIDA)" if not frida_ok else "")
         log.info("  MQTT: %s:%d", self.mqtt_host, self.mqtt_port)
@@ -10502,6 +10854,8 @@ img{{max-width:100%;height:auto}}</style></head>
         log.info("    %s/pipeline_health    — overall pipeline status (retained)", MQTT_TOPIC_PREFIX)
         log.info("    %s/recovery_result    — force_recovery outcome", MQTT_TOPIC_PREFIX)
         log.info("    %s/cmd/vehicle_status — send vehicle_id", MQTT_TOPIC_PREFIX)
+        log.info("    %s/cmd/prop_unify     — unify system props with PIF identity", MQTT_TOPIC_PREFIX)
+        log.info("    %s/prop_unify         — prop unification status (retained)", MQTT_TOPIC_PREFIX)
         log.info("=" * 60)
 
         try:
