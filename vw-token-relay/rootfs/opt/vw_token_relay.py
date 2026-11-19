@@ -7904,19 +7904,24 @@ img{{max-width:100%;height:auto}}</style></head>
                 _tap(360, 1099, "submit fallback (known coords)")
 
             log.info("AUTO_LOGIN: Waiting for OIDC redirect...")
-            time.sleep(15)  # Wait for OIDC redirect + app load
+            time.sleep(30)  # Wait for OIDC redirect + app load (30s for slow connections)
 
             activity = _get_activity()
             log.info("AUTO_LOGIN: After sign-in, activity: %s", activity)
 
-            # Step 8: Reattach Frida and wait for tokens
-            log.info("AUTO_LOGIN: Step 8 — Reattaching Frida...")
+            # Step 8: Reattach Frida WITHOUT killing the app
+            # The OIDC session lives in-memory — killing the app destroys it.
+            # Try attaching to the running process first; only fall back to
+            # spawn-gate if the running attach fails.
+            log.info("AUTO_LOGIN: Step 8 — Attaching Frida to running app (preserving OIDC session)...")
             time.sleep(5)
-            if not self._attach_frida_safe(timeout=60):
-                log.warning("AUTO_LOGIN: Frida attach failed, retrying...")
-                time.sleep(5)
-                if not self._attach_frida_safe(timeout=60):
-                    log.error("AUTO_LOGIN: Frida attach failed again")
+            frida_ok = self._attach_frida_running()
+            if not frida_ok:
+                log.warning("AUTO_LOGIN: Running attach failed — falling back to spawn-gate (will kill app)...")
+                time.sleep(3)
+                frida_ok = self._attach_frida_safe(timeout=60)
+                if not frida_ok:
+                    log.error("AUTO_LOGIN: Frida attach failed completely")
 
             # Wait for app to make API calls and capture tokens
             log.info("AUTO_LOGIN: Waiting 30s for app to load and make API calls...")
@@ -9721,6 +9726,87 @@ fi
         if exc_info[0]:
             log.error("FRIDA ATTACH: Error: %s", exc_info[0])
         return result[0]
+
+    def _attach_frida_running(self):
+        """Attach Frida to the ALREADY-RUNNING VW app without killing it.
+
+        Unlike _attach_frida() which uses spawn gating (kill → spawn suspended
+        → attach → resume), this method attaches to the live process.  Used
+        after auto-login OIDC completes so the in-memory session survives.
+
+        Returns True on success, False if the app isn't running or attach fails.
+        """
+        log.info("FRIDA_RUNNING: Attempting to attach to running VW app...")
+        try:
+            self.device = frida.get_usb_device(timeout=10)
+        except Exception as e:
+            log.error("FRIDA_RUNNING: No USB device: %s", e)
+            return False
+
+        # Find the running VW app PID
+        target_pid = None
+        try:
+            for app in self.device.enumerate_applications():
+                if app.identifier == VW_PACKAGE and app.pid:
+                    target_pid = app.pid
+                    break
+        except Exception as e:
+            log.error("FRIDA_RUNNING: Cannot enumerate apps: %s", e)
+            return False
+
+        if not target_pid:
+            log.warning("FRIDA_RUNNING: VW app not running — cannot attach")
+            return False
+
+        log.info("FRIDA_RUNNING: Found running VW app PID %d", target_pid)
+
+        # Detach existing session if any
+        try:
+            if self.session:
+                self.session.detach()
+                self.session = None
+        except Exception:
+            pass
+        try:
+            if self.script:
+                self.script = None
+        except Exception:
+            pass
+
+        # Attach to the running process
+        try:
+            self.session = self.device.attach(target_pid)
+        except Exception as e:
+            log.error("FRIDA_RUNNING: Cannot attach to PID %d: %s", target_pid, e)
+            return False
+
+        self.session.on("detached", self._on_detached)
+
+        # Load the Frida script
+        import os as _os
+        if _os.path.isfile(COMPILED_AGENT_PATH):
+            with open(COMPILED_AGENT_PATH, "r") as _f:
+                script_source = _f.read()
+            log.info("FRIDA_RUNNING: Using compiled agent (%d bytes)", len(script_source))
+        else:
+            script_source = FRIDA_SCRIPT
+            log.warning("FRIDA_RUNNING: Compiled agent not found — using inline script")
+
+        try:
+            self.script = self.session.create_script(script_source, runtime="v8")
+            self.script.on("message", self._on_message)
+            self.script.load()
+            log.info("FRIDA_RUNNING: Script loaded on running process PID %d", target_pid)
+        except Exception as e:
+            log.error("FRIDA_RUNNING: Script load failed: %s", e)
+            return False
+
+        # Give hooks time to initialize on running process
+        import time as _time
+        _time.sleep(5)
+        log.info("FRIDA_RUNNING: Hooks installed on running process — app NOT killed")
+
+        return True
 
     def _attach_frida(self):
         """Attach to the VW app via USB using spawn gating.
