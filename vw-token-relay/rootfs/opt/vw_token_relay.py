@@ -8025,15 +8025,33 @@ img{{max-width:100%;height:auto}}</style></head>
                         log.warning("AUTO_LOGIN: PIN screen still "
                                     "showing — trying confirm button")
                         # Try tapping a confirm/submit button
-                        for btn in [{"text": "Confirm"},
+                        # (matches the strategy in SPIN_ENTRY)
+                        pin_confirmed = False
+                        for btn in [{"resource_id": "button_ok"},
+                                    {"text": "Confirm"},
+                                    {"text": "Verify"},
+                                    {"text": "OK"},
                                     {"text": "Submit"},
                                     {"text": "Done"},
-                                    {"text": "OK"},
-                                    {"text": "Next"}]:
+                                    {"text": "Next"},
+                                    {"text": "CONFIRM"},
+                                    {"text": "VERIFY"}]:
                             if self._tap_element(
                                     xml2, "PIN confirm", **btn):
+                                pin_confirmed = True
                                 time.sleep(3)
                                 break
+                        if not pin_confirmed:
+                            # Fallback: press Enter key (same
+                            # as SPIN_ENTRY fallback)
+                            log.info("AUTO_LOGIN: No confirm "
+                                     "button found — pressing "
+                                     "Enter as fallback")
+                            subprocess.run(
+                                ["adb", "shell", "su", "-c",
+                                 "input keyevent ENTER"],
+                                capture_output=True, timeout=10)
+                            time.sleep(3)
                         # Final check
                         xml3 = self._dump_ui_xml()
                         pin_final = self._find_ui_elements(
@@ -8787,6 +8805,37 @@ img{{max-width:100%;height:auto}}</style></head>
                     capture_output=True, text=True, timeout=5)
                 actual[key] = r.stdout.strip() if r.returncode == 0 else ""
 
+            # Also check the FULL fingerprint family —
+            # ro.build.fingerprint might be correct while
+            # vendor/system/bootimage/odm/product/system_ext
+            # still show the real device fingerprint
+            fp_family = [
+                "ro.vendor.build.fingerprint",
+                "ro.system.build.fingerprint",
+                "ro.bootimage.build.fingerprint",
+                "ro.odm.build.fingerprint",
+                "ro.product.build.fingerprint",
+                "ro.system_ext.build.fingerprint",
+            ]
+            for fp_prop in fp_family:
+                r = subprocess.run(
+                    ["adb", "shell", "su", "-c",
+                     f"resetprop {fp_prop}"],
+                    capture_output=True, text=True, timeout=5)
+                fp_actual = (r.stdout.strip()
+                             if r.returncode == 0 else "")
+                if (fp_actual and fp_actual != expected["fingerprint"]
+                        and actual.get("fingerprint") == expected["fingerprint"]):
+                    # Main fingerprint matched but a family
+                    # member doesn't — override actual to flag it
+                    actual["fingerprint"] = fp_actual
+                    log.warning(
+                        "PROP_UNIFY: %s still has original "
+                        "value '%s' (need '%s')",
+                        fp_prop, fp_actual,
+                        expected["fingerprint"])
+                    break
+
             # Compare
             mismatches = {}
             for key in expected:
@@ -8894,10 +8943,14 @@ img{{max-width:100%;height:auto}}</style></head>
                     elif mm_key == "product":
                         resetprop_cmds.append(f"resetprop -n ro.product.name '{expected_val}'")
                     elif mm_key == "fingerprint":
+                        # ALL 7 fingerprint family props must match
                         resetprop_cmds.append(f"resetprop -n ro.build.fingerprint '{expected_val}'")
                         resetprop_cmds.append(f"resetprop -n ro.vendor.build.fingerprint '{expected_val}'")
                         resetprop_cmds.append(f"resetprop -n ro.system.build.fingerprint '{expected_val}'")
                         resetprop_cmds.append(f"resetprop -n ro.bootimage.build.fingerprint '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.odm.build.fingerprint '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.product.build.fingerprint '{expected_val}'")
+                        resetprop_cmds.append(f"resetprop -n ro.system_ext.build.fingerprint '{expected_val}'")
 
                 # Also scrub OEM-specific product props that leak real identity
                 for part in ["odm", "vendor", "product", "system_ext"]:
@@ -8945,11 +8998,15 @@ img{{max-width:100%;height:auto}}</style></head>
                         elif mm_key == "product":
                             patch_cmds.append(f"resetprop -n ro.product.name '{ev}'")
                         elif mm_key == "fingerprint":
+                            # ALL 7 fingerprint family props
                             patch_cmds += [
                                 f"resetprop -n ro.build.fingerprint '{ev}'",
                                 f"resetprop -n ro.vendor.build.fingerprint '{ev}'",
                                 f"resetprop -n ro.system.build.fingerprint '{ev}'",
                                 f"resetprop -n ro.bootimage.build.fingerprint '{ev}'",
+                                f"resetprop -n ro.odm.build.fingerprint '{ev}'",
+                                f"resetprop -n ro.product.build.fingerprint '{ev}'",
+                                f"resetprop -n ro.system_ext.build.fingerprint '{ev}'",
                             ]
                     if patch_cmds:
                         full_cmd = " && ".join(patch_cmds)
@@ -9006,7 +9063,8 @@ img{{max-width:100%;height:auto}}</style></head>
             boot_script = """#!/system/bin/sh
 # prop_unify_relay.sh — created by VW Token Relay
 # Ensures PIF-spoofed identity is applied system-wide at boot.
-# Delegates to AlwaysStrong's prop_unify.sh if available.
+# Delegates to AlwaysStrong's prop_unify.sh first, then
+# explicitly sets ALL 7 fingerprint family props from PIF config.
 
 sleep 15  # wait for modules to initialize
 
@@ -9022,6 +9080,31 @@ if [ -n "$PROP_UNIFY" ]; then
   log -t PropUnifyRelay "prop_unify complete (rc=$?)"
 else
   log -t PropUnifyRelay "No prop_unify.sh found — relay will handle on startup"
+fi
+
+# Read PIF fingerprint and apply to ALL fingerprint family props.
+# AlwaysStrong's script may only fix ro.build.fingerprint but
+# VW/Audi apps check vendor/system/bootimage/odm/product/system_ext too.
+PIF_FP=""
+for pf in /data/adb/tricky_store/pif.prop /data/adb/modules/tricky_store/custom.pif.prop; do
+  if [ -f "$pf" ]; then
+    PIF_FP=$(grep -E "^FINGERPRINT=" "$pf" | head -1 | cut -d= -f2-)
+    [ -n "$PIF_FP" ] && break
+  fi
+done
+
+if [ -n "$PIF_FP" ]; then
+  log -t PropUnifyRelay "Applying fingerprint to all 7 family props: $PIF_FP"
+  resetprop -n ro.build.fingerprint "$PIF_FP"
+  resetprop -n ro.vendor.build.fingerprint "$PIF_FP"
+  resetprop -n ro.system.build.fingerprint "$PIF_FP"
+  resetprop -n ro.bootimage.build.fingerprint "$PIF_FP"
+  resetprop -n ro.odm.build.fingerprint "$PIF_FP"
+  resetprop -n ro.product.build.fingerprint "$PIF_FP"
+  resetprop -n ro.system_ext.build.fingerprint "$PIF_FP"
+  log -t PropUnifyRelay "All 7 fingerprint family props set"
+else
+  log -t PropUnifyRelay "WARNING: Could not read PIF fingerprint from config"
 fi
 """
             # Create service.d directory if needed, write the script
