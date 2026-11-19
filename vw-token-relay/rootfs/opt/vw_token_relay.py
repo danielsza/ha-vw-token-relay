@@ -7099,22 +7099,47 @@ img{{max-width:100%;height:auto}}</style></head>
         if not xml_str or not self.vw_spin:
             return False
 
-        # Look for PIN entry indicators
+        # Look for PIN entry indicators (strong match — specific resource IDs)
         has_pin_entry = bool(self._find_ui_elements(xml_str, resource_id="pin_entry"))
         has_pin_field = bool(self._find_ui_elements(xml_str, resource_id="pin"))
-        has_edittext = bool(self._find_ui_elements(xml_str, class_name="EditText"))
-        has_confirm = (
-            bool(self._find_ui_elements(xml_str, resource_id="button_ok")) or
-            bool(self._find_ui_elements(xml_str, text="Confirm")) or
-            bool(self._find_ui_elements(xml_str, text="Verify")) or
-            bool(self._find_ui_elements(xml_str, text="OK"))
-        )
 
-        if not (has_pin_entry or has_pin_field or (has_edittext and has_confirm)):
-            return False
+        if has_pin_entry or has_pin_field:
+            log.info("SPIN_ENTRY: SPIN dialog detected (pin_entry=%s pin=%s)",
+                     has_pin_entry, has_pin_field)
+        else:
+            # Fallback: generic EditText + confirm button
+            has_edittext = bool(self._find_ui_elements(xml_str, class_name="EditText"))
+            has_confirm = (
+                bool(self._find_ui_elements(xml_str, resource_id="button_ok")) or
+                bool(self._find_ui_elements(xml_str, text="Confirm")) or
+                bool(self._find_ui_elements(xml_str, text="Verify")) or
+                bool(self._find_ui_elements(xml_str, text="OK"))
+            )
 
-        log.info("SPIN_ENTRY: SPIN dialog detected (pin_entry=%s pin=%s edittext=%s confirm=%s)",
-                 has_pin_entry, has_pin_field, has_edittext, has_confirm)
+            if not (has_edittext and has_confirm):
+                return False
+
+            # Exclude login/OIDC pages — they have EditText + buttons but
+            # are NOT PIN dialogs. Without this check the relay enters the
+            # S-PIN into the email/password field on the VW login page.
+            is_login_page = (
+                bool(self._find_ui_elements(xml_str, text="Email")) or
+                bool(self._find_ui_elements(xml_str, text="Welcome")) or
+                bool(self._find_ui_elements(xml_str, text="Create account")) or
+                bool(self._find_ui_elements(xml_str, text="Next")) or
+                bool(self._find_ui_elements(xml_str, text="Password")) or
+                bool(self._find_ui_elements(xml_str, text="Sign in")) or
+                bool(self._find_ui_elements(xml_str, text="Log in")) or
+                bool(self._find_ui_elements(xml_str, text="Forgot password")) or
+                bool(self._find_ui_elements(xml_str, text="Volkswagen ID"))
+            )
+            if is_login_page:
+                log.info("SPIN_ENTRY: Skipping — login/auth page detected "
+                         "(edittext+confirm present but login indicators found)")
+                return False
+
+            log.info("SPIN_ENTRY: SPIN dialog detected via fallback "
+                     "(edittext=%s confirm=%s)", has_edittext, has_confirm)
 
         # Strategy 1: Tap pin_entry or EditText field, then type SPIN digits
         target_field = None
