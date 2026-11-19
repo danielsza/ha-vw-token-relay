@@ -7622,15 +7622,21 @@ img{{max-width:100%;height:auto}}</style></head>
             _swipe(360, 1400, 360, 600, 300)  # Swipe up to dismiss lock screen
             time.sleep(2)
 
-            # Step 3: Launch app fresh
-            log.info("AUTO_LOGIN: Step 3 — Launching VW app fresh...")
-            subprocess.run(
-                ["adb", "shell", "am", "start",
-                 "-a", "android.intent.action.MAIN",
-                 "-c", "android.intent.category.LAUNCHER",
-                 VW_PACKAGE],
-                capture_output=True, timeout=10)
-            time.sleep(10)  # Longer wait for splash/welcome
+            # Step 3: Launch app WITH Frida spawn-gating so hooks capture
+            # the OIDC token exchange during login (not just after).
+            log.info("AUTO_LOGIN: Step 3 — Spawn-gating VW app with Frida hooks...")
+            frida_spawn_ok = self._attach_frida_safe(timeout=60)
+            if frida_spawn_ok:
+                log.info("AUTO_LOGIN: Step 3 — Frida spawn-gate OK — hooks active from app start")
+            else:
+                log.warning("AUTO_LOGIN: Step 3 — Frida spawn-gate failed, falling back to plain launch")
+                subprocess.run(
+                    ["adb", "shell", "am", "start",
+                     "-a", "android.intent.action.MAIN",
+                     "-c", "android.intent.category.LAUNCHER",
+                     VW_PACKAGE],
+                    capture_output=True, timeout=10)
+            time.sleep(10)  # Wait for splash/welcome
 
             # v1.55.1: Verify VW app is actually in the foreground.
             # If another app (e.g. Clock alarm settings) is on top,
@@ -7909,23 +7915,25 @@ img{{max-width:100%;height:auto}}</style></head>
             activity = _get_activity()
             log.info("AUTO_LOGIN: After sign-in, activity: %s", activity)
 
-            # Step 8: Reattach Frida WITHOUT killing the app
-            # The OIDC session lives in-memory — killing the app destroys it.
-            # Try attaching to the running process first; only fall back to
-            # spawn-gate if the running attach fails.
-            log.info("AUTO_LOGIN: Step 8 — Attaching Frida to running app (preserving OIDC session)...")
+            # Step 8: Frida was attached in Step 3 (spawn-gate). Just verify
+            # hooks are still alive and wait for token capture.
+            log.info("AUTO_LOGIN: Step 8 — Verifying Frida hooks still active...")
             time.sleep(5)
-            frida_ok = self._attach_frida_running()
-            if not frida_ok:
-                log.warning("AUTO_LOGIN: Running attach failed — falling back to spawn-gate (will kill app)...")
-                time.sleep(3)
-                frida_ok = self._attach_frida_safe(timeout=60)
+            if self.session is None or self.script is None:
+                log.warning("AUTO_LOGIN: Step 8 — Frida session lost! Reattaching to running app...")
+                frida_ok = self._attach_frida_running()
                 if not frida_ok:
-                    log.error("AUTO_LOGIN: Frida attach failed completely")
+                    log.warning("AUTO_LOGIN: Running attach failed — spawn-gate fallback (will kill app)...")
+                    time.sleep(3)
+                    frida_ok = self._attach_frida_safe(timeout=60)
+                    if not frida_ok:
+                        log.error("AUTO_LOGIN: Frida attach failed completely")
+            else:
+                log.info("AUTO_LOGIN: Step 8 — Frida session alive, hooks should have captured tokens")
 
-            # Wait for app to make API calls and capture tokens
-            log.info("AUTO_LOGIN: Waiting 30s for app to load and make API calls...")
-            time.sleep(30)
+            # Wait for any pending API calls to complete
+            log.info("AUTO_LOGIN: Waiting 15s for final API calls...")
+            time.sleep(15)
 
             # Check if we got a fresh token (check expiry, not just presence)
             now = datetime.now()
